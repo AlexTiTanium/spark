@@ -1,0 +1,1059 @@
+# Spark ECS — Architecture & Build Plan
+
+This is the design and step-by-step build plan for the `crates/ecs` crate. We're rolling it from scratch as a learning exercise.
+
+## Design philosophy
+
+**Bevy-style API** for ergonomics, **Shipyard-inspired workloads** for explicit grouping and ordering, **sparse-set storage** for implementation simplicity, **traceability built in** so the editor can inspect everything live, **parallel-execution-ready** but single-threaded first.
+
+The non-negotiable rule: **all memory management is ECS-based**. The window handle, the wgpu device, the input state, the asset cache, the power network — every piece of long-lived state lives in the World as either a Resource (singleton) or an Entity (many). Nothing in global statics, nothing in side allocations.
+
+## Goals & non-goals
+
+**Goals:**
+- Function-parameter system extraction (Bevy-style): `fn sys(time: Res<Time>, q: Query<(&mut A, &B)>)`.
+- Named, first-class workloads with explicit ordering between them.
+- Full system traceability: every system call recorded with timing, access set, command/event counts.
+- Editor-friendly reflection: list entities, components, resources, system graph, frame timings — all readable at runtime.
+- Sparse-set storage for simplicity. Archetype migration possible later behind the same API.
+- No `unsafe` until profiling demands it; safe Rust everywhere by default.
+
+**Non-goals (for v1):**
+- Parallel execution. Designed to be added in Phase 3; single-threaded scheduler first.
+- Archetype storage. Stretch refactor after the API stabilises.
+- Networking, save serialization, or scripting — separate concerns, layered on top later.
+
+## Architecture overview
+
+```
+                              App
+                               │
+                       ┌───────┴───────┐
+                     World          Scheduler
+                       │                │
+              ┌────────┼────────┐       │
+          Entities  Components  Resources
+                       │              Schedules (Startup, First, PreUpdate,
+                       │                          FixedUpdate, Update,
+                       │                          PostUpdate, Render, Last)
+                       │                │
+                       │              Each Schedule contains Workloads
+                       │                │
+                       │              Each Workload contains Systems
+                       │                │
+                     Events ─── consumed by Systems via EventReader/Writer
+                       │
+                   Commands ──── deferred mutations, flushed between Workloads
+```
+
+Per frame, the App calls the Scheduler. The Scheduler runs each Schedule in order, each Workload in dependency order, each System extracts its params from the World, mutations queue into Commands, command queues flush between Workloads, events drain at end of frame.
+
+## Core types — schema reference
+
+### Entity
+
+Generational ID. Pure data. `Copy`.
+
+```rust
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct Entity {
+    index: u32,
+    generation: u32,
+}
+```
+
+When an entity is despawned, its index goes onto a free list; on reuse, generation bumps. Old `Entity` handles to recycled slots fail `is_alive` cleanly.
+
+### Component
+
+Any `'static + Send + Sync` type marked with the derive:
+
+```rust
+#[derive(Component, Debug, Clone, Copy)]
+pub struct Position(pub Vec2);
+
+#[derive(Component, Debug, Clone)]
+pub struct Sprite {
+    pub texture: TextureHandle,
+    pub size: Vec2,
+    pub tint: Color,
+}
+
+#[derive(Component)]
+pub struct PlayerControlled;        // marker (zero-sized)
+
+#[derive(Component)]
+pub struct Operational;             // marker
+```
+
+The `#[derive(Component)]` macro:
+- registers the type at startup in a `ComponentRegistry` (name, `TypeId`, `Debug` formatter, optional serde hooks)
+- emits zero runtime cost beyond a one-shot inventory entry
+- exposes the type to the editor for inspection
+
+### Resource
+
+Singletons. Exactly one per type per world. Anything "engine-global" lives here.
+
+```rust
+#[derive(Resource)]
+pub struct Time {
+    pub delta: f32,
+    pub fixed_delta: f32,
+    pub elapsed: f32,
+    pub frame: u64,
+}
+
+#[derive(Resource)]
+pub struct Window {
+    pub handle: winit::window::Window,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Resource)]
+pub struct RenderContext {
+    pub device: wgpu::Device,
+    pub queue: wgpu::Queue,
+    pub surface: wgpu::Surface<'static>,
+    pub config: wgpu::SurfaceConfiguration,
+}
+
+#[derive(Resource, Default)]
+pub struct InputState {
+    pub keys_held: BitSet,
+    pub keys_just_pressed: BitSet,
+    pub mouse_pos: Vec2,
+    pub mouse_buttons: u8,
+}
+
+#[derive(Resource, Default)]
+pub struct PowerNetwork {
+    pub supply: f32,
+    pub demand: f32,
+    pub ratio: f32,
+}
+```
+
+The `#[derive(Resource)]` macro registers the type for editor inspection just like components.
+
+### Event
+
+Typed messages between systems. Double-buffered across frames so readers don't miss them.
+
+```rust
+#[derive(Event, Debug, Clone)]
+pub struct TileClicked {
+    pub tile: IVec2,
+    pub button: MouseButton,
+}
+
+#[derive(Event)]
+pub struct ConstructionCompleted(pub Entity);
+
+#[derive(Event)]
+pub struct CityTierUp {
+    pub city: Entity,
+    pub new_tier: u32,
+}
+```
+
+### Query
+
+A query is a declarative description of which entities a system reads or writes.
+
+```rust
+Query<&Position>                                            // read
+Query<&mut Position>                                        // write
+Query<(&mut Position, &Velocity)>                           // tuple
+Query<&Worker, Without<CurrentJob>>                         // with filter
+Query<&Plant, (With<Operational>, Without<UnderMaintenance>)>  // multiple filters
+Query<(&Position, Option<&Velocity>)>                       // optional component
+Query<(Entity, &Position)>                                  // entity ID alongside
+```
+
+Filters available on day 1: `With<T>`, `Without<T>`, tuple of filters, `Or<(F1, F2)>`. Later: `Changed<T>`, `Added<T>` (Phase 3).
+
+### System
+
+A regular Rust function. The signature declares what it needs from the world:
+
+```rust
+fn movement(
+    time: Res<Time>,
+    mut q: Query<(&mut Position, &Velocity)>,
+) {
+    for (mut pos, vel) in q.iter_mut() {
+        pos.0 += vel.0 * time.delta;
+    }
+}
+```
+
+**Parameter rules:**
+
+1. Order doesn't matter. Each parameter is looked up by type. `fn(a: Res<X>, b: Res<Y>)` and `fn(b: Res<Y>, a: Res<X>)` are equivalent.
+2. You declare only what you need. Zero parameters is valid (e.g. startup logging). One. Twenty. Any subset.
+3. Conflicting parameters within one system panic at registration (e.g. two `&mut` queries over the same component type without disjoint filters).
+4. Conflicting parameters *between* systems in the same workload cause those systems to run sequentially, not in parallel — handled automatically by the scheduler.
+
+**Available parameter types:**
+
+| Param | Purpose |
+|-------|---------|
+| `Res<T>` | Read a resource |
+| `ResMut<T>` | Write a resource |
+| `Query<D>` | Read entities (data shape `D`) |
+| `Query<D, F>` | Same with filter `F` |
+| `Commands` | Defer entity spawn/despawn/insert/remove |
+| `EventReader<E>` | Read events from this frame and last |
+| `EventWriter<E>` | Send events |
+| `Local<T>` | Per-system local state, persists between calls |
+| `Entities` | Direct access to the entity allocator (rare) |
+| `&World` / `&mut World` | Escape hatch — system runs alone, no parallelism |
+
+### Commands — deferred mutations
+
+Systems never mutate world structure directly. They queue commands; the scheduler flushes them between workloads.
+
+```rust
+fn place_plan(
+    mut events: EventReader<TileClicked>,
+    economy: Res<Economy>,
+    mut cmd: Commands,
+) {
+    for click in events.read() {
+        if economy.capital >= 100.0 {
+            cmd.spawn((
+                Plan { tile: click.tile, kind: BuildingKind::WaterWheel },
+                Position(click.tile.as_vec2()),
+                ConstructionProgress { current: 0.0, required: 30.0 },
+            ));
+            cmd.update_resource::<Economy>(|e| e.capital -= 100.0);
+        }
+    }
+}
+
+fn finish_construction(
+    mut cmd: Commands,
+    completed: Query<Entity, With<ConstructionDone>>,
+) {
+    for e in &completed {
+        cmd.entity(e)
+           .remove::<ConstructionProgress>()
+           .remove::<ConstructionDone>()
+           .insert(Operational);
+    }
+}
+```
+
+Commands available:
+- `cmd.spawn((A, B, C))` — spawn an entity with a bundle (tuple) of components
+- `cmd.despawn(entity)` — remove the entity and all its components
+- `cmd.entity(e).insert(comp).remove::<T>()` — incremental edits to an existing entity
+- `cmd.insert_resource(r)` / `cmd.update_resource::<T>(|t| ...)` / `cmd.remove_resource::<T>()`
+- `cmd.send_event(e)` — equivalent to `EventWriter<E>::write(e)`
+
+Always deferred. Single-threaded. Deterministic.
+
+### Workload — first-class system group (Shipyard-inspired)
+
+A workload is a named bundle of systems that belong together. Systems inside a workload can run in parallel when access allows. Workloads have explicit ordering between each other within a schedule.
+
+```rust
+#[derive(WorkloadLabel)]
+pub enum Workload {
+    Input,
+    Simulation,
+    PowerGrid,
+    CityTick,
+    Construction,
+    Rendering,
+}
+
+app.add_workload(Workload::Input, Schedule::PreUpdate, |w| {
+    w.add(poll_window_events);
+    w.add(update_input_state).after(poll_window_events);
+    w.add(update_mouse_world_pos).after(update_input_state);
+});
+
+app.add_workload(Workload::PowerGrid, Schedule::FixedUpdate, |w| {
+    w.after_workload(Workload::Simulation);
+
+    // These run in parallel — disjoint access
+    w.add(collect_supply);
+    w.add(compute_demand);
+
+    // Runs after both of the above
+    w.add(distribute_power).after_all_prior();
+    w.add(emit_blackout_events).after(distribute_power);
+});
+```
+
+Workload-level features:
+- `.after_workload(label)` — explicit ordering between workloads
+- Systems inside use `.after(other_system)` / `.before(other_system)` / `.after_all_prior()`
+- Commands flush at workload boundaries (i.e. all queued commands are applied after a workload completes, before the next workload starts)
+- Editor visualizes workloads as a labelled DAG
+
+Why workloads on top of stages? Stages define the broad frame structure; workloads let modules group their related systems with a meaningful name. A plugin can add a self-contained workload without worrying about exact system order in some giant frame-wide list.
+
+### Schedule — the frame shape
+
+```rust
+pub enum Schedule {
+    Startup,        // once, before main loop begins
+    First,          // very first thing each frame
+    PreUpdate,      // input poll, time tick
+    FixedUpdate,    // runs N times per frame based on accumulator (60 Hz)
+    Update,         // main game logic at display rate
+    PostUpdate,     // cleanup
+    Render,         // build draw lists, submit GPU work
+    Last,           // very last thing each frame
+}
+```
+
+Per-frame order: `First → PreUpdate → (FixedUpdate × N) → Update → PostUpdate → Render → Last`.
+
+Inside a schedule, workloads run in the order their explicit `.after_workload()` constraints dictate. Within a workload, systems run in the order their access conflicts and `.after()` constraints dictate.
+
+Commands flush between every workload. Events double-buffer between `Last` (frame N) and `First` (frame N+1).
+
+### Plugin
+
+A plugin registers everything a module owns: components, resources, events, systems, workloads.
+
+```rust
+pub struct PowerGridPlugin;
+
+impl Plugin for PowerGridPlugin {
+    fn build(&self, app: &mut App) {
+        app.init_resource::<PowerNetwork>()
+           .add_event::<BlackoutStarted>()
+           .add_event::<BlackoutEnded>()
+           .add_workload(Workload::PowerGrid, Schedule::FixedUpdate, |w| {
+               w.after_workload(Workload::Simulation);
+               w.add(collect_supply);
+               w.add(compute_demand);
+               w.add(distribute_power).after_all_prior();
+               w.add(emit_blackout_events).after(distribute_power);
+           });
+    }
+}
+```
+
+### App
+
+```rust
+fn main() {
+    App::new()
+        // Engine plugins
+        .add_plugin(CorePlugin)
+        .add_plugin(WindowPlugin { title: "Spark", size: (1280, 720) })
+        .add_plugin(InputPlugin)
+        .add_plugin(RenderPlugin)
+        .add_plugin(AssetsPlugin)
+        // Game plugins
+        .add_plugin(WorldPlugin)
+        .add_plugin(PowerGridPlugin)
+        .add_plugin(CityPlugin)
+        .add_plugin(WorkerPlugin)
+        .add_plugin(PlansPlugin)
+        .add_plugin(EconomyPlugin)
+        .add_plugin(UiPlugin)
+        // Run the main loop
+        .run();
+}
+```
+
+`App::run()` consumes the app, hands control to the window plugin's event loop, which calls `app.frame()` per redraw. Each `frame()` runs the schedules in order.
+
+## Derive macros
+
+Four derive/attribute macros, all living in a sibling proc-macro crate `crates/ecs-derive`:
+
+| Macro | What it does |
+|-------|--------------|
+| `#[derive(Component)]` | Registers the type in `ComponentRegistry` for introspection |
+| `#[derive(Resource)]` | Same for resources |
+| `#[derive(Event)]` | Same for events; also implements `Event` marker trait |
+| `#[derive(WorkloadLabel)]` | Implements label identity for enum-based workload labels |
+| `#[derive(Trace)]` | Opt-in: emits `ChangeEvent` on every mutation of this component |
+| `#[system]` (attribute) | Captures `file:line` + module path metadata for system introspection (optional convenience) |
+
+The derives are not required for the type to work — manual registration via `app.register_component::<T>()` is always available. But the derives are the ergonomic default and what every example uses.
+
+## Traceability layer
+
+Traceability is built into every system, workload, and command flow by default.
+
+### System metadata (registration-time)
+
+```rust
+pub struct SystemMeta {
+    pub name: &'static str,            // function name
+    pub module: &'static str,          // module path
+    pub file: &'static str,            // source file
+    pub line: u32,                     // source line
+    pub reads: &'static [TypeId],      // declared read set
+    pub writes: &'static [TypeId],     // declared write set
+    pub workload: WorkloadId,
+    pub schedule: ScheduleId,
+}
+```
+
+Populated automatically by `IntoSystem` impls (using `std::any::type_name`, `module_path!()`, `file!()`, `line!()`). The `#[system]` attribute macro can override or enrich this.
+
+### Runtime FrameTrace resource
+
+```rust
+#[derive(Resource, Default)]
+pub struct FrameTrace {
+    pub frame: u64,
+    pub workloads: Vec<WorkloadTrace>,
+}
+
+pub struct WorkloadTrace {
+    pub label: WorkloadId,
+    pub schedule: ScheduleId,
+    pub started_at: Instant,
+    pub duration: Duration,
+    pub systems: Vec<SystemTrace>,
+    pub commands_flushed: usize,
+}
+
+pub struct SystemTrace {
+    pub system: SystemId,
+    pub started_at: Instant,
+    pub duration: Duration,
+    pub entities_read: usize,
+    pub entities_mutated: usize,
+    pub commands_queued: usize,
+    pub events_sent: HashMap<EventTypeId, usize>,
+}
+```
+
+`FrameTrace` is overwritten each frame. The editor reads it. `tracing` crate spans wrap every system call, giving free integration with `tracing-subscriber`, `tracy`, flamegraphs, etc.
+
+### Component change log (opt-in)
+
+```rust
+#[derive(Component, Trace)]   // <-- opt-in
+pub struct PowerNetwork { ... }
+
+// Editor reads from a ChangeLog resource:
+let log = world.resource::<ChangeLog>();
+for ev in log.read::<PowerNetwork>(last_frame) {
+    println!("PowerNetwork mutated by system {:?} at frame {}", ev.system, ev.frame);
+}
+```
+
+`#[derive(Trace)]` wraps mutable access in a smart pointer that records who wrote and when. Off by default; on for components you want to debug.
+
+### Command log
+
+Every `Commands::spawn`, `despawn`, `insert`, `remove` records a row in a frame-scoped `CommandLog` resource. The editor's history panel reads it directly.
+
+## Editor introspection — reflection APIs
+
+The editor (built as another plugin running in-process) gets these world-level introspection methods:
+
+```rust
+// All entities currently alive
+for entity in world.entities().iter() { ... }
+
+// All components on a single entity (name + debug string)
+for inspect in world.inspect_entity(entity) {
+    println!("{}: {}", inspect.component_name, inspect.debug);
+}
+
+// All resources
+for inspect in world.inspect_resources() {
+    println!("{}: {}", inspect.resource_name, inspect.debug);
+}
+
+// System graph for the current frame
+let graph = world.resource::<FrameTrace>().system_graph();
+
+// Live timings
+for sys in &world.resource::<FrameTrace>().workloads[0].systems {
+    println!("{:?}: {:?}", sys.system, sys.duration);
+}
+```
+
+Zero-cost when the editor isn't attached — registration-time metadata only; the `FrameTrace` resource is updated regardless because tracing is cheap, but no one reads it. The editor is a separate plugin (`EditorPlugin`) that adds an egui overlay reading these APIs.
+
+## Parallel execution model (Phase 3)
+
+Each system declares its access set via the `SystemParam::access()` method. The scheduler within a workload:
+
+1. Builds a DAG: edges for declared `.after()` ordering, plus implicit edges where two systems' access sets conflict (read-write or write-write on same `TypeId`).
+2. Topologically batches: systems with no remaining dependencies and no current-batch conflicts run in parallel via Rayon.
+3. Commands flush between workloads (single-threaded, deterministic).
+
+```text
+Workload::Simulation:
+  worker_ai        reads Worker, writes JobBoard
+  plant_operation  reads Plant, writes PowerNetwork
+  construction     writes ConstructionProgress, reads Worker
+
+Conflict edges:
+  worker_ai ↔ construction   (both touch Worker — read vs write)
+  plant_operation: no conflicts → runs in parallel with one of them
+
+Batches:
+  Batch 1: [plant_operation, worker_ai]   (parallel)
+  Batch 2: [construction]                  (sequential after worker_ai)
+```
+
+Determinism is preserved: parallel systems target disjoint data, so iteration order within a batch doesn't affect output.
+
+Phase 3 only — Phase 1 runs everything sequentially within a workload to keep the scheduler simple while we're learning.
+
+## Internal implementation sketch
+
+Key traits the ECS hangs on. Real implementations are deferred to the build plan; this is to communicate the shape.
+
+### `SystemParam` — the heart of function-parameter extraction
+
+```rust
+pub trait SystemParam {
+    type State: 'static + Send + Sync;   // cached lookup state between calls
+    type Item<'w>;                       // what the function actually receives
+
+    fn init(world: &mut World) -> Self::State;
+    fn access() -> Access;               // read/write set for this param
+    fn get<'w>(state: &'w mut Self::State, world: &'w UnsafeWorldCell) -> Self::Item<'w>;
+}
+
+// Implemented for:
+impl<T: Resource> SystemParam for Res<T> { ... }
+impl<T: Resource> SystemParam for ResMut<T> { ... }
+impl<D: QueryData, F: QueryFilter> SystemParam for Query<'_, '_, D, F> { ... }
+impl SystemParam for Commands<'_, '_> { ... }
+impl<E: Event> SystemParam for EventReader<'_, '_, E> { ... }
+impl<E: Event> SystemParam for EventWriter<'_, E> { ... }
+impl<T: Default + 'static> SystemParam for Local<'_, T> { ... }
+
+// Tuples up to arity 16
+impl<P1: SystemParam, P2: SystemParam> SystemParam for (P1, P2) { ... }
+// ... via macro
+```
+
+### `IntoSystem` — turn a function into a `Box<dyn System>`
+
+```rust
+pub trait IntoSystem<Params> {
+    fn into_system(self) -> Box<dyn System>;
+}
+
+// Generated for each arity via macro:
+impl<F, P1, P2> IntoSystem<(P1, P2)> for F
+where
+    P1: SystemParam,
+    P2: SystemParam,
+    F: FnMut(P1::Item<'_>, P2::Item<'_>) + 'static
+       + for<'w> FnMut(P1::Item<'w>, P2::Item<'w>),
+{
+    fn into_system(mut self) -> Box<dyn System> {
+        Box::new(FunctionSystem {
+            func: self,
+            state: None,
+            meta: SystemMeta {
+                name: type_name_of::<F>(),
+                reads: union(P1::access().reads, P2::access().reads),
+                writes: union(P1::access().writes, P2::access().writes),
+                // ...
+            },
+        })
+    }
+}
+```
+
+### `ComponentStorage<T>` — sparse set
+
+```rust
+pub struct ComponentStorage<T> {
+    sparse: Vec<Option<u32>>,    // sparse[entity.index] -> dense index
+    dense: Vec<T>,                // packed component data
+    entity_index: Vec<Entity>,    // entity_index[dense_idx] -> Entity
+}
+```
+
+O(1) insert/remove/get. Linear iteration over `dense`. Cache-friendly enough for Spark's scale. Archetype refactor is stretch.
+
+### `World`
+
+```rust
+pub struct World {
+    entities: EntityAllocator,
+    components: HashMap<TypeId, Box<dyn AnyStorage>>,
+    resources: HashMap<TypeId, Box<dyn AnyResource>>,
+    events: HashMap<TypeId, Box<dyn AnyEvents>>,
+    change_log: ChangeLog,
+}
+```
+
+Heterogeneous storages stored as trait objects, downcast via `TypeId`. `RefCell` inside each storage for runtime borrow checking until we move to parallel execution.
+
+### `Scheduler`
+
+```rust
+pub struct Scheduler {
+    schedules: HashMap<ScheduleId, ScheduleData>,
+}
+
+pub struct ScheduleData {
+    workloads: Vec<WorkloadData>,
+    workload_order: Vec<WorkloadId>,   // topo-sorted by .after_workload()
+}
+
+pub struct WorkloadData {
+    label: WorkloadId,
+    systems: Vec<Box<dyn System>>,
+    system_order: Vec<SystemId>,        // topo-sorted within workload
+}
+```
+
+Phase 1: `Scheduler::run(world)` walks schedules → workloads → systems sequentially. Phase 3: builds parallel batches within a workload.
+
+## Crate structure
+
+```
+lib/
+├── ecs/
+│   ├── Cargo.toml
+│   ├── src/
+│   │   ├── lib.rs              # re-exports
+│   │   ├── entity.rs           # Entity, EntityAllocator
+│   │   ├── storage.rs          # ComponentStorage<T>, AnyStorage
+│   │   ├── world.rs            # World
+│   │   ├── resource.rs         # Resource access, AnyResource
+│   │   ├── query/
+│   │   │   ├── mod.rs
+│   │   │   ├── data.rs         # QueryData trait, tuple impls
+│   │   │   ├── filter.rs       # With, Without, Or, ...
+│   │   │   └── iter.rs         # Query iteration
+│   │   ├── system/
+│   │   │   ├── mod.rs
+│   │   │   ├── param.rs        # SystemParam trait, all impls
+│   │   │   ├── function.rs     # IntoSystem, FunctionSystem
+│   │   │   └── system.rs       # System trait
+│   │   ├── schedule.rs         # Schedule enum, ScheduleData
+│   │   ├── workload.rs         # Workload labels, WorkloadData, builder
+│   │   ├── scheduler.rs        # Scheduler — runs schedules
+│   │   ├── commands.rs         # Commands, CommandQueue
+│   │   ├── events.rs           # Events<T>, EventReader, EventWriter
+│   │   ├── plugin.rs           # Plugin trait, App
+│   │   ├── trace.rs            # FrameTrace, SystemTrace, ChangeLog
+│   │   ├── reflect.rs          # Reflection APIs for the editor
+│   │   └── access.rs           # Access set, conflict detection
+│   └── tests/
+│       ├── entity.rs
+│       ├── storage.rs
+│       ├── query.rs
+│       ├── system.rs
+│       ├── workload.rs
+│       ├── commands.rs
+│       └── events.rs
+└── ecs-derive/
+    ├── Cargo.toml
+    └── src/
+        ├── lib.rs
+        ├── component.rs        # #[derive(Component)]
+        ├── resource.rs         # #[derive(Resource)]
+        ├── event.rs            # #[derive(Event)]
+        ├── workload_label.rs   # #[derive(WorkloadLabel)]
+        ├── trace.rs            # #[derive(Trace)]
+        └── system.rs           # #[system] attribute
+```
+
+## Cargo.toml
+
+```toml
+# crates/ecs/Cargo.toml
+[package]
+name = "spark-ecs"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+spark-core = { path = "../core" }
+spark-ecs-derive = { path = "../ecs-derive" }
+tracing.workspace = true
+hashbrown = "0.15"
+
+# No external ECS dependency — everything written from scratch.
+```
+
+```toml
+# crates/ecs-derive/Cargo.toml
+[package]
+name = "spark-ecs-derive"
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"
+```
+
+## Build plan — phases and stages
+
+Each stage ends with passing tests. We don't move on until green.
+
+### Phase 1 — Core ECS (stages 1–14)
+
+This is the minimum to ship Spark.
+
+**Stage 1 — Entity + EntityAllocator** (½ day)
+Generational IDs, allocate/destroy/recycle with generation bump, `is_alive`.
+Test: 1M create/destroy cycles preserve invariants.
+
+**Stage 2 — `ComponentStorage<T>` (sparse set)** (1 day)
+Generic over `T: 'static + Send + Sync`. `insert`, `remove`, `get`, `get_mut`, `iter`, `iter_mut`, `len`, `contains`.
+Test: insert 10k, swap-remove half randomly, iter remaining, verify count.
+
+**Stage 3 — `World` with heterogeneous storages** (1–2 days)
+`HashMap<TypeId, Box<dyn AnyStorage>>`, `AnyStorage` trait, `spawn`, `despawn` cascade through all storages, `insert::<T>`, `remove::<T>`, `get::<T>`, `get_mut::<T>`.
+Test: two component types, despawn cascades correctly.
+
+**Stage 4 — Resources** (½ day)
+`world.insert_resource(r)`, `resource::<T>()`, `resource_mut::<T>()`, `remove_resource::<T>()`.
+Test: insert/read/update/remove cycle.
+
+**Stage 5 — Queries (no filters)** (2–3 days)
+`Query<&T>`, `Query<&mut T>`, `Query<(&A, &B)>`, `Query<(&mut A, &B)>` for arity 1–4. Driver-storage selection for joins (pick smallest).
+Test: movement system across 1k entities.
+
+**Stage 6 — Query filters** (1 day)
+`With<T>`, `Without<T>`, tuple-of-filters, `Or<(F1, F2)>`, `Option<&T>` in data.
+Test: filter combinations yield correct sets.
+
+**Stage 7 — Derive macros: `Component`, `Resource`, `Event`** (1–2 days)
+`crates/ecs-derive` crate. `#[derive(Component)]` registers in `ComponentRegistry`, captures name/debug fn. Same for the others.
+Test: derived types show up in registry; can be enumerated.
+
+**Stage 8 — `SystemParam` for `Res<T>` and `ResMut<T>`** (1–2 days)
+Trait definition, impls for `Res`/`ResMut`. Access set computation.
+Test: standalone `Res<T>` extraction works against a world.
+
+**Stage 9 — `SystemParam` for `Query<D, F>`** (2–3 days)
+Implement the trait for queries. Cache lookup state across calls.
+Test: extract a query from a world via the param trait.
+
+**Stage 10 — `IntoSystem` + tuple macro** (2–3 days)
+`IntoSystem` trait, tuple impls for arity 0–8 via macro. `FunctionSystem` wrapper. `Box<dyn System>` boxing.
+Test: write a regular function with two params, register it, invoke via the system box.
+
+**Stage 11 — `Schedule` enum + sequential scheduler** (1 day)
+`Schedule::Startup`, `First`, `PreUpdate`, `FixedUpdate`, `Update`, `PostUpdate`, `Render`, `Last`. Scheduler walks them in order, runs systems sequentially within each.
+Test: three systems in three different schedules run in correct order.
+
+**Stage 12 — `Workload` + builder** (2 days)
+`WorkloadLabel` trait, `#[derive(WorkloadLabel)]`. Workload builder closure: `app.add_workload(label, schedule, |w| { ... })`. `.after_workload()`, `.after(other_sys)`, `.before(other_sys)`, `.after_all_prior()`. Topo-sort within workload.
+Test: ordering constraints respected; cycle detected at registration.
+
+**Stage 13 — `Commands` + `CommandQueue`** (2 days)
+`Commands::spawn`, `despawn`, `entity(e).insert().remove()`, `insert_resource`, `update_resource`. Queue flush between workloads.
+Test: spawn inside a system → entity visible to next workload.
+
+**Stage 14 — `Events<T>` + readers/writers + `Plugin`/`App` + `FixedUpdate`** (2 days)
+`Events<T>` resource (double-buffered ring). `EventReader<T>` (cursor per system), `EventWriter<T>`. `Plugin` trait. `App::add_plugin`, `add_systems`, `add_workload`, `init_resource`, `add_event`, `run`. `FixedUpdate` accumulator.
+Test: end-to-end app with 1 plugin, 1 workload, 1 event round-trip; 100 ms simulated time = 6 fixed updates at 60 Hz.
+
+**After Phase 1: the ECS is feature-complete for shipping Spark.**
+
+### Phase 2 — Traceability & editor (stages 15–18)
+
+**Stage 15 — `FrameTrace` resource + `tracing` spans** (1 day)
+Wrap every system call in a `tracing::info_span!`. Record `SystemTrace` per system per workload. Update `FrameTrace` resource each frame.
+Test: read `FrameTrace` after one frame; counts and durations populated.
+
+**Stage 16 — `#[derive(Trace)]` + `ChangeLog`** (2–3 days)
+Derive macro wraps `&mut T` access in a tracking smart pointer. `ChangeLog` resource holds events per `TypeId`. Frame-scoped retention.
+Test: mutate a `#[derive(Trace)]` component; verify event appears in log with correct system attribution.
+
+**Stage 17 — Reflection APIs** (1–2 days)
+`world.entities()`, `world.inspect_entity(e)`, `world.inspect_resources()`. Component/resource registries expose `name`, debug-fmt fn, optional serde.
+Test: walk all entities and dump their components via registry; assert structure.
+
+**Stage 18 — `CommandLog` resource** (1 day)
+Per-frame log of every command applied. Editor history panel reads from it.
+Test: spawn/insert/remove inside a system; verify entries in log.
+
+**After Phase 2: editor can introspect everything live.** The actual `EditorPlugin` (egui overlay) lives in `crates/editor`, not in `crates/ecs`, but consumes the APIs above.
+
+### Phase 3 — Performance & polish (stages 19+)
+
+These are stretch; not required to ship Spark v1.
+
+**Stage 19 — Parallel system execution**
+Track access sets per system. Within a workload, batch non-conflicting systems and run via Rayon. Determinism preserved by disjoint-data invariant.
+Estimated: 3–5 days.
+
+**Stage 20 — `Local<T>` per-system state**
+Per-system state that persists between calls. Cached inside `FunctionSystem`.
+Estimated: ½ day.
+
+**Stage 21 — Run conditions**
+`.run_if(condition_fn)` on systems and workloads. Useful for "only run during gameplay, not in menu".
+Estimated: 1 day.
+
+**Stage 22 — `Changed<T>` / `Added<T>` query filters**
+Builds on `#[derive(Trace)]` infrastructure. Lets systems iterate only modified entities.
+Estimated: 2 days.
+
+**Stage 23 — `#[derive(Bundle)]` for named bundles**
+Sugar over tuples: `#[derive(Bundle)] struct WorkerBundle { pos: Position, vel: Velocity, ... }` then `cmd.spawn(worker_bundle)`.
+Estimated: 1 day.
+
+**Stage 24 — Archetype storage refactor**
+Replace sparse-set internals with archetype tables. Public API unchanged. Benchmark improvement.
+Estimated: 1–2 weeks.
+
+## Worked example 1 — orange-style demo (movable sprite + camera)
+
+Smallest end-to-end demo of the whole pipeline: window opens, sprite shows, WASD moves it, camera follows.
+
+### Components
+
+```rust
+// crates/core/src/types.rs
+#[derive(Component, Debug, Clone, Copy)]
+pub struct Position(pub Vec2);
+
+#[derive(Component, Debug, Clone, Copy)]
+pub struct Velocity(pub Vec2);
+
+#[derive(Component, Debug, Clone)]
+pub struct Sprite {
+    pub texture: TextureHandle,
+    pub size: Vec2,
+    pub tint: Color,
+}
+
+// game/src/main.rs
+#[derive(Component)] pub struct PlayerControlled;
+#[derive(Component)] pub struct CameraTarget;
+```
+
+### Resource
+
+```rust
+#[derive(Resource, Default)]
+pub struct Camera {
+    pub position: Vec2,
+    pub zoom: f32,
+}
+```
+
+### Systems
+
+```rust
+pub fn spawn_player(mut cmd: Commands, assets: Res<AssetServer>) {
+    let texture = assets.load_texture("player.png");
+    cmd.spawn((
+        Position(Vec2::ZERO),
+        Velocity(Vec2::ZERO),
+        Sprite { texture, size: vec2(32.0, 32.0), tint: Color::WHITE },
+        PlayerControlled,
+        CameraTarget,
+    ));
+}
+
+pub fn read_player_input(
+    input: Res<InputState>,
+    mut q: Query<&mut Velocity, With<PlayerControlled>>,
+) {
+    let mut dir = Vec2::ZERO;
+    if input.held(Key::W) { dir.y += 1.0; }
+    if input.held(Key::S) { dir.y -= 1.0; }
+    if input.held(Key::A) { dir.x -= 1.0; }
+    if input.held(Key::D) { dir.x += 1.0; }
+    for mut vel in q.iter_mut() {
+        vel.0 = dir.normalize_or_zero() * 200.0;
+    }
+}
+
+pub fn integrate_motion(
+    time: Res<Time>,
+    mut q: Query<(&mut Position, &Velocity)>,
+) {
+    for (mut pos, vel) in q.iter_mut() {
+        pos.0 += vel.0 * time.delta;
+    }
+}
+
+pub fn camera_follow(
+    mut camera: ResMut<Camera>,
+    targets: Query<&Position, With<CameraTarget>>,
+) {
+    if let Some(target) = targets.iter().next() {
+        camera.position = camera.position.lerp(target.0, 0.1);
+    }
+}
+```
+
+### Plugin
+
+```rust
+pub struct DemoPlugin;
+
+impl Plugin for DemoPlugin {
+    fn build(&self, app: &mut App) {
+        app.init_resource::<Camera>()
+           .add_systems(Schedule::Startup, spawn_player)
+           .add_workload(Workload::PlayerInput, Schedule::PreUpdate, |w| {
+               w.after_workload(Workload::Input);
+               w.add(read_player_input);
+           })
+           .add_workload(Workload::PlayerMotion, Schedule::Update, |w| {
+               w.add(integrate_motion);
+               w.add(camera_follow).after(integrate_motion);
+           });
+    }
+}
+```
+
+### main.rs
+
+```rust
+fn main() {
+    App::new()
+        .add_plugin(CorePlugin)
+        .add_plugin(WindowPlugin { title: "Spark Demo", size: (1280, 720) })
+        .add_plugin(InputPlugin)
+        .add_plugin(RenderPlugin)
+        .add_plugin(AssetsPlugin)
+        .add_plugin(DemoPlugin)
+        .run();
+}
+```
+
+A complete, runnable game showing the full ECS round-trip: input → motion → camera → render. ~80 lines of game-side code.
+
+## Worked example 2 — first Spark loop (plant → city)
+
+Building on the same primitives.
+
+### Components + Resources
+
+```rust
+#[derive(Component, Debug)]
+pub struct Plant {
+    pub kind: PlantKind,
+    pub output_mw: f32,
+}
+
+#[derive(Component)] pub struct Operational;
+#[derive(Component)] pub struct UnderMaintenance;
+
+#[derive(Component, Debug)]
+pub struct City {
+    pub population: u32,
+    pub demand_mw: f32,
+    pub supply_mw: f32,
+}
+
+#[derive(Resource, Default)]
+pub struct PowerNetwork {
+    pub supply: f32,
+    pub demand: f32,
+    pub ratio: f32,
+}
+
+#[derive(Event)]
+pub struct CityTierUp {
+    pub city: Entity,
+    pub new_tier: u32,
+}
+```
+
+### Systems
+
+```rust
+pub fn collect_supply(
+    plants: Query<&Plant, With<Operational>>,
+    mut grid: ResMut<PowerNetwork>,
+) {
+    grid.supply = plants.iter().map(|p| p.output_mw).sum();
+}
+
+pub fn compute_demand(
+    mut cities: Query<&mut City>,
+    mut grid: ResMut<PowerNetwork>,
+) {
+    let mut total = 0.0;
+    for mut city in cities.iter_mut() {
+        city.demand_mw = city.population as f32 * 0.001;
+        total += city.demand_mw;
+    }
+    grid.demand = total;
+    grid.ratio = if total > 0.0 { (grid.supply / total).min(1.0) } else { 1.0 };
+}
+
+pub fn distribute_power(
+    grid: Res<PowerNetwork>,
+    mut cities: Query<&mut City>,
+) {
+    for mut city in cities.iter_mut() {
+        city.supply_mw = city.demand_mw * grid.ratio;
+    }
+}
+
+pub fn city_growth(
+    time: Res<Time>,
+    mut cities: Query<(Entity, &mut City)>,
+    mut events: EventWriter<CityTierUp>,
+) {
+    for (entity, mut city) in cities.iter_mut() {
+        let met = if city.demand_mw > 0.0 { city.supply_mw / city.demand_mw } else { 1.0 };
+        if met > 0.95 {
+            city.population += (time.fixed_delta * 2.0) as u32;
+            if city.population >= 1000 {
+                events.write(CityTierUp { city: entity, new_tier: 2 });
+            }
+        } else if met < 0.5 {
+            city.population = city.population.saturating_sub((time.fixed_delta * 1.0) as u32);
+        }
+    }
+}
+```
+
+### Plugin
+
+```rust
+pub struct PowerCityPlugin;
+
+impl Plugin for PowerCityPlugin {
+    fn build(&self, app: &mut App) {
+        app.init_resource::<PowerNetwork>()
+           .add_event::<CityTierUp>()
+           .add_workload(Workload::PowerGrid, Schedule::FixedUpdate, |w| {
+               w.add(collect_supply);
+               w.add(compute_demand).after(collect_supply);
+               w.add(distribute_power).after(compute_demand);
+           })
+           .add_workload(Workload::CityTick, Schedule::FixedUpdate, |w| {
+               w.after_workload(Workload::PowerGrid);
+               w.add(city_growth);
+           });
+    }
+}
+```
+
+Fully working Spark minimum-loop. Each system is small and focused; access sets are declared by the parameter types; Phase 3 parallelisation will batch non-conflicting systems automatically.
+
+## Open questions
+
+Parked for future decisions:
+
+- **Bundle derive** — do we want `#[derive(Bundle)]` for named bundles like `WorkerBundle { pos, vel, sprite }`? Tuple-spawn `cmd.spawn((Position, Velocity, Sprite))` works without it. Convenient if many systems spawn the same shape.
+- **Run conditions** (`.run_if(...)`) — phase 3, decide when we hit game states (main menu vs gameplay).
+- **System sets** (Bevy's `SystemSet`) — we have workloads, which is similar but heavier. Decide if a lighter "label set" abstraction also has value.
+- **Hot-reload** — if `EditorPlugin` becomes capable, do we want hot-reload of systems via `libloading`? Likely out of scope for v1.
+- **Save/load** — separate concern; design once core ECS is stable. Will piggy-back on the reflection APIs from stage 17.
