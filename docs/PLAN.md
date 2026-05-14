@@ -92,7 +92,7 @@ members = ["crates/*", "game"]
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.95"
 authors = ["Alex Kucherenko", "Nikita Kucherenko"]
 license = "MIT"
 
