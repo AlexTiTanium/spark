@@ -160,7 +160,10 @@ impl EntityAllocator {
             let index = u32::try_from(self.generation.len())
                 .expect("entity count overflow: more than u32::MAX entities allocated");
             self.generation.push(0);
-            Entity { index, generation: 0 }
+            Entity {
+                index,
+                generation: 0,
+            }
         }
     }
 
@@ -274,7 +277,10 @@ mod tests {
         let old = alloc.allocate();
         alloc.destroy(old);
         let _new = alloc.allocate(); // reuses old's slot
-        assert!(!alloc.is_alive(old), "original handle must still be dead after reuse");
+        assert!(
+            !alloc.is_alive(old),
+            "original handle must still be dead after reuse"
+        );
     }
 
     #[test]
