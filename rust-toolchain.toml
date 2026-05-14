@@ -59,7 +59,7 @@
 # Effect: every cargo/rustc command run in this directory is routed through
 # this exact toolchain. We pin "1.95" to match the MSRV declared in
 # `Cargo.toml` (`rust-version = "1.95"`) and the CI action pin.
-channel = "1.95"
+channel = "1.95.0"
 
 # `components` — extra components installed alongside the compiler.
 #
