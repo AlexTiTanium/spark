@@ -71,10 +71,16 @@ channel = "1.95"
 #   - "miri"                — interpreter for UB detection (nightly only)
 #   - "llvm-tools-preview"  — needed for coverage instrumentation (`cargo-llvm-cov`)
 #
-# Effect: rustup fetches each listed component on first use. We list rustfmt
-# and clippy because the project's documentation/lint rules require both
-# locally, and `profile = "minimal"` below would otherwise skip them.
-components = ["rustfmt", "clippy"]
+# Effect: rustup fetches each listed component on first use. We list:
+#   - rustfmt + clippy   → required by the project's doc/lint rules
+#   - rust-src           → lets rust-analyzer resolve std symbols (jump-to-def
+#                          on `Vec`, `Iterator`, etc.) and unblocks future
+#                          `-Z build-std` work (e.g. wasm/no_std targets)
+# `profile = "minimal"` below would otherwise skip all of these.
+# `rust-analyzer` is intentionally not listed — the VS Code extension manages
+# its own (more frequently updated) RA binary. Add it here only if you want a
+# toolchain-matched RA for CI or `cargo +<channel> rust-analyzer`.
+components = ["rustfmt", "clippy", "rust-src"]
 
 # `profile` — which base set of components the toolchain ships with.
 #
