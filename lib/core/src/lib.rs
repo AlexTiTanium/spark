@@ -55,3 +55,47 @@
 //! - Do not put game-specific types (cities, plants, workers) here; the
 //!   game lives in `src/` and depends on the engine, not the other way
 //!   around.
+//!
+//! # Examples
+//!
+//! ```
+//! assert!(!spark_core::VERSION.is_empty());
+//! ```
+
+/// Semantic version of `spark-core`, mirrored from `Cargo.toml` at compile
+/// time.
+///
+/// # Logic
+///
+/// The string is produced by the `env!("CARGO_PKG_VERSION")` macro, which
+/// Cargo populates before rustc runs. The value is baked into the binary
+/// as a `&'static str` — there is no runtime cost.
+///
+/// # Why it works
+///
+/// `Cargo.toml` is the single source of truth for the crate version. Bump
+/// the manifest, recompile, and `VERSION` updates automatically — there is
+/// no parallel constant in code to forget.
+///
+/// # How to use
+///
+/// Use it for banners, log lines, and `--version` output:
+///
+/// ```
+/// println!("spark-core v{}", spark_core::VERSION);
+/// ```
+///
+/// # How NOT to use
+///
+/// - Do not hand-parse this string to compare versions; pull in a real
+///   semver crate when you need ordering.
+/// - Do not edit the value in code — bump `version` in
+///   `lib/core/Cargo.toml` and recompile.
+///
+/// # Examples
+///
+/// ```
+/// assert!(!spark_core::VERSION.is_empty());
+/// assert!(spark_core::VERSION.starts_with("0."));
+/// ```
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");

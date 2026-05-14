@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **Spark** is a Rust learning project: a custom 2D game engine built module-by-module, plus **Spark** itself — a power-grid + city simulator with indirect ("designate, don't control") gameplay.
 
-The repo is in a **design-first, pre-M1** state. Only `src/main.rs` (a `Hello, world!` stub) and a top-level single-package `Cargo.toml` exist. The `lib/` directory is empty. The intended workspace layout, crate breakdown, milestones, and architecture are specified in `docs/` — those documents are the source of truth for what to build next, not the current filesystem.
+The repo is in early **M1 (workspace foundations)**. The Cargo workspace is set up (`Cargo.toml` is a virtual manifest, members = `lib/*` + `src`); `spark-core` exists in `lib/core/` as an empty foundation crate; `src/` holds the `spark` binary (still a `Hello, world!` stub). Other engine crates (`spark-ecs`, `spark-window`, `spark-render`, …) and game modules under `src/game/` are not yet created. The design docs in `docs/` are still the source of truth for what to build next.
 
 Before writing code, read the design docs:
 
@@ -17,19 +17,19 @@ Before writing code, read the design docs:
 
 ## Commands
 
-Standard Cargo — no workspace, custom tooling, or CI is in place yet.
+Standard Cargo, run from the workspace root. CI runs the same commands on every push/PR.
 
 ```bash
-cargo build           # compile
-cargo run             # run main.rs
-cargo test            # run all tests
-cargo test <name>     # run a single test by name substring
-cargo check           # type-check without codegen
-cargo clippy          # lint
-cargo fmt             # format
+cargo build                       # build every workspace member
+cargo run -p spark                # run the binary (src/main.rs)
+cargo test --workspace            # run all tests + doc tests
+cargo test -p spark-core <name>   # run one crate's tests by name substring
+cargo check --workspace           # fast type-check across the workspace
+cargo clippy --workspace --all-targets --all-features -- -D warnings  # lint
+cargo fmt --all                   # format every member
 ```
 
-The workspace structure described in `docs/PLAN.md` (members = `lib/*`, `src`) is **planned but not yet realized**. When creating the first sub-crate, convert `Cargo.toml` to a workspace manifest per the template in `PLAN.md` (resolver = "2", `[workspace.package]` with edition 2024, `[workspace.lints]` with `clippy::pedantic = warn`).
+Workspace layout matches `docs/PLAN.md`: members = `lib/*` + `src`. Shared settings (edition, MSRV, license, lints) live in `[workspace.package]` and `[workspace.lints]` in the root `Cargo.toml`; each member opts in with `<field>.workspace = true` and `[lints] workspace = true`. New engine crates land under `lib/<name>/` and are picked up automatically by the `lib/*` glob.
 
 ## Architecture
 
