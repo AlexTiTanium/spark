@@ -1,0 +1,80 @@
+# src/Cargo.toml — manifest for the `spark` binary crate (the game).
+#
+# # Summary
+#
+# This crate is the entry point of the application: it wires together every
+# engine plugin from `lib/*` and runs the main loop. The crate lives under
+# `src/` rather than the usual top-level so the workspace root stays a clean
+# virtual manifest (no phantom crate at the top).
+#
+# # Logic
+#
+# Cargo discovers this crate as a workspace member (`members = ["lib/*",
+# "src"]` in `../Cargo.toml`). On `cargo build` it compiles every dependency
+# and links the binary defined by `[[bin]]` below — `main.rs` sits next to
+# this file, not in a nested `src/src/` directory, so we override the
+# default source path explicitly.
+#
+# # Why it works
+#
+# Inheriting `edition`, `rust-version`, and `license` from the workspace
+# means we have exactly one place to bump those values. Opting into
+# `[lints] workspace = true` makes this crate subject to the same Clippy
+# pedantic + `unsafe_code` rules as every other member.
+#
+# # How to use
+#
+# - `cargo run`               → build and run the game binary
+# - `cargo build`             → build (debug)
+# - `cargo build --release`   → build (release, optimised)
+# - `cargo run -p spark`      → unambiguous when invoked from a sub-crate
+#
+# # How NOT to use
+#
+# - Do not move `main.rs` into `src/src/main.rs` "to be more idiomatic"
+#   without also dropping the `[[bin]] path = "main.rs"` override below;
+#   one form must match the other.
+# - Do not pin dependency versions inline here once `[workspace.dependencies]`
+#   has the crate. Use `<name>.workspace = true` so versions stay centralised.
+
+[package]
+
+# `name` — the produced binary is called `spark` and this is how other
+# workspace members would reference it (none currently do — binaries
+# don't usually have downstream consumers).
+name = "spark"
+
+# `version` — semver of the game itself. 0.1.0 = pre-release, breaking
+# changes expected. Will move to 1.0.0 only when the game ships.
+version = "0.1.0"
+
+# Inherited from `[workspace.package]` in the root manifest.
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# `[[bin]]` — explicit binary target. The default discovery would look for
+# `src/main.rs` *relative to this manifest*, i.e. `src/src/main.rs`, but
+# we keep `main.rs` directly next to this Cargo.toml (per the layout in
+# `docs/PLAN.md`). The path override below makes Cargo find it.
+[[bin]]
+
+# `name` — name of the produced executable (`./target/debug/spark`).
+name = "spark"
+
+# `path` — source file of the binary, relative to this Cargo.toml.
+# Resolves to `<repo>/src/main.rs`.
+path = "main.rs"
+
+# `[lints] workspace = true` opts this crate into the workspace-wide lint
+# configuration declared in `../Cargo.toml` ([workspace.lints.rust] and
+# [workspace.lints.clippy]). Adding `[lints.clippy] <lint> = "allow"` here
+# can override individual lints, but doing so should be rare and noted.
+[lints]
+workspace = true
+
+# Runtime dependencies. As engine crates land they're wired in here as
+# path dependencies. `spark-core` is the foundation crate (math, time,
+# error, log, ids) and the first to come online.
+[dependencies]
+spark-core = { path = "../lib/core" }
