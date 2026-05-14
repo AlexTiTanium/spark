@@ -19,7 +19,7 @@ Full pitch and mechanics: [`docs/GAME_DESIGN.md`](./docs/GAME_DESIGN.md).
 - **Plugin pattern.** Each engine crate (`core`, `ecs`, `window`, `input`, `render`, `assets`, `ui`, `editor`, `audio`) exposes a `Plugin` that registers its resources and systems with the `App`.
 - **Two clocks.** Fixed-timestep 60 Hz simulation; variable-rate update and render.
 - **Deterministic simulation.** No `HashMap` iteration in sim systems — keeps the door open for save/replay/multiplayer.
-- **Modern Rust.** Edition 2024, `rust-version = "1.85"`, `wgpu` + WGSL, `tracing`, `thiserror`/`anyhow`, no `lazy_static!` / `extern crate` / `mod.rs`.
+- **Modern Rust.** Edition 2024, `rust-version = "1.95"`, `wgpu` + WGSL, `tracing`, `thiserror`/`anyhow`, no `lazy_static!` / `extern crate` / `mod.rs`.
 
 Guiding rule: **build the engine the game needs, not a general-purpose engine.**
 
@@ -61,3 +61,12 @@ cargo fmt             # format
 - [`docs/ECS_DESIGN.md`](./docs/ECS_DESIGN.md) — full ECS architecture, phased build plan
 - [`docs/GAME_DESIGN.md`](./docs/GAME_DESIGN.md) — game concept, mechanics, MVP scope
 - [`docs/UI_DESIGN.md`](./docs/UI_DESIGN.md) — egui-based UI strategy, editor vs game UI split
+
+## License
+
+Dual-licensed under either of
+
+- Apache License, Version 2.0 ([`LICENSE-APACHE`](./LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([`LICENSE-MIT`](./LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
+
+at your option.
