@@ -73,7 +73,8 @@ path = "main.rs"
 [lints]
 workspace = true
 
-# Runtime dependencies. Empty for now — `main.rs` is still a stub. As
-# engine crates land they'll be wired in here as path dependencies
-# (e.g. `spark-core = { path = "../lib/core" }`).
+# Runtime dependencies. As engine crates land they're wired in here as
+# path dependencies. `spark-core` is the foundation crate (math, time,
+# error, log, ids) and the first to come online.
 [dependencies]
+spark-core = { path = "../lib/core" }
