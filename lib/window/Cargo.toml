@@ -1,0 +1,27 @@
+# OS window + event-loop crate, built on `winit`. First engine crate
+# above `spark-core` in the dependency graph. Exposes a free `run()`
+# today; gets repackaged behind a `WindowPlugin` in M4 once `spark-ecs`
+# lands the `App` / `Plugin` traits.
+
+[package]
+name = "spark-window"
+version = "0.1.0"
+
+# Inherited from [workspace.package].
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+
+# Workspace path dep on the foundation crate.
+spark-core = { path = "../core" }
+
+# Versions pinned in root [workspace.dependencies]; we just opt in.
+winit.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+thiserror.workspace = true

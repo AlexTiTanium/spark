@@ -51,23 +51,67 @@ core → ecs → window → input → render → assets → ui → editor
                                             game (in src/) sits on top
 ```
 
-## Documentation requirements (STRICT — non-negotiable)
+## Documentation requirements (tiered)
 
-This is a **study project**. The whole point is to learn by reading the code later. Documentation is not optional polish — it is the deliverable. Code without documentation is unfinished work.
+This is a **study project**: the code should teach the reader. But teaching value comes from *insight*, not from ceremonial headings on every getter. Match doc depth to code complexity.
 
-**Every** function, struct, enum, trait, `impl` block, and module **must** carry a rustdoc comment (`///` on items, `//!` at the top of modules) covering all of the sections below. The only exemption: trivial one-line getters/setters and `#[derive]`-generated boilerplate. When in doubt, document.
+**Every** function, struct, enum, trait, `impl` block, and module carries a rustdoc comment (`///` on items, `//!` at modules). The only exemption is `#[derive]`-generated boilerplate. Pick the tier from the table below.
 
-Required sections, in this order:
+| Tier | Applies to | What to write |
+|---|---|---|
+| **1 — Trivial** | Builders, simple getters, obvious wrappers, one-line conversions, plain re-export modules | One-line summary + `# Examples` doc test. Nothing else. |
+| **2 — Meaningful** | Functions returning `Result`, types with an invariant, anything with a real footgun, module headers | Summary + 1–3 short paragraphs covering whichever of {how it works, why this design, key pitfall} actually has content + `# Examples`. Add `# Errors` if it returns `Result` (clippy requires it). |
+| **3 — Teaching** | Load-bearing engine code where the *why* is the entire point: `EntityAllocator`, `ComponentStorage`, schedulers, query planners, the workload graph | Full deep dive: Summary, Logic, Memory layout (ASCII), Why it works (the invariant), How to use, How NOT to use, Examples. |
 
-1. **Summary** — one short line in plain language. What this is, why it exists. No jargon a beginner wouldn't recognise; if a term is unavoidable, link or briefly define it.
-2. **Logic** — short paragraph explaining how it works, step by step where useful. Beginner-friendly.
-3. **Memory layout** — for any data structure, an ASCII schema of the fields and how they relate. Use ```` ```text ```` fenced blocks. This is mandatory for storages, allocators, queues, graphs, anything with non-trivial internal structure.
-4. **Why it works** — the invariant or insight that makes the implementation correct (e.g. "generation bump invalidates stale handles", "sparse[entity.index] always points to the dense slot or is `None`").
-5. **How to use** — typical call pattern, with realistic context (not just signature restated).
-6. **How NOT to use** — pitfalls, panics, footguns, wrong assumptions, ordering constraints, what happens if you call it twice, etc. Be explicit.
-7. **`# Examples`** — at least one runnable doc test with `assert_eq!` / `assert!`. Doc tests must compile and pass (`cargo test --doc`).
+**Rules of thumb:**
 
-Reference template (apply to every non-trivial item):
+- If a section would say "this is obvious from the signature," delete it.
+- Don't fabricate "How NOT to use" when there's no real footgun. Don't write a "Memory layout" block for a struct with three independent fields.
+- "How to use" and "Examples" usually duplicate each other — keep only `# Examples` unless the prose adds real context the doc test can't show.
+- Doc tests must compile and pass (`cargo test --doc`). Use `no_run` only when running the code would block (event loops) or require the network.
+
+### Tier 1 example
+
+```rust
+/// Sets the window title. Accepts `&str` or `String` via `Into<String>`.
+///
+/// # Examples
+///
+/// ```
+/// let cfg = WindowConfig::default().with_title("Hello");
+/// assert_eq!(cfg.title, "Hello");
+/// ```
+#[must_use]
+pub fn with_title(mut self, title: impl Into<String>) -> Self {
+    self.title = title.into();
+    self
+}
+```
+
+### Tier 2 example
+
+```rust
+/// Opens a window and drives the OS event loop until the user closes it.
+///
+/// Builds a `winit` event loop, constructs an internal handler that owns
+/// the window, and hands the loop to `EventLoop::run_app`. Blocks the
+/// calling thread until the user closes the window.
+///
+/// # Errors
+///
+/// Returns [`WindowError::EventLoop`] if the OS event loop cannot be
+/// created, or [`WindowError::Os`] if the window cannot be created.
+///
+/// # Examples
+///
+/// ```no_run
+/// spark_window::run(spark_window::WindowConfig::default())?;
+/// # Ok::<(), spark_window::WindowError>(())
+/// ```
+pub fn run(config: WindowConfig) -> Result<(), WindowError> { /* … */ }
+```
+
+### Tier 3 example (use this depth only when the design *is* the lesson)
 
 ```rust
 /// Allocates a new entity, reusing a freed slot when one is available.
@@ -91,14 +135,6 @@ Reference template (apply to every non-trivial item):
 /// pointing at that index now mismatches and `is_alive` returns `false`.
 /// `(index, generation)` uniquely names a live entity for all time.
 ///
-/// # How to use
-///
-/// ```
-/// let mut alloc = EntityAllocator::new();
-/// let e = alloc.allocate();
-/// assert!(alloc.is_alive(e));
-/// ```
-///
 /// # How NOT to use
 ///
 /// - Do not retain `Entity` handles across `World::clear()` — index
@@ -121,14 +157,19 @@ Reference template (apply to every non-trivial item):
 pub fn allocate(&mut self) -> Entity { /* … */ }
 ```
 
-**Enforcement rules — apply to yourself without being asked:**
+### Config files (TOML, YAML)
 
-- Before reporting any code change as complete, **re-read every function, struct, and module you wrote or modified** and verify all required sections are present and accurate.
-- If any item is missing documentation or has thin/placeholder sections, **do not stop — fix it**. Loop until the bar is met. Treat missing docs the same as a failing test.
-- Run `cargo test --doc` after writing or editing doc tests. A doc test that doesn't compile is a broken doc.
-- Module-level (`//!`) docs at the top of each file must describe what the module is for, what it exposes, and how it fits with neighbouring modules — the same logic/memory/why/use/don't structure applies, scaled up.
-- "Beginner-friendly" is the test: a reader who is learning Rust should be able to follow the doc without prior context from elsewhere in the codebase.
-- **Config files count too.** TOML and other config files (`Cargo.toml`, `rust-toolchain.toml`, `rustfmt.toml`, `clippy.toml`, CI YAML, etc.) must carry the same beginner-friendly comments — file-level header (summary/logic/why/how to use/how NOT to use, with examples where it helps), plus an inline comment on every non-trivial key explaining what the key does, the set of valid values, and the effect of the chosen value. The "ASCII memory-layout schema" section is optional for config files (skip it unless the file describes a data layout); everything else applies. Use `#` for comments in TOML/YAML.
+Same tiering applies, scaled down:
+
+- **File-level header**: 2–4 lines. What the file is, what's special about it. No multi-paragraph essays.
+- **Per-key comments**: only when the key choice or value is non-obvious. `edition = "2024"` needs no comment; `resolver = "3"` does (because *why* we set it explicitly is the interesting part). For pinned deps, one short line per dep saying what it does and why it's here.
+- Skip comments on plain workspace inheritance (`edition.workspace = true`, `license.workspace = true`) — group them under a single one-line header like `# Inherited from [workspace.package].`
+
+### Enforcement
+
+- After writing or editing code, re-read your docs and ask of each section: *would deleting this lose information a reader needs?* If no, delete it.
+- Run `cargo test --doc` after editing doc tests.
+- Module headers (`//!`) follow the same tiering as items: trivial re-export modules get one line; modules with real responsibility get Tier 2.
 
 ## Project conventions
 
