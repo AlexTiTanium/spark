@@ -100,12 +100,41 @@ rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 
 # `[workspace.dependencies]` — shared dependency versions. Members
-# reference with `<name>.workspace = true` in their own
-# `[dependencies]` table, optionally enabling features there.
-# Empty for now — engine crates have no third-party deps yet. When we
-# add `glam`, `thiserror`, `tracing`, `wgpu`, etc., pin exact versions
-# here (project convention — see `CLAUDE.md`).
+# reference with `<name>.workspace = true` in their own `[dependencies]`
+# table, optionally enabling features there. Every entry is pinned to an
+# exact version (e.g. `"0.30.13"`, not `"0.30"` or `"^0.30"`); project
+# policy is manual, deliberate bumps — no Dependabot, no caret ranges.
+# See `CLAUDE.md` "Project conventions".
 [workspace.dependencies]
+
+# `winit` — cross-platform window + event-loop library. Powers
+# `spark-window`. We are on the 0.30.x line because 0.31 is still beta
+# at the time of writing; 0.30 is the current latest stable. The crate
+# uses the `ApplicationHandler` trait model (see `winit::application`),
+# which is what `spark-window::event_loop` implements.
+# Stable since 0.30.0; MSRV of 0.30.13 is well below our 1.95 floor.
+winit = "0.30.13"
+
+# `tracing` — structured, level-based, async-aware logging. Modern
+# replacement for `log` + `env_logger` (per `CLAUDE.md` "Outdated
+# patterns to avoid"). Engine code emits events with `tracing::info!`,
+# `tracing::debug!`, etc.; binaries pick up a subscriber to format and
+# route them. Lives in `spark-window` for now; will move to
+# `spark-core::log` once a second engine crate also needs it.
+tracing = "0.1.44"
+
+# `tracing-subscriber` — the formatter + filter side of `tracing`. The
+# `fmt` feature enables the human-readable stdout formatter; `env-filter`
+# enables runtime level filtering via the `RUST_LOG` environment variable
+# (e.g. `RUST_LOG=spark_window=debug cargo run -p spark`). Without
+# `env-filter`, log levels are hard-coded at compile time.
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+
+# `thiserror` — derive macro for ergonomic `std::error::Error`
+# implementations on library error enums. Per `CLAUDE.md`, libraries use
+# `thiserror` and binaries use `anyhow`; we do NOT use `Box<dyn Error>`.
+# Used by `spark-window::WindowError` to wrap `winit::error` variants.
+thiserror = "2.0.18"
 
 # `[workspace.lints]` — lint configuration applied to every member that
 # opts in with `[lints] workspace = true` in its manifest. This is how we

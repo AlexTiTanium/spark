@@ -75,6 +75,22 @@ workspace = true
 
 # Runtime dependencies. As engine crates land they're wired in here as
 # path dependencies. `spark-core` is the foundation crate (math, time,
-# error, log, ids) and the first to come online.
+# error, log, ids) and the first to come online; `spark-window` follows
+# in M1 and owns the OS window + event loop.
 [dependencies]
+
+# `spark-core` — foundation crate (currently just `VERSION`).
 spark-core = { path = "../lib/core" }
+
+# `spark-window` — OS window + event-loop driver, built on `winit`. The
+# binary calls `spark_window::init_tracing()` then
+# `spark_window::run(WindowConfig::default()...)?` from `main`. Will be
+# replaced by `App::new().add_plugin(WindowPlugin)...` once `spark-ecs`
+# lands in M4 (see `docs/ECS_DESIGN.md` stage 14).
+spark-window = { path = "../lib/window" }
+
+# `tracing` — the binary emits its own log records (e.g. the startup
+# banner `Spark v{VERSION}`) and therefore depends on `tracing` directly,
+# not transitively through `spark-window`. Pinned at the workspace level;
+# see `[workspace.dependencies].tracing` in the root manifest.
+tracing.workspace = true
