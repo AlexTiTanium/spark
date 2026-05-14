@@ -53,12 +53,22 @@
 [workspace]
 
 # `resolver` — which version of Cargo's dependency-resolution algorithm to
-# use. Valid values: "1" | "2" | "3". Edition 2021+ defaults to "2";
-# edition 2024 defaults to "3". We pin "2" explicitly for clarity and
-# stability — it handles target-specific features correctly (each target
-# resolves features independently), which matters once we add wgpu and
-# cross-compile to wasm/native.
-resolver = "2"
+# use. Valid values: "1" | "2" | "3". We pin "3" explicitly. Edition 2024
+# already defaults to "3", but being explicit documents intent.
+#
+# Why resolver 3:
+#   - It is a strict superset of "2" (per-target/per-kind feature unification
+#     — dev-deps no longer leak features into release builds).
+#   - Adds MSRV-aware version resolution: when picking dep versions it
+#     consults `rust-version` here, so Cargo prefers versions that compile
+#     with our pinned 1.95 toolchain rather than always grabbing the newest.
+#     Without this, a fresh dep release that bumps its own MSRV silently
+#     breaks the build.
+#
+# Stable since Cargo 1.84; we are on 1.95, so the only constraint is that
+# everyone touching this repo also runs ≥ 1.84 (they do — see
+# `rust-toolchain.toml`).
+resolver = "3"
 
 # `members` — paths (glob-supported) to the crates that make up this
 # workspace. Cargo treats each as a buildable unit.
