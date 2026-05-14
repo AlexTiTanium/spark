@@ -1,4 +1,99 @@
+# rust-toolchain.toml — pins the Rust toolchain used to build this project.
+#
+# # Summary
+#
+# Tells `rustup` (the Rust installer/version manager) exactly which compiler
+# release and which extra tooling to use whenever any `cargo`/`rustc` command
+# runs inside this directory tree. Without this file, the user's globally
+# selected toolchain wins — meaning "works on my machine" bugs are one
+# `rustup default` away.
+#
+# # Logic
+#
+# `rustup` walks up from the current directory looking for a `rust-toolchain.toml`
+# (or the older bare-channel `rust-toolchain`) file. The first one it finds becomes
+# an override for that directory: cargo/rustc invocations are routed through the
+# toolchain declared here. If the toolchain isn't installed yet, rustup installs
+# it automatically on first use, including the listed components.
+#
+# # Why it works
+#
+# Pinning the channel here makes local builds identical to CI (which pins the same
+# version via `dtolnay/rust-toolchain@1.95.0` in `.github/workflows/ci.yml`).
+# Anyone who clones the repo and runs `cargo build` ends up on Rust 1.95 with
+# rustfmt + clippy installed, regardless of what their global default is.
+#
+# # How to use
+#
+# Just run cargo normally. The first command in a fresh clone may take a minute
+# while rustup downloads the toolchain:
+#
+#   $ cargo build      # uses Rust 1.95 + rustfmt + clippy from this file
+#   $ cargo clippy     # ditto
+#   $ cargo fmt        # ditto
+#
+# To temporarily try a different toolchain without editing this file:
+#
+#   $ cargo +nightly build
+#
+# # How NOT to use
+#
+# - Do not bump `channel` without also bumping `rust-version` in `Cargo.toml`
+#   and the pinned action version in `.github/workflows/ci.yml`. All three must
+#   stay in lockstep — otherwise CI and local will silently disagree.
+# - Do not use `channel = "stable"` if you care about reproducibility. "stable"
+#   floats — today it's 1.95, next month it's 1.96, and a future Rust release
+#   could quietly break the build.
+# - Do not switch `profile` to `"complete"` casually; it pulls down hundreds of
+#   megabytes of components most projects never use.
+
 [toolchain]
-channel = "1.85"
+
+# `channel` — which Rust release rustup should install and use.
+#
+# Valid values:
+#   - "stable" | "beta" | "nightly"       — latest of that train (floats)
+#   - "1.95" | "1.95.0"                   — exact-version pin (reproducible)
+#   - "nightly-2025-01-15"                — pinned nightly by date
+#
+# Effect: every cargo/rustc command run in this directory is routed through
+# this exact toolchain. We pin "1.95" to match the MSRV declared in
+# `Cargo.toml` (`rust-version = "1.95"`) and the CI action pin.
+channel = "1.95"
+
+# `components` — extra components installed alongside the compiler.
+#
+# Valid values (common ones):
+#   - "rustfmt"             — code formatter (required by `cargo fmt`)
+#   - "clippy"              — lint suite (required by `cargo clippy`)
+#   - "rust-src"            — std source, needed by rust-analyzer and `-Z build-std`
+#   - "rust-analyzer"       — LSP server, if you don't install it via your editor
+#   - "miri"                — interpreter for UB detection (nightly only)
+#   - "llvm-tools-preview"  — needed for coverage instrumentation (`cargo-llvm-cov`)
+#
+# Effect: rustup fetches each listed component on first use. We list rustfmt
+# and clippy because the project's documentation/lint rules require both
+# locally, and `profile = "minimal"` below would otherwise skip them.
 components = ["rustfmt", "clippy"]
+
+# `profile` — which base set of components the toolchain ships with.
+#
+# Valid values:
+#   - "minimal"  — rustc + cargo + rust-std only (smallest install)
+#   - "default"  — minimal + rust-docs + rustfmt + clippy (rustup's default)
+#   - "complete" — every shipped component (large; not recommended)
+#
+# Effect: combined with `components` above, "minimal" keeps the install lean —
+# nothing lands on disk that wasn't explicitly requested. Switching to
+# "default" would be redundant here (rustfmt + clippy are already listed).
 profile = "minimal"
+
+# Other [toolchain] keys you might add later (not used today):
+#
+#   targets = ["wasm32-unknown-unknown", "x86_64-unknown-linux-musl"]
+#     # cross-compilation targets to preinstall — saves a `rustup target add`
+#     # step in CI when you start shipping web/mobile/static builds.
+#
+#   path = "/abs/path/to/custom/toolchain"
+#     # point rustup at a locally built compiler instead of installing one —
+#     # only useful when hacking on the Rust compiler itself.

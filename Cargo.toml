@@ -1,8 +1,79 @@
+# Cargo.toml — manifest for the `spark` binary crate (top-level for now).
+#
+# # Summary
+#
+# Declares package metadata and dependencies for the Spark application crate.
+# This is the file `cargo` reads to know what to build, what to link against,
+# and what Rust version it can assume.
+#
+# # Logic
+#
+# Today this is a single-package manifest because only the top-level `src/` exists
+# and `lib/` is empty. When the first sub-crate lands (e.g. `lib/core`), this file
+# becomes a workspace manifest per the template in `docs/PLAN.md` — the package
+# moves under `src/Cargo.toml`, and `[workspace] members = ["lib/*", "src"]` lives
+# here instead.
+#
+# # Why it works
+#
+# Pinning `edition = "2024"` plus `rust-version = "1.95"` locks the project to
+# modern Rust idioms (async closures, let-else everywhere, etc.) and matches the
+# toolchain pin in `rust-toolchain.toml` and the action pin in CI. All three are
+# load-bearing — drift between them is what causes "works locally, fails in CI".
+#
+# # How to use
+#
+# - `cargo build` / `cargo run` / `cargo test` — standard commands work as usual.
+# - Add new runtime dependencies with `cargo add <crate> --vers <exact-version>`
+#   (exact-version pin is a project convention — see `CLAUDE.md`).
+# - Add dev-only deps (tests, benches) under a new `[dev-dependencies]` table.
+#
+# # How NOT to use
+#
+# - Do not relax `edition` or `rust-version` to chase compatibility with an older
+#   crate — find a different crate or wait for it to be updated.
+# - Do not use caret/wildcard version requirements (e.g. `"1.0"`, `"^1.0"`, `"*"`).
+#   The project pins exact versions so `cargo update` can never surprise CI.
+# - Do not commit local-path or git-only dependencies once the workspace is set
+#   up; sub-crates in `lib/*` will be referenced via workspace inheritance instead.
+
 [package]
+
+# `name` — crate name on disk and as published to crates.io (if ever).
+# Effect: produces a binary called `spark` (since `src/main.rs` exists).
+# When this file becomes a workspace manifest, this `[package]` table moves
+# to `src/Cargo.toml` and gets renamed there if appropriate.
 name = "spark"
+
+# `version` — semver of this crate. 0.1.0 means "pre-release, breaking changes
+# expected" — appropriate while we're pre-M1.
+# Effect: shows up in `cargo --version` output for the binary and would be the
+# published version if we ever ran `cargo publish`.
 version = "0.1.0"
+
+# `edition` — which Rust edition's syntax/idioms apply to this crate.
+# Valid values: "2015" | "2018" | "2021" | "2024".
+# Effect: enables edition-2024 features (let-else everywhere, async closures,
+# new `unsafe` ergonomics, `Cargo.lock` v4 by default, etc.). Older editions
+# are still valid but disable newer syntax — we want the latest.
 edition = "2024"
-rust-version = "1.85"
+
+# `rust-version` — minimum supported Rust version (MSRV) for this crate.
+# Effect: cargo refuses to build with an older toolchain than this and warns
+# downstream consumers if they try. Must stay in lockstep with
+# `rust-toolchain.toml` (channel) and `.github/workflows/ci.yml` (action pin).
+rust-version = "1.95"
+
+# `license` — SPDX license identifier(s) for this crate.
+# Valid values: any SPDX expression — e.g. "MIT", "Apache-2.0", "MIT OR Apache-2.0".
+# Effect: surfaced on crates.io and by license-audit tooling (e.g. cargo-deny).
+# Dual MIT/Apache-2.0 is the Rust ecosystem convention; the full license texts
+# live in `LICENSE-MIT` and `LICENSE-APACHE` at the repo root.
 license = "MIT OR Apache-2.0"
 
+# Runtime dependencies. Empty for now — Spark hasn't taken a dep on anything
+# yet. When adding entries, pin exact versions:
+#   wgpu = "26.0.1"        # ✓ exact pin (project convention)
+#   wgpu = "26"            # ✗ caret range, forbidden
+#   wgpu = "^26.0.1"       # ✗ same — caret in disguise
 [dependencies]

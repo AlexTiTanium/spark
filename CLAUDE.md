@@ -128,12 +128,13 @@ pub fn allocate(&mut self) -> Entity { /* … */ }
 - Run `cargo test --doc` after writing or editing doc tests. A doc test that doesn't compile is a broken doc.
 - Module-level (`//!`) docs at the top of each file must describe what the module is for, what it exposes, and how it fits with neighbouring modules — the same logic/memory/why/use/don't structure applies, scaled up.
 - "Beginner-friendly" is the test: a reader who is learning Rust should be able to follow the doc without prior context from elsewhere in the codebase.
+- **Config files count too.** TOML and other config files (`Cargo.toml`, `rust-toolchain.toml`, `rustfmt.toml`, `clippy.toml`, CI YAML, etc.) must carry the same beginner-friendly comments — file-level header (summary/logic/why/how to use/how NOT to use, with examples where it helps), plus an inline comment on every non-trivial key explaining what the key does, the set of valid values, and the effect of the chosen value. The "ASCII memory-layout schema" section is optional for config files (skip it unless the file describes a data layout); everything else applies. Use `#` for comments in TOML/YAML.
 
 ## Project conventions
 
 These are non-obvious and worth keeping in mind:
 
-- **Modern Rust only.** Edition 2024, `rust-version = "1.85"`. Avoid all "orange-era" patterns documented in `PLAN.md` § "Outdated patterns to avoid": no `extern crate`, no `mod.rs` (use `foo.rs` + `foo/`), no `lazy_static!` (use `std::sync::LazyLock`), no `try!`, no `Box<dyn Error>` (use `thiserror` for libs, `anyhow` for apps), no `failure`/`error-chain`, no hand-rolled GL (use `wgpu` + WGSL), no `log`+`env_logger` (use `tracing` + `tracing-subscriber`).
+- **Modern Rust only.** Edition 2024, `rust-version = "1.95"`. Avoid all "orange-era" patterns documented in `PLAN.md` § "Outdated patterns to avoid": no `extern crate`, no `mod.rs` (use `foo.rs` + `foo/`), no `lazy_static!` (use `std::sync::LazyLock`), no `try!`, no `Box<dyn Error>` (use `thiserror` for libs, `anyhow` for apps), no `failure`/`error-chain`, no hand-rolled GL (use `wgpu` + WGSL), no `log`+`env_logger` (use `tracing` + `tracing-subscriber`).
 - **Pinned exact deps.** Dependency versions are pinned to exact versions (e.g. `"1.1.0"`, not `"1.1"` or `"^1.1.0"`).
 - **Workspace lints.** `[workspace.lints.rust] unsafe_code = "warn"` and `[workspace.lints.clippy] pedantic = "warn"`. No `unsafe` until profiling demands it.
 - **Crate naming.** Engine crates are named `spark-<module>` (e.g. `spark-ecs`, `spark-ecs-derive`) per the `Cargo.toml` examples in `ECS_DESIGN.md`. Internal paths use the unprefixed module name.
