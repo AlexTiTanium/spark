@@ -1,97 +1,27 @@
-# lib/window/Cargo.toml — manifest for the `spark-window` engine crate.
-#
-# # Summary
-#
-# `spark-window` owns the platform window and the OS event loop. It is the
-# first engine crate above `spark-core` in the dependency graph (see
-# `docs/PLAN.md`). Today it exposes a free function `run(config)` that
-# opens a window via `winit` and logs OS events via `tracing`; in milestone
-# M4 the same internals get repackaged behind an `App` / `Plugin` trait
-# from `spark-ecs`.
-#
-# # Logic
-#
-# Cargo discovers this crate via `members = ["lib/*", "src"]` in the
-# workspace root (`../../Cargo.toml`). The crate name `spark-window`
-# becomes the Rust identifier `spark_window` (hyphens → underscores).
-# Dependencies (`winit`, `tracing`, …) are pinned in
-# `[workspace.dependencies]` at the root and inherited here with
-# `<name>.workspace = true` so versions stay centralised.
-#
-# # Why it works
-#
-# Keeping the window + event-loop concern in its own crate means the rest
-# of the engine never imports `winit` directly. If we ever swap winit for
-# another backend, only this crate changes. The crate has zero state of
-# its own at module scope — all state lives inside the `EventLoopRunner`
-# value passed into `winit::event_loop::EventLoop::run_app`.
-#
-# # How to use
-#
-# - `cargo build -p spark-window`   → build just this crate
-# - `cargo test -p spark-window`    → run this crate's unit + doc tests
-# - From another workspace crate (e.g. the `spark` binary):
-#     `spark-window = { path = "../lib/window" }` under `[dependencies]`,
-#     then `spark_window::run(spark_window::WindowConfig::default())?` in
-#     code.
-#
-# # How NOT to use
-#
-# - Do not call `spark_window::run(...)` from a doc test or unit test —
-#   it blocks on the OS event loop and the test process will hang.
-# - Do not add render or input concerns here; rendering lives in
-#   `lib/render/` (M2) and input in `lib/input/` (next M1 PR).
+# OS window + event-loop crate, built on `winit`. First engine crate
+# above `spark-core` in the dependency graph. Exposes a free `run()`
+# today; gets repackaged behind a `WindowPlugin` in M4 once `spark-ecs`
+# lands the `App` / `Plugin` traits.
 
 [package]
-
-# `name` — crate name on crates.io / `cargo`; references in code use the
-# underscore form `spark_window`. Engine crates use the `spark-` prefix
-# (see `CLAUDE.md` "Crate naming").
 name = "spark-window"
-
-# `version` — semver of this crate. 0.1.0 = pre-release; breaking changes
-# are allowed between 0.x minor bumps while the engine is being built out.
 version = "0.1.0"
 
-# Inherited from `[workspace.package]` in the root manifest. Centralising
-# `edition`, `rust-version`, and `license` means there is exactly one
-# place to bump them, and drift between crates is impossible by
-# construction.
+# Inherited from [workspace.package].
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
-# `[lints] workspace = true` — apply the workspace-wide lint config from
-# `../../Cargo.toml` (`unsafe_code = "warn"`, `clippy::pedantic = "warn"`).
-# Overriding a single lint here is allowed but should be rare and noted.
 [lints]
 workspace = true
 
-# Runtime dependencies. Each entry is pinned (exact version) in the root
-# `[workspace.dependencies]` table; we just opt in here.
 [dependencies]
 
-# `spark-core` — workspace path dep. Currently exports `VERSION` only;
-# more shared types (math, time, error, log) will land here over M1–M2.
+# Workspace path dep on the foundation crate.
 spark-core = { path = "../core" }
 
-# `winit` — windowing + event loop. Drives `EventLoopRunner` in
-# `src/event_loop.rs`. See `[workspace.dependencies].winit` for the
-# version pin and rationale.
+# Versions pinned in root [workspace.dependencies]; we just opt in.
 winit.workspace = true
-
-# `tracing` — structured logging. Used to emit info/debug/trace events
-# for window and input lifecycle. Pulled in here (not `spark-core`) until
-# a second engine crate needs it — see policy note in `lib/core/Cargo.toml`.
 tracing.workspace = true
-
-# `tracing-subscriber` — the formatter and filter for `tracing`. Used
-# only by `init_tracing()` in `src/log.rs`, which the binary calls once
-# at startup. With the `env-filter` feature enabled (see root manifest)
-# log levels can be set at runtime via `RUST_LOG`.
 tracing-subscriber.workspace = true
-
-# `thiserror` — derive macro for typed library error enums. Used by
-# `WindowError` in `src/error.rs` to wrap `winit::error::{EventLoopError,
-# OsError}` without resorting to `Box<dyn Error>`.
 thiserror.workspace = true

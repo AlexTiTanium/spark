@@ -1,157 +1,59 @@
-# Cargo.toml — workspace manifest for the Spark monorepo.
-#
-# # Summary
-#
-# This is the **workspace root**. It doesn't itself build a crate; it tells
-# Cargo which sub-crates make up this project and declares the metadata,
-# dependency versions, and lint configuration they all share. Each member
-# inherits from here via `edition.workspace = true`, `wgpu.workspace = true`,
-# `[lints] workspace = true`, etc., so versions and rules stay consistent
-# across the engine.
-#
-# # Logic
-#
-# When you run any `cargo` command at this directory (or any descendant of
-# it), Cargo discovers this file, reads `[workspace] members`, and treats
-# each listed path as a sub-crate. `cargo build` builds all members; `cargo
-# test -p spark-core` targets one. Sub-crate manifests reference shared
-# settings with the `.workspace = true` shorthand — the values are looked
-# up here.
-#
-# # Why it works
-#
-# Hosting MSRV, edition, license, dependency versions, and lints centrally
-# means there is exactly one place to bump them. Drift between sub-crates
-# (e.g. one on `edition = "2021"`, another on `edition = "2024"`) becomes
-# impossible by construction. Workspace lints (`clippy::pedantic`,
-# `unsafe_code`) apply to every member that opts in with `[lints] workspace
-# = true`, so the whole engine gets reviewed under the same bar.
-#
-# # How to use
-#
-# - `cargo build`         → builds every workspace member
-# - `cargo test`          → tests every member
-# - `cargo test -p spark-core`  → just one member
-# - `cargo check --workspace`   → fast type-check across the workspace
-#
-# Add a new engine crate by creating `lib/<name>/{Cargo.toml,src/lib.rs}`;
-# the `lib/*` glob in `members` picks it up automatically.
-#
-# # How NOT to use
-#
-# - Do not duplicate `edition`, `rust-version`, or `license` in sub-crate
-#   manifests — inherit them via `.workspace = true`.
-# - Do not declare shared dep versions inside sub-crates. Add them to
-#   `[workspace.dependencies]` here and reference with `<name>.workspace
-#   = true` in members.
-# - Do not put a `[package]` table in this file. A workspace root is
-#   either virtual (no `[package]`, as here) or hybrid (also a crate);
-#   we use virtual to avoid building a phantom crate at the root.
-# - Do not relax `[workspace.lints]` per crate without a written reason —
-#   the lints are part of the engineering bar.
+# Workspace root manifest. Virtual (no `[package]`) — Cargo uses this
+# only to discover members and to host shared package/lint/dep settings
+# inherited via `<field>.workspace = true`. To add an engine crate,
+# create `lib/<name>/{Cargo.toml,src/lib.rs}`; the `lib/*` glob picks
+# it up.
 
 [workspace]
 
-# `resolver` — which version of Cargo's dependency-resolution algorithm to
-# use. Valid values: "1" | "2" | "3". We pin "3" explicitly. Edition 2024
-# already defaults to "3", but being explicit documents intent.
-#
-# Why resolver 3:
-#   - It is a strict superset of "2" (per-target/per-kind feature unification
-#     — dev-deps no longer leak features into release builds).
-#   - Adds MSRV-aware version resolution: when picking dep versions it
-#     consults `rust-version` here, so Cargo prefers versions that compile
-#     with our pinned 1.95 toolchain rather than always grabbing the newest.
-#     Without this, a fresh dep release that bumps its own MSRV silently
-#     breaks the build.
-#
-# Stable since Cargo 1.84; we are on 1.95, so the only constraint is that
-# everyone touching this repo also runs ≥ 1.84 (they do — see
-# `rust-toolchain.toml`).
+# Resolver 3: per-target/per-kind feature unification (dev-deps don't
+# leak features into release) AND MSRV-aware version resolution (Cargo
+# prefers versions that compile with our pinned 1.95 toolchain). Edition
+# 2024 defaults to "3"; setting it explicitly documents intent.
 resolver = "3"
 
-# `members` — paths (glob-supported) to the crates that make up this
-# workspace. Cargo treats each as a buildable unit.
-#   - "lib/*"  picks up every engine sub-crate as we add them
-#               (lib/core, lib/ecs, lib/window, …)
-#   - "src"    is the top-level game binary crate (`spark`)
-# Order doesn't affect build behaviour; Cargo computes the dep graph.
 members = ["lib/*", "src"]
 
-# `[workspace.package]` — default values that members can inherit with
-# `<field>.workspace = true` in their own `[package]` table.
 [workspace.package]
-
-# `edition` — Rust edition for every member. "2024" enables the newest
-# language defaults (let-else everywhere, async closures, updated
-# import/module rules). Members opt in with `edition.workspace = true`.
 edition = "2024"
 
-# `rust-version` — workspace MSRV. Every member that inherits this will
-# refuse to build on an older toolchain. Must agree with `channel` in
-# `rust-toolchain.toml` and the pinned `dtolnay/rust-toolchain` action
-# in CI — all three move together.
+# MSRV. Must agree with `channel` in `rust-toolchain.toml` and the
+# `dtolnay/rust-toolchain` pin in CI — all three move together.
 rust-version = "1.95"
 
-# `license` — SPDX license expression inherited by every member. "MIT OR
-# Apache-2.0" is the Rust ecosystem convention for dual-licensed crates;
-# full license texts live in `LICENSE-MIT` and `LICENSE-APACHE` at the
-# repo root.
 license = "MIT OR Apache-2.0"
 
-# `[workspace.dependencies]` — shared dependency versions. Members
-# reference with `<name>.workspace = true` in their own `[dependencies]`
-# table, optionally enabling features there. Every entry is pinned to an
-# exact version (e.g. `"0.30.13"`, not `"0.30"` or `"^0.30"`); project
-# policy is manual, deliberate bumps — no Dependabot, no caret ranges.
-# See `CLAUDE.md` "Project conventions".
+# Shared dependency versions, pinned to exact patch (no caret ranges).
+# Members opt in with `<name>.workspace = true`. Bumps are manual — no
+# Dependabot (see CLAUDE.md "Project conventions").
 [workspace.dependencies]
 
-# `winit` — cross-platform window + event-loop library. Powers
-# `spark-window`. We are on the 0.30.x line because 0.31 is still beta
-# at the time of writing; 0.30 is the current latest stable. The crate
-# uses the `ApplicationHandler` trait model (see `winit::application`),
-# which is what `spark-window::event_loop` implements.
-# Stable since 0.30.0; MSRV of 0.30.13 is well below our 1.95 floor.
+# Window + event loop. Latest stable; 0.31 is still beta. Used only by
+# `spark-window`. Uses the `ApplicationHandler` model.
 winit = "0.30.13"
 
-# `tracing` — structured, level-based, async-aware logging. Modern
-# replacement for `log` + `env_logger` (per `CLAUDE.md` "Outdated
-# patterns to avoid"). Engine code emits events with `tracing::info!`,
-# `tracing::debug!`, etc.; binaries pick up a subscriber to format and
-# route them. Lives in `spark-window` for now; will move to
-# `spark-core::log` once a second engine crate also needs it.
+# Structured logging. Replaces `log` + `env_logger`. Currently only
+# `spark-window` uses it; moves to `spark-core` when a second engine
+# crate also needs to log.
 tracing = "0.1.44"
 
-# `tracing-subscriber` — the formatter + filter side of `tracing`. The
-# `fmt` feature enables the human-readable stdout formatter; `env-filter`
-# enables runtime level filtering via the `RUST_LOG` environment variable
-# (e.g. `RUST_LOG=spark_window=debug cargo run -p spark`). Without
-# `env-filter`, log levels are hard-coded at compile time.
+# Formatter + filter for `tracing`. `env-filter` enables runtime `RUST_LOG`
+# control; `fmt` is the stdout formatter. Used by `init_tracing()`.
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 
-# `thiserror` — derive macro for ergonomic `std::error::Error`
-# implementations on library error enums. Per `CLAUDE.md`, libraries use
-# `thiserror` and binaries use `anyhow`; we do NOT use `Box<dyn Error>`.
-# Used by `spark-window::WindowError` to wrap `winit::error` variants.
+# Derive macro for typed library error enums. Per CLAUDE.md: libraries
+# use `thiserror`, binaries use `anyhow`, never `Box<dyn Error>`.
 thiserror = "2.0.18"
 
-# `[workspace.lints]` — lint configuration applied to every member that
-# opts in with `[lints] workspace = true` in its manifest. This is how we
-# keep the engineering bar consistent across crates.
+# Workspace-wide lints. Members opt in with `[lints] workspace = true`.
 [workspace.lints.rust]
 
-# `unsafe_code` — warn on any use of `unsafe`. We don't allow `unsafe`
-# until profiling demands it (per `CLAUDE.md`); warning makes accidental
-# `unsafe` blocks visible in CI without hard-failing the build.
-# Valid values: "allow" | "warn" | "deny" | "forbid".
+# Warn (not deny) so accidental `unsafe` is visible in CI without
+# blocking the build. No `unsafe` until profiling demands it.
 unsafe_code = "warn"
 
 [workspace.lints.clippy]
 
-# `pedantic` — enable Clippy's pedantic lint group, which catches stylistic
-# and correctness nits that the default group skips (e.g. `must_use_candidate`,
-# `cast_precision_loss`). `priority = -1` lets individual lints in this
-# group be overridden by later, more specific lint settings without warnings
-# fighting each other.
+# `priority = -1` lets individual lints in this group be overridden by
+# more specific settings without fighting each other.
 pedantic = { level = "warn", priority = -1 }

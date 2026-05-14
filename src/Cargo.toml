@@ -1,96 +1,30 @@
-# src/Cargo.toml — manifest for the `spark` binary crate (the game).
-#
-# # Summary
-#
-# This crate is the entry point of the application: it wires together every
-# engine plugin from `lib/*` and runs the main loop. The crate lives under
-# `src/` rather than the usual top-level so the workspace root stays a clean
-# virtual manifest (no phantom crate at the top).
-#
-# # Logic
-#
-# Cargo discovers this crate as a workspace member (`members = ["lib/*",
-# "src"]` in `../Cargo.toml`). On `cargo build` it compiles every dependency
-# and links the binary defined by `[[bin]]` below — `main.rs` sits next to
-# this file, not in a nested `src/src/` directory, so we override the
-# default source path explicitly.
-#
-# # Why it works
-#
-# Inheriting `edition`, `rust-version`, and `license` from the workspace
-# means we have exactly one place to bump those values. Opting into
-# `[lints] workspace = true` makes this crate subject to the same Clippy
-# pedantic + `unsafe_code` rules as every other member.
-#
-# # How to use
-#
-# - `cargo run`               → build and run the game binary
-# - `cargo build`             → build (debug)
-# - `cargo build --release`   → build (release, optimised)
-# - `cargo run -p spark`      → unambiguous when invoked from a sub-crate
-#
-# # How NOT to use
-#
-# - Do not move `main.rs` into `src/src/main.rs` "to be more idiomatic"
-#   without also dropping the `[[bin]] path = "main.rs"` override below;
-#   one form must match the other.
-# - Do not pin dependency versions inline here once `[workspace.dependencies]`
-#   has the crate. Use `<name>.workspace = true` so versions stay centralised.
+# `spark` binary crate. Wires engine plugins together and runs the main
+# loop. Lives under `src/` rather than the repo root so the workspace
+# manifest can stay virtual (no phantom top-level crate).
 
 [package]
-
-# `name` — the produced binary is called `spark` and this is how other
-# workspace members would reference it (none currently do — binaries
-# don't usually have downstream consumers).
 name = "spark"
-
-# `version` — semver of the game itself. 0.1.0 = pre-release, breaking
-# changes expected. Will move to 1.0.0 only when the game ships.
 version = "0.1.0"
 
-# Inherited from `[workspace.package]` in the root manifest.
+# Inherited from [workspace.package].
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
-# `[[bin]]` — explicit binary target. The default discovery would look for
-# `src/main.rs` *relative to this manifest*, i.e. `src/src/main.rs`, but
-# we keep `main.rs` directly next to this Cargo.toml (per the layout in
-# `docs/PLAN.md`). The path override below makes Cargo find it.
+# Default discovery would look for `src/main.rs` relative to this
+# manifest, i.e. `src/src/main.rs`. We keep `main.rs` next to this file
+# (per docs/PLAN.md), so override the path.
 [[bin]]
-
-# `name` — name of the produced executable (`./target/debug/spark`).
 name = "spark"
-
-# `path` — source file of the binary, relative to this Cargo.toml.
-# Resolves to `<repo>/src/main.rs`.
 path = "main.rs"
 
-# `[lints] workspace = true` opts this crate into the workspace-wide lint
-# configuration declared in `../Cargo.toml` ([workspace.lints.rust] and
-# [workspace.lints.clippy]). Adding `[lints.clippy] <lint> = "allow"` here
-# can override individual lints, but doing so should be rare and noted.
 [lints]
 workspace = true
 
-# Runtime dependencies. As engine crates land they're wired in here as
-# path dependencies. `spark-core` is the foundation crate (math, time,
-# error, log, ids) and the first to come online; `spark-window` follows
-# in M1 and owns the OS window + event loop.
 [dependencies]
-
-# `spark-core` — foundation crate (currently just `VERSION`).
 spark-core = { path = "../lib/core" }
-
-# `spark-window` — OS window + event-loop driver, built on `winit`. The
-# binary calls `spark_window::init_tracing()` then
-# `spark_window::run(WindowConfig::default()...)?` from `main`. Will be
-# replaced by `App::new().add_plugin(WindowPlugin)...` once `spark-ecs`
-# lands in M4 (see `docs/ECS_DESIGN.md` stage 14).
 spark-window = { path = "../lib/window" }
 
-# `tracing` — the binary emits its own log records (e.g. the startup
-# banner `Spark v{VERSION}`) and therefore depends on `tracing` directly,
-# not transitively through `spark-window`. Pinned at the workspace level;
-# see `[workspace.dependencies].tracing` in the root manifest.
+# The binary emits its own log records (startup banner) and so depends
+# on `tracing` directly, not transitively through `spark-window`.
 tracing.workspace = true

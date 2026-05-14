@@ -1,65 +1,21 @@
-# lib/core/Cargo.toml — manifest for the `spark-core` engine crate.
-#
-# # Summary
-#
-# `spark-core` is the lowest-level engine crate: math, time, error, logging,
-# and ID types that every other engine layer (ecs, window, render, …) depends
-# on. It has zero third-party dependencies *today* — that grows to
-# `glam`, `thiserror`, and `tracing` as the modules land in later PRs (see
-# `docs/PLAN.md` module dependency graph).
-#
-# # Logic
-#
-# Cargo discovers this crate via `members = ["lib/*", "src"]` in the workspace
-# root. Engine crates are named with a `spark-` prefix (see `CLAUDE.md`
-# "Crate naming"). When imported, the crate name becomes `spark_core` (Rust
-# converts hyphens to underscores for identifiers): `use spark_core::time::...`.
-#
-# # Why it works
-#
-# Keeping `core` thin and dep-free at the bottom of the dependency graph
-# prevents compile-time bloat from rippling up: every higher-level crate
-# depends on core, so any new `[dependencies]` here recompiles the world.
-# Add things to core only when they are genuinely shared by multiple
-# downstream engine layers.
-#
-# # How to use
-#
-# - `cargo build -p spark-core`   → build just this crate
-# - `cargo test -p spark-core`    → run this crate's tests + doc tests
-# - From another workspace crate: `spark-core = { path = "../core" }` under
-#   `[dependencies]`, then `use spark_core::…` in code.
-#
-# # How NOT to use
-#
-# - Do not add deps here unless at least two downstream crates need them.
-#   A dep that only `lib/render` uses belongs in `lib/render/Cargo.toml`.
-# - Do not introduce `unsafe` here without profiling justification — this
-#   crate is the foundation; any UB ripples through everything.
+# Foundation crate. Lives at the bottom of the engine dependency graph,
+# stays small and dep-free. Imported as `spark_core::...` (hyphens →
+# underscores). Add a dep here only when 2+ downstream crates need it;
+# a dep used only by `lib/render/` belongs in `lib/render/Cargo.toml`.
 
 [package]
-
-# `name` — published/imported crate name. Use `spark-<module>` for every
-# engine crate (see `CLAUDE.md` "Crate naming"). Code references this as
-# `spark_core` (hyphens → underscores).
 name = "spark-core"
-
-# `version` — semver of this crate. 0.1.0 = pre-release; breaking changes
-# are allowed between minor bumps while we're still building out the engine.
 version = "0.1.0"
 
-# Inherited from `[workspace.package]` in the root manifest.
+# Inherited from [workspace.package] in the root manifest.
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
-# `[lints] workspace = true` — apply the workspace-wide lint config from
-# `../../Cargo.toml`. See that file for what's enabled.
 [lints]
 workspace = true
 
-# Runtime dependencies. Empty today. Per `docs/PLAN.md`, this crate will
-# eventually pull in `glam` (math), `thiserror` (typed errors), and
-# `tracing` (structured logging). Add each only when the corresponding
-# submodule lands.
+# Empty today. Per docs/PLAN.md this crate will eventually pull in
+# `glam` (math), `thiserror` (root error type), and `tracing` (logging)
+# as the matching submodules land.
 [dependencies]
