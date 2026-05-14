@@ -1,79 +1,118 @@
-# Cargo.toml — manifest for the `spark` binary crate (top-level for now).
+# Cargo.toml — workspace manifest for the Spark monorepo.
 #
 # # Summary
 #
-# Declares package metadata and dependencies for the Spark application crate.
-# This is the file `cargo` reads to know what to build, what to link against,
-# and what Rust version it can assume.
+# This is the **workspace root**. It doesn't itself build a crate; it tells
+# Cargo which sub-crates make up this project and declares the metadata,
+# dependency versions, and lint configuration they all share. Each member
+# inherits from here via `edition.workspace = true`, `wgpu.workspace = true`,
+# `[lints] workspace = true`, etc., so versions and rules stay consistent
+# across the engine.
 #
 # # Logic
 #
-# Today this is a single-package manifest because only the top-level `src/` exists
-# and `lib/` is empty. When the first sub-crate lands (e.g. `lib/core`), this file
-# becomes a workspace manifest per the template in `docs/PLAN.md` — the package
-# moves under `src/Cargo.toml`, and `[workspace] members = ["lib/*", "src"]` lives
-# here instead.
+# When you run any `cargo` command at this directory (or any descendant of
+# it), Cargo discovers this file, reads `[workspace] members`, and treats
+# each listed path as a sub-crate. `cargo build` builds all members; `cargo
+# test -p spark-core` targets one. Sub-crate manifests reference shared
+# settings with the `.workspace = true` shorthand — the values are looked
+# up here.
 #
 # # Why it works
 #
-# Pinning `edition = "2024"` plus `rust-version = "1.95"` locks the project to
-# modern Rust idioms (async closures, let-else everywhere, etc.) and matches the
-# toolchain pin in `rust-toolchain.toml` and the action pin in CI. All three are
-# load-bearing — drift between them is what causes "works locally, fails in CI".
+# Hosting MSRV, edition, license, dependency versions, and lints centrally
+# means there is exactly one place to bump them. Drift between sub-crates
+# (e.g. one on `edition = "2021"`, another on `edition = "2024"`) becomes
+# impossible by construction. Workspace lints (`clippy::pedantic`,
+# `unsafe_code`) apply to every member that opts in with `[lints] workspace
+# = true`, so the whole engine gets reviewed under the same bar.
 #
 # # How to use
 #
-# - `cargo build` / `cargo run` / `cargo test` — standard commands work as usual.
-# - Add new runtime dependencies with `cargo add <crate> --vers <exact-version>`
-#   (exact-version pin is a project convention — see `CLAUDE.md`).
-# - Add dev-only deps (tests, benches) under a new `[dev-dependencies]` table.
+# - `cargo build`         → builds every workspace member
+# - `cargo test`          → tests every member
+# - `cargo test -p spark-core`  → just one member
+# - `cargo check --workspace`   → fast type-check across the workspace
+#
+# Add a new engine crate by creating `lib/<name>/{Cargo.toml,src/lib.rs}`;
+# the `lib/*` glob in `members` picks it up automatically.
 #
 # # How NOT to use
 #
-# - Do not relax `edition` or `rust-version` to chase compatibility with an older
-#   crate — find a different crate or wait for it to be updated.
-# - Do not use caret/wildcard version requirements (e.g. `"1.0"`, `"^1.0"`, `"*"`).
-#   The project pins exact versions so `cargo update` can never surprise CI.
-# - Do not commit local-path or git-only dependencies once the workspace is set
-#   up; sub-crates in `lib/*` will be referenced via workspace inheritance instead.
+# - Do not duplicate `edition`, `rust-version`, or `license` in sub-crate
+#   manifests — inherit them via `.workspace = true`.
+# - Do not declare shared dep versions inside sub-crates. Add them to
+#   `[workspace.dependencies]` here and reference with `<name>.workspace
+#   = true` in members.
+# - Do not put a `[package]` table in this file. A workspace root is
+#   either virtual (no `[package]`, as here) or hybrid (also a crate);
+#   we use virtual to avoid building a phantom crate at the root.
+# - Do not relax `[workspace.lints]` per crate without a written reason —
+#   the lints are part of the engineering bar.
 
-[package]
+[workspace]
 
-# `name` — crate name on disk and as published to crates.io (if ever).
-# Effect: produces a binary called `spark` (since `src/main.rs` exists).
-# When this file becomes a workspace manifest, this `[package]` table moves
-# to `src/Cargo.toml` and gets renamed there if appropriate.
-name = "spark"
+# `resolver` — which version of Cargo's dependency-resolution algorithm to
+# use. Valid values: "1" | "2" | "3". Edition 2021+ defaults to "2";
+# edition 2024 defaults to "3". We pin "2" explicitly for clarity and
+# stability — it handles target-specific features correctly (each target
+# resolves features independently), which matters once we add wgpu and
+# cross-compile to wasm/native.
+resolver = "2"
 
-# `version` — semver of this crate. 0.1.0 means "pre-release, breaking changes
-# expected" — appropriate while we're pre-M1.
-# Effect: shows up in `cargo --version` output for the binary and would be the
-# published version if we ever ran `cargo publish`.
-version = "0.1.0"
+# `members` — paths (glob-supported) to the crates that make up this
+# workspace. Cargo treats each as a buildable unit.
+#   - "lib/*"  picks up every engine sub-crate as we add them
+#               (lib/core, lib/ecs, lib/window, …)
+#   - "src"    is the top-level game binary crate (`spark`)
+# Order doesn't affect build behaviour; Cargo computes the dep graph.
+members = ["lib/*", "src"]
 
-# `edition` — which Rust edition's syntax/idioms apply to this crate.
-# Valid values: "2015" | "2018" | "2021" | "2024".
-# Effect: enables edition-2024 features (let-else everywhere, async closures,
-# new `unsafe` ergonomics, `Cargo.lock` v4 by default, etc.). Older editions
-# are still valid but disable newer syntax — we want the latest.
+# `[workspace.package]` — default values that members can inherit with
+# `<field>.workspace = true` in their own `[package]` table.
+[workspace.package]
+
+# `edition` — Rust edition for every member. "2024" enables the newest
+# language defaults (let-else everywhere, async closures, updated
+# import/module rules). Members opt in with `edition.workspace = true`.
 edition = "2024"
 
-# `rust-version` — minimum supported Rust version (MSRV) for this crate.
-# Effect: cargo refuses to build with an older toolchain than this and warns
-# downstream consumers if they try. Must stay in lockstep with
-# `rust-toolchain.toml` (channel) and `.github/workflows/ci.yml` (action pin).
+# `rust-version` — workspace MSRV. Every member that inherits this will
+# refuse to build on an older toolchain. Must agree with `channel` in
+# `rust-toolchain.toml` and the pinned `dtolnay/rust-toolchain` action
+# in CI — all three move together.
 rust-version = "1.95"
 
-# `license` — SPDX license identifier(s) for this crate.
-# Valid values: any SPDX expression — e.g. "MIT", "Apache-2.0", "MIT OR Apache-2.0".
-# Effect: surfaced on crates.io and by license-audit tooling (e.g. cargo-deny).
-# Dual MIT/Apache-2.0 is the Rust ecosystem convention; the full license texts
-# live in `LICENSE-MIT` and `LICENSE-APACHE` at the repo root.
+# `license` — SPDX license expression inherited by every member. "MIT OR
+# Apache-2.0" is the Rust ecosystem convention for dual-licensed crates;
+# full license texts live in `LICENSE-MIT` and `LICENSE-APACHE` at the
+# repo root.
 license = "MIT OR Apache-2.0"
 
-# Runtime dependencies. Empty for now — Spark hasn't taken a dep on anything
-# yet. When adding entries, pin exact versions:
-#   wgpu = "26.0.1"        # ✓ exact pin (project convention)
-#   wgpu = "26"            # ✗ caret range, forbidden
-#   wgpu = "^26.0.1"       # ✗ same — caret in disguise
-[dependencies]
+# `[workspace.dependencies]` — shared dependency versions. Members
+# reference with `<name>.workspace = true` in their own
+# `[dependencies]` table, optionally enabling features there.
+# Empty for now — engine crates have no third-party deps yet. When we
+# add `glam`, `thiserror`, `tracing`, `wgpu`, etc., pin exact versions
+# here (project convention — see `CLAUDE.md`).
+[workspace.dependencies]
+
+# `[workspace.lints]` — lint configuration applied to every member that
+# opts in with `[lints] workspace = true` in its manifest. This is how we
+# keep the engineering bar consistent across crates.
+[workspace.lints.rust]
+
+# `unsafe_code` — warn on any use of `unsafe`. We don't allow `unsafe`
+# until profiling demands it (per `CLAUDE.md`); warning makes accidental
+# `unsafe` blocks visible in CI without hard-failing the build.
+# Valid values: "allow" | "warn" | "deny" | "forbid".
+unsafe_code = "warn"
+
+[workspace.lints.clippy]
+
+# `pedantic` — enable Clippy's pedantic lint group, which catches stylistic
+# and correctness nits that the default group skips (e.g. `must_use_candidate`,
+# `cast_precision_loss`). `priority = -1` lets individual lints in this
+# group be overridden by later, more specific lint settings without warnings
+# fighting each other.
+pedantic = { level = "warn", priority = -1 }
