@@ -1,0 +1,20 @@
+# ECS crate. Implements the custom entity-component-system in 24 staged
+# increments (see docs/ECS_DESIGN.md). Depends only on spark-core; no
+# external deps until stage 5+ (query iterators) or stage 15 (reflect).
+# Built up module-by-module: entity → storage → world → resources →
+# queries → filters → commands → events → scheduler → workloads → …
+
+[package]
+name = "spark-ecs"
+version = "0.1.0"
+
+# Inherited from [workspace.package] in the root manifest.
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+spark-core = { path = "../core" }
