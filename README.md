@@ -61,3 +61,12 @@ cargo fmt             # format
 - [`docs/ECS_DESIGN.md`](./docs/ECS_DESIGN.md) — full ECS architecture, phased build plan
 - [`docs/GAME_DESIGN.md`](./docs/GAME_DESIGN.md) — game concept, mechanics, MVP scope
 - [`docs/UI_DESIGN.md`](./docs/UI_DESIGN.md) — egui-based UI strategy, editor vs game UI split
+
+## License
+
+Dual-licensed under either of
+
+- Apache License, Version 2.0 ([`LICENSE-APACHE`](./LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([`LICENSE-MIT`](./LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
+
+at your option.
