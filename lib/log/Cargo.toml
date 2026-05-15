@@ -1,0 +1,21 @@
+# Tracing-subscriber install, packaged as a Plugin. Sits one level
+# above `spark-core`, alongside `spark-window`. Register first so
+# logging is live before any other plugin emits a record.
+
+[package]
+name = "spark-log"
+version = "0.1.0"
+
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+spark-core = { path = "../core" }
+
+tracing.workspace = true
+tracing-subscriber.workspace = true
+thiserror.workspace = true

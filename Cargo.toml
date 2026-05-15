@@ -1,15 +1,12 @@
-# Workspace root manifest. Virtual (no `[package]`) — Cargo uses this
-# only to discover members and to host shared package/lint/dep settings
-# inherited via `<field>.workspace = true`. To add an engine crate,
-# create `lib/<name>/{Cargo.toml,src/lib.rs}`; the `lib/*` glob picks
-# it up.
+# Workspace root manifest. Virtual — Cargo uses it only to discover
+# members and host shared package/lint/dep settings. New engine crates
+# under `lib/<name>/` are picked up automatically by the `lib/*` glob.
 
 [workspace]
 
-# Resolver 3: per-target/per-kind feature unification (dev-deps don't
-# leak features into release) AND MSRV-aware version resolution (Cargo
-# prefers versions that compile with our pinned 1.95 toolchain). Edition
-# 2024 defaults to "3"; setting it explicitly documents intent.
+# Resolver 3: per-target/per-kind feature unification + MSRV-aware
+# version resolution. Edition 2024 defaults to "3"; setting it
+# explicitly documents intent.
 resolver = "3"
 
 members = ["lib/*", "src"]
@@ -17,43 +14,31 @@ members = ["lib/*", "src"]
 [workspace.package]
 edition = "2024"
 
-# MSRV. Must agree with `channel` in `rust-toolchain.toml` and the
-# `dtolnay/rust-toolchain` pin in CI — all three move together.
+# MSRV. Must agree with `channel` in `rust-toolchain.toml` and CI.
 rust-version = "1.95"
 
 license = "MIT OR Apache-2.0"
 
-# Shared dependency versions, pinned to exact patch (no caret ranges).
-# Members opt in with `<name>.workspace = true`. Bumps are manual — no
-# Dependabot (see CLAUDE.md "Project conventions").
+# Shared deps, pinned exact patch. Members opt in with
+# `<name>.workspace = true`. Bumps are manual — no Dependabot.
 [workspace.dependencies]
 
-# Window + event loop. Latest stable; 0.31 is still beta. Used only by
-# `spark-window`. Uses the `ApplicationHandler` model.
 winit = "0.30.13"
-
-# Structured logging. Replaces `log` + `env_logger`. Currently only
-# `spark-window` uses it; moves to `spark-core` when a second engine
-# crate also needs to log.
 tracing = "0.1.44"
-
-# Formatter + filter for `tracing`. `env-filter` enables runtime `RUST_LOG`
-# control; `fmt` is the stdout formatter. Used by `init_tracing()`.
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
-
-# Derive macro for typed library error enums. Per CLAUDE.md: libraries
-# use `thiserror`, binaries use `anyhow`, never `Box<dyn Error>`.
 thiserror = "2.0.18"
 
-# Workspace-wide lints. Members opt in with `[lints] workspace = true`.
+# Erased error type used at every Plugin → Application seam. Re-exported
+# by `spark-core` as `EngineError`.
+anyhow = "1.0.102"
+
 [workspace.lints.rust]
 
-# Warn (not deny) so accidental `unsafe` is visible in CI without
-# blocking the build. No `unsafe` until profiling demands it.
+# Warn (not deny) so accidental `unsafe` shows up in CI without blocking.
 unsafe_code = "warn"
 
 [workspace.lints.clippy]
 
-# `priority = -1` lets individual lints in this group be overridden by
-# more specific settings without fighting each other.
+# `priority = -1` lets individual lints override pedantic without
+# fighting each other.
 pedantic = { level = "warn", priority = -1 }

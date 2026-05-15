@@ -1,16 +1,21 @@
 //! Spark binary entry point.
 //!
-//! Installs the `tracing` subscriber, logs the engine version, and hands
-//! off to [`spark_window::run`]. Becomes the textbook
-//! `App::new().add_plugin(...).run()` shape once `spark-ecs` lands the
-//! formal `App` / `Plugin` traits in M4.
+//! `LogPlugin` registers the tracing subscriber install as a startup
+//! closure; `WindowPlugin` installs the OS event-loop runner. `run()`
+//! drains startup, then hands the main thread to the runner.
 
-fn main() -> Result<(), spark_window::WindowError> {
-    spark_window::init_tracing();
-    tracing::info!("Spark v{}", spark_core::VERSION);
-    spark_window::run(
-        spark_window::WindowConfig::default()
-            .with_title("Spark")
-            .with_size(1280, 720),
-    )
+use spark_core::{Application, EngineError};
+use spark_log::LogPlugin;
+use spark_window::{WindowConfig, WindowPlugin};
+
+fn main() -> Result<(), EngineError> {
+    Application::new()
+        .add_plugin(LogPlugin)
+        .add_plugin(WindowPlugin {
+            config: WindowConfig::default()
+                .with_title("Spark")
+                .with_size(1280, 720)
+                .with_resizable(true),
+        })
+        .run()
 }

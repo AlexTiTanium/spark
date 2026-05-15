@@ -2,13 +2,9 @@
 
 use thiserror::Error;
 
-/// Errors that can occur while constructing or running the application
-/// window.
-///
-/// Wraps the two `winit` failure modes we hit (event-loop construction
-/// and window creation) so callers don't have to handle `Box<dyn Error>`
-/// or two distinct error types. `#[from]` provides automatic conversions
-/// so the `?` operator works internally.
+/// Errors that can occur while opening or driving the application
+/// window. Wraps the two `winit` failure modes we hit (event-loop
+/// construction, window creation).
 ///
 /// # Examples
 ///

@@ -1,26 +1,22 @@
 //! Window and OS-event-loop layer for the Spark engine.
 //!
-//! Owns the platform window and the operating-system event loop, built on
-//! [`winit`]. Exposes a free function — [`run`] — that opens a window,
-//! drives the event loop, and emits `tracing` events for every OS event
-//! of interest. In M4 the same internals move behind a `WindowPlugin`
-//! once `spark-ecs` lands the canonical `App` / `Plugin` traits (see
-//! `docs/ECS_DESIGN.md` stage 14).
+//! Owns the platform window and the OS event loop, built on [`winit`].
+//! Two entry points:
 //!
-//! Public surface: [`WindowConfig`], [`WindowError`], [`run`],
-//! [`init_tracing`].
+//! - [`WindowPlugin`] — idiomatic. Installs [`run`] as the
+//!   [`Application`](spark_core::Application)'s runner.
+//! - [`run`] — the free function the plugin delegates to. Useful for
+//!   low-level callers that bypass the `Application` scaffolding.
+//!
+//! Subscriber install lives in `spark-log`.
 //!
 //! # Examples
 //!
-//! ```no_run
-//! fn main() -> Result<(), spark_window::WindowError> {
-//!     spark_window::init_tracing();
-//!     spark_window::run(
-//!         spark_window::WindowConfig::default()
-//!             .with_title("Spark")
-//!             .with_size(1280, 720),
-//!     )
-//! }
+//! ```
+//! use spark_core::Application;
+//! use spark_window::WindowPlugin;
+//!
+//! let _app = Application::new().add_plugin(WindowPlugin::default());
 //! ```
 //!
 //! Verbose logs via `RUST_LOG`:
@@ -32,9 +28,9 @@
 mod config;
 mod error;
 mod event_loop;
-mod log;
+mod plugin;
 
 pub use config::WindowConfig;
 pub use error::WindowError;
 pub use event_loop::run;
-pub use log::init_tracing;
+pub use plugin::WindowPlugin;

@@ -1,17 +1,10 @@
 //! OS event-loop driver.
 //!
-//! Contains [`run`]: builds a [`winit::event_loop::EventLoop`], pairs it
-//! with an internal `EventLoopRunner` that implements
+//! [`run`] builds a [`winit::event_loop::EventLoop`], pairs it with an
+//! internal `EventLoopRunner` that implements
 //! [`ApplicationHandler`](winit::application::ApplicationHandler), and
-//! hands the loop off to winit. Every OS event the engine cares about is
-//! observed here and emitted as a `tracing` event.
-//!
-//! winit 0.30 adopted a callback-object model: state lives in a struct
-//! that implements `ApplicationHandler`, and winit calls the trait
-//! methods until `event_loop.exit()` is invoked. We use that struct to
-//! hold the [`WindowConfig`] and the lazily-created
-//! [`Window`](winit::window::Window) — the window cannot exist before
-//! `resumed` fires.
+//! hands the loop to winit. Every OS event we care about is emitted as
+//! a `tracing` event from here.
 
 use std::num::NonZeroU32;
 
@@ -25,15 +18,10 @@ use winit::window::{Window, WindowAttributes, WindowId};
 use crate::config::WindowConfig;
 use crate::error::WindowError;
 
-/// Opens a window described by `config` and drives the OS event loop
-/// until the user closes the window.
-///
-/// Sets [`ControlFlow::Wait`] so the thread blocks between events (no
-/// busy-loop). This will switch to [`ControlFlow::Poll`] once we have a
-/// fixed-timestep simulation that needs to tick every frame (M3+).
-///
-/// Blocks the calling thread. Must run on the main thread; winit panics
-/// otherwise.
+/// Opens the window from `config` and drives the OS event loop until
+/// the user closes it. Blocks the calling thread; must run on the main
+/// thread. Uses [`ControlFlow::Wait`]; switches to
+/// [`ControlFlow::Poll`] in M3+ when fixed-timestep sim arrives.
 ///
 /// # Errors
 ///
@@ -70,12 +58,10 @@ pub fn run(config: WindowConfig) -> Result<(), WindowError> {
     Ok(())
 }
 
-/// State held across calls into the OS event loop.
-///
-/// `window` is `Option` because winit only allows window creation after
-/// the event loop is active — it stays `None` until
-/// [`ApplicationHandler::resumed`] populates it. Once `spark-ecs` lands
-/// in M4, this field set becomes a `Window` resource on the `World`.
+/// State held across calls into the OS event loop. `window` is
+/// `Option` because winit only creates it after the loop is active
+/// ([`ApplicationHandler::resumed`]). M4 will move this state onto the
+/// ECS `World` as resources.
 struct EventLoopRunner {
     config: WindowConfig,
     window: Option<Window>,

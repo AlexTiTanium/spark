@@ -1,16 +1,12 @@
-//! Configuration for the application window.
-//!
-//! [`WindowConfig`] is the plain-data input to [`crate::run`]: title,
-//! initial size in logical pixels, and a `resizable` flag. Built with a
-//! small chainable API. `#[non_exhaustive]` so future fields (icon,
-//! decorations, fullscreen, …) can be added without a breaking change.
+//! Configuration for the application window. Plain data, chainable
+//! builders, `#[non_exhaustive]` for additive evolution.
 
-/// Configuration for the application window opened by [`crate::run`].
+/// Configuration for the window opened by [`crate::run`].
 ///
-/// `size` is in **logical** (DPI-independent) pixels — on a 2x display,
-/// `(1280, 720)` becomes `2560 × 1440` physical pixels. `winit` does the
-/// conversion. `#[non_exhaustive]` forbids external struct-literal
-/// construction; use [`WindowConfig::default`] and the `with_*` builders.
+/// `size` is in **logical** (DPI-independent) pixels: on a 2x display
+/// `(1280, 720)` becomes `2560 × 1440` physical pixels. Use
+/// [`WindowConfig::default`] and the `with_*` builders rather than the
+/// struct literal (`#[non_exhaustive]`).
 ///
 /// # Examples
 ///
@@ -36,8 +32,7 @@ pub struct WindowConfig {
 }
 
 impl Default for WindowConfig {
-    /// 720p, resizable, titled `"Spark"` — safe on essentially every
-    /// modern display.
+    /// 1280×720 logical, resizable, titled `"Spark"`.
     ///
     /// # Examples
     ///

@@ -1,19 +1,16 @@
-# `spark` binary crate. Wires engine plugins together and runs the main
-# loop. Lives under `src/` rather than the repo root so the workspace
-# manifest can stay virtual (no phantom top-level crate).
+# `spark` binary crate. Wires engine plugins together. Lives under
+# `src/` (not the repo root) so the workspace manifest stays virtual.
 
 [package]
 name = "spark"
 version = "0.1.0"
 
-# Inherited from [workspace.package].
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
-# Default discovery would look for `src/main.rs` relative to this
-# manifest, i.e. `src/src/main.rs`. We keep `main.rs` next to this file
-# (per docs/PLAN.md), so override the path.
+# `path` overrides Cargo's default `src/src/main.rs` discovery so
+# `main.rs` can live next to this manifest.
 [[bin]]
 name = "spark"
 path = "main.rs"
@@ -23,8 +20,5 @@ workspace = true
 
 [dependencies]
 spark-core = { path = "../lib/core" }
+spark-log = { path = "../lib/log" }
 spark-window = { path = "../lib/window" }
-
-# The binary emits its own log records (startup banner) and so depends
-# on `tracing` directly, not transitively through `spark-window`.
-tracing.workspace = true
