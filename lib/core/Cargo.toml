@@ -16,3 +16,8 @@ workspace = true
 
 # `EngineError` is `pub use anyhow::Error`.
 anyhow.workspace = true
+
+# `Application` embeds a `World` so plugins have a canonical home for
+# long-lived state. spark-ecs is stdlib-only and sits below this crate
+# in the dependency graph.
+spark-ecs = { path = "../ecs" }

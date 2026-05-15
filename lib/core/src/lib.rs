@@ -1,11 +1,12 @@
 //! Foundation crate for the Spark engine.
 //!
-//! Sits at the bottom of the dependency graph (see `docs/PLAN.md`):
-//! every other engine crate depends on this one. anyhow (for
-//! [`EngineError`]) is the only dep in M1.
+//! Sits one layer above [`spark_ecs`] in the dependency graph (see
+//! `docs/PLAN.md`): every other engine crate depends on this one.
+//! [`Application`] embeds a [`World`] so plugins have a canonical home
+//! for long-lived state.
 //!
 //! Public surface: [`Application`], [`Plugin`], [`stages::STARTUP`],
-//! [`EngineError`], [`VERSION`].
+//! [`EngineError`], [`World`], [`VERSION`].
 //!
 //! # Example
 //!
@@ -35,6 +36,7 @@ mod stage;
 pub use application::Application;
 pub use error::EngineError;
 pub use plugin::Plugin;
+pub use spark_ecs::World;
 pub use stage::stages;
 
 /// Semantic version of `spark-core` from `Cargo.toml`.

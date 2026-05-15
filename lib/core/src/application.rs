@@ -2,6 +2,8 @@
 //! nothing about windowing or logging; every capability is supplied
 //! by a [`Plugin`].
 
+use spark_ecs::World;
+
 use crate::error::EngineError;
 use crate::plugin::Plugin;
 
@@ -37,6 +39,7 @@ type Runner = Box<dyn FnOnce(Application) -> Result<(), EngineError>>;
 /// ```
 #[derive(Default)]
 pub struct Application {
+    world: World,
     startup: Vec<StartupSystem>,
     runner: Option<Runner>,
 }
@@ -75,6 +78,26 @@ impl Application {
     #[allow(clippy::needless_pass_by_value)]
     pub fn add_plugin<P: Plugin>(&mut self, plugin: P) -> &mut Self {
         plugin.build(self);
+        self
+    }
+
+    /// Inserts a resource into the engine's [`World`]. Chainable; a
+    /// second insert of the same type overwrites the previous value.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use spark_core::Application;
+    ///
+    /// struct GameTime { dt: f32 }
+    ///
+    /// Application::new()
+    ///     .add_resource(GameTime { dt: 0.016 })
+    ///     .run()
+    ///     .unwrap();
+    /// ```
+    pub fn add_resource<T: 'static>(&mut self, value: T) -> &mut Self {
+        self.world.add_resource(value);
         self
     }
 

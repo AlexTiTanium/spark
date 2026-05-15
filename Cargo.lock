@@ -1180,7 +1180,12 @@ name = "spark-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "spark-ecs",
 ]
+
+[[package]]
+name = "spark-ecs"
+version = "0.1.0"
 
 [[package]]
 name = "spark-log"
