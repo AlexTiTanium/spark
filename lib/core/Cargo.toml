@@ -1,13 +1,10 @@
-# Foundation crate. Lives at the bottom of the engine dependency graph,
-# stays small and dep-free. Imported as `spark_core::...` (hyphens →
-# underscores). Add a dep here only when 2+ downstream crates need it;
-# a dep used only by `lib/render/` belongs in `lib/render/Cargo.toml`.
+# Foundation crate. Bottom of the engine dependency graph; kept small.
+# Imported as `spark_core::...`.
 
 [package]
 name = "spark-core"
 version = "0.1.0"
 
-# Inherited from [workspace.package] in the root manifest.
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -15,7 +12,7 @@ license.workspace = true
 [lints]
 workspace = true
 
-# Empty today. Per docs/PLAN.md this crate will eventually pull in
-# `glam` (math), `thiserror` (root error type), and `tracing` (logging)
-# as the matching submodules land.
 [dependencies]
+
+# `EngineError` is `pub use anyhow::Error`.
+anyhow.workspace = true
