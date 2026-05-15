@@ -159,10 +159,31 @@ Game UI is built on vanilla `egui` through M7–M13; the custom stack is compose
 
 ## Plugin pattern
 
-Each crate exposes a plugin. `main.rs` just lists them:
+### M1–M3 — `spark_core::Application` boot harness (no ECS yet)
+
+Without ECS there are no Resources or Schedules for a `Plugin` trait to register with, so the "plugin" idea is collapsed into a small boot harness — `spark_core::Application`. It owns config + boot order (tracing init, root error type, window startup):
 
 ```rust
-// /src/main.rs
+// /src/main.rs (M1)
+fn main() -> Result<(), spark_core::EngineError> {
+    spark_core::Application::new()
+        .with_window(
+            WindowConfig::default()
+                .with_title("Spark")
+                .with_size(1280, 720),
+        )
+        .run()
+}
+```
+
+The builder grows additively as M1→M3 progresses: M1 adds `.with_window`; the input PR adds `.with_input`; M2 adds `.with_render`. Earlier methods stay valid through every later milestone.
+
+### M4 onward — formal `App` + `Plugin` (with ECS)
+
+Once `spark-ecs` lands the `App`/`Plugin`/`Resource`/`Workload` machinery (ECS_DESIGN.md stage 14), `Application` is replaced by the canonical `App` and the `.with_*` builders are replaced by `.add_plugin(...)` calls. Each engine crate exposes a `Plugin` that registers its Resources and Systems:
+
+```rust
+// /src/main.rs (M4+)
 fn main() {
     App::new()
         .add_plugin(CorePlugin)
@@ -181,6 +202,8 @@ fn main() {
         .run();
 }
 ```
+
+The migration is additive on the engine side — `Application` and its helpers stay (as a thin wrapper around the new `App` if useful), so binaries written against M1 still compile.
 
 ## Outdated patterns to avoid (lessons from orange)
 
@@ -202,7 +225,8 @@ fn main() {
 ### Engine-foundation (no game content yet)
 
 #### M1 — Hello window
-- Set up workspace, `core`, `window`, `input` crates, plugin pattern
+- Set up workspace, `core`, `window`, `input` crates
+- `spark_core::Application` boot harness: owns config + boot order (tracing init, root `EngineError`, window startup). Pre-ECS stand-in for the canonical `App` arriving in M4 — same API surface, extended additively as later crates land.
 - Window opens, logs input events
 - No render, no ECS yet
 
