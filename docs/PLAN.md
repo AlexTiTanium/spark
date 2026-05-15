@@ -8,7 +8,7 @@ See **[GAME_DESIGN.md](./GAME_DESIGN.md)** for the game concept, **[ECS_DESIGN.m
 
 - **Spark** is the project codename. The game-design vision is in `GAME_DESIGN.md`.
 - This is a **new repo** (`spark`). The earlier [AlexTiTanium/orange](https://github.com/AlexTiTanium/orange) project is **reference material only** — we'll borrow its workspace layout patterns but write everything fresh, using modern Rust (edition 2024, current crates, ECS-centric design).
-- Single monorepo. Engine modules live under `crates/`; the game lives under `game/`. If the engine ever matures into a standalone product we can extract it later — premature splitting wastes effort.
+- Single monorepo. Engine modules live under `lib/`; the game binary lives under `src/`. If the engine ever matures into a standalone product we can extract it later — premature splitting wastes effort.
 
 ## Goals
 
@@ -21,8 +21,9 @@ Guiding rule: **build the engine the game needs, not a general-purpose engine.**
 ## Architecture principles
 
 - **ECS-centric.** Everything that lives in the world is either an Entity (many, dynamic) or a Resource (one, unique). No global state outside the ECS.
-- **Modular by Cargo crate.** Each engine module is a separate `crates/*` crate with its own dependencies. The `game/` crate sits on top.
-- **Plugin pattern.** Each crate exposes a `Plugin` that registers its Resources and Systems with the App. `main.rs` just lists plugins.
+- **Modular by Cargo crate.** Each engine module is a separate `lib/*` crate with its own dependencies; the game binary in `src/` sits on top. A new crate is justified by a distinct architectural layer (windowing, rendering, input, ECS, audio) — engine-wide infrastructure (logging, errors, math, time, ids) lives as modules inside `spark-core`, not as standalone crates.
+- **Boot harness, then plugins.** Pre-ECS (M1–M3) the binary uses `spark_core::Application` — a small builder owning config and the boot sequence (logging init, window startup, top-level error type). Post-ECS (M4+) `Application` gains `add_plugin`, `world`, and the schedule driver; engine and game crates expose `Plugin`s that register their Resources and Systems. The API grows additively; nothing gets ripped out.
+- **Separation of concerns.** Process-wide state (`tracing` subscriber, panic hook, root `EngineError`) lives in `spark-core`. Per-layer events and errors live in their layer crate (`WindowError` in `spark-window`, etc.). Libraries never install global state — that's the boot harness's job.
 - **Two clocks.** Fixed-timestep simulation (60 Hz) for game logic; variable-rate render for display.
 - **Deterministic simulation.** No `HashMap` iteration in sim systems — keeps the door open for save/replay/multiplayer later.
 
@@ -87,17 +88,16 @@ Each sub-crate owns its `Cargo.toml`.
 
 ```toml
 [workspace]
-resolver = "2"
-members = ["crates/*", "game"]
+resolver = "3"
+members = ["lib/*", "src"]
 
 [workspace.package]
 edition = "2024"
 rust-version = "1.95"
-authors = ["Alex Kucherenko", "Nikita Kucherenko"]
-license = "MIT"
+license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-# Dependency /lib
+# Pinned exact versions, e.g. winit = "0.30.13", tracing = "0.1.44".
 
 [workspace.lints.rust]
 unsafe_code = "warn"
@@ -110,16 +110,20 @@ Each sub-crate's manifest:
 
 ```toml
 [package]
-name = "render"
+name = "spark-render"
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
 
 [dependencies]
-wgpu.workspace = true
-glam.workspace = true
-core = { path = "../core" }
-ecs = { path = "../ecs" }
-winit = "0.30"
+spark-core = { path = "../core" }
+spark-ecs  = { path = "../ecs" }
+wgpu.workspace  = true
+glam.workspace  = true
+winit.workspace = true
 ```
 
 ## ECS approach
