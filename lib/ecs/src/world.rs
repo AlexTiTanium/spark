@@ -1,8 +1,8 @@
 //! The [`World`] resource container.
 //!
 //! Holds one value per type, keyed by [`TypeId`]. Read accessors land in
-//! M4 alongside the systems that consume them; today the only verb is
-//! [`World::add_resource`].
+//! the next PR alongside `Res<T>` / `ResMut<T>` system params (#11);
+//! today the only verb is [`World::add_resource`].
 
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
@@ -47,15 +47,17 @@ impl World {
     /// # Examples
     ///
     /// ```
-    /// let _world = spark_ecs::World::new();
+    /// use spark_ecs::World;
+    ///
+    /// let _world = World::new();
     /// ```
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Inserts a resource, overwriting the previous value of the same
-    /// type if one was present.
+    /// Inserts a resource. A second insert of the same type silently
+    /// overwrites the first.
     ///
     /// # Examples
     ///
