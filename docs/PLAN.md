@@ -70,17 +70,22 @@ Guiding rule: **build the engine the game needs, not a general-purpose engine.**
 ## Module dependency graph
 
 ```
-core    ── (glam, thiserror, tracing)
-ecs     ── core            (no external ECS dep — written from scratch)
-window  ── core + ecs + (winit)
-input   ── core + window + ecs + (gilrs)
-render  ── core + window + ecs + (wgpu, image)
-assets  ── core + render + ecs + (notify)
-ui      ── core + window + input + render + ecs + (egui, egui-wgpu, egui-winit)
-editor  ── core + ecs + ui              (feature-flagged, dev-only)
-audio   ── core + ecs (kira)
+ecs     ── (stdlib only — deepest foundation crate; no external ECS dep)
+core    ── ecs + (glam, thiserror, tracing)
+window  ── core + (winit)
+input   ── core + window + (gilrs)
+render  ── core + window + (wgpu, image)
+assets  ── core + render + (notify)
+ui      ── core + window + input + render + (egui, egui-wgpu, egui-winit)
+editor  ── core + ui                    (feature-flagged, dev-only)
+audio   ── core + (kira)
 game    ── all of the above
 ```
+
+`spark-ecs` is the deepest crate so `Application` (in `spark-core`) can
+embed a `World` without inverting Cargo's no-cycle rule. Every crate
+above `core` reaches `World` through `spark_core::World`, keeping
+`spark-ecs` a transitive dep.
 
 Each sub-crate owns its `Cargo.toml`.
 
@@ -184,7 +189,7 @@ The builder grows additively as M1→M3 progresses: M1 adds `.with_window`; the 
 
 ### M4 onward — formal `App` + `Plugin` (with ECS)
 
-Once `spark-ecs` lands the `App`/`Plugin`/`Resource`/`Workload` machinery (ECS_DESIGN.md stage 14), `Application` is replaced by the canonical `App` and the `.with_*` builders are replaced by `.add_plugin(...)` calls. Each engine crate exposes a `Plugin` that registers its Resources and Systems:
+`spark-ecs` already exposes the `World` + `add_resource` value-verb that `Application` embeds today; `Plugin`/`add_plugin` are wired in `spark-core`. What still lands in M4 is the read side — `Res<T>` / `ResMut<T>` system params, the `Workload` machinery, and the schedule driver (ECS_DESIGN.md stage 14). At that point each engine crate exposes a `Plugin` that registers its Resources and Systems:
 
 ```rust
 // /src/main.rs (M4+)

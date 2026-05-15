@@ -1,0 +1,22 @@
+# ECS crate. Deepest foundation crate in the engine dependency graph —
+# every other engine crate (including `spark-core`) sits on top. Pure
+# stdlib, no engine deps, no external deps. The single primitive today
+# is `World` + `add_resource`; entities, components, queries, systems,
+# and schedulers land in M3–M4 (see docs/ECS_DESIGN.md).
+
+[package]
+name = "spark-ecs"
+version = "0.1.0"
+
+# Inherited from [workspace.package] in the root manifest.
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+# No dependencies on purpose — the bottom of the dep graph stays
+# stdlib-only so every crate above can pull `World` in without fear of
+# cycles or transitive surprises.
+[dependencies]
