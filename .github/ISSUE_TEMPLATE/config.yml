@@ -1,0 +1,4 @@
+# Disables the "blank issue" option so every issue starts from a template
+# and inherits the project's documentation standards (diagrams, learn
+# section, expandable structure). Use the chooser when filing.
+blank_issues_enabled: false
