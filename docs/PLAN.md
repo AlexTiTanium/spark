@@ -254,6 +254,15 @@ The migration is additive on the engine side — `Application` and its helpers s
 #### M4 — ECS feature-complete
 - Build `ecs` crate steps 7–11:
   Resources, Systems, Schedule, App+Plugin, FixedUpdate, Events
+- Introduce the `Resource` and `Component` traits, both
+  `Send + Sync + 'static`. `SystemParam` impls thread the bound
+  through. This is the committed contract — Spark targets a heavy
+  simulation and parallel system execution is a hard requirement, not
+  an optional extra.
+- Scheduler executes independent systems in parallel (Rayon), using
+  the per-system read/write access set + the `Send + Sync` bound as
+  the safety proof for lockless execution. Conflicts are caught at
+  registration time (no `RefCell` runtime-panic safety net).
 - Migrate `window` and `input` plugins to ECS-style (state in Resources)
 - App main loop runs the schedule each frame
 
@@ -274,10 +283,12 @@ The migration is additive on the engine side — `Application` and its helpers s
 ### Stretch / advanced
 
 - **A1** — Change detection in ECS (`Changed<T>` filters)
-- **A2** — Parallel system execution via Rayon
 - **A3** — Archetype storage refactor (replace sparse-set internals)
 - **A4** — Save/load (custom serialization)
 - **A7** — Day/night cycle affecting solar + lighting demand
+
+(Parallel system execution is no longer listed here — it moved into M4
+as a committed requirement, not a stretch goal.)
 
 ## Repo hygiene
 

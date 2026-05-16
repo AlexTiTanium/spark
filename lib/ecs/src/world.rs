@@ -20,14 +20,23 @@ use std::collections::HashMap;
 /// [`World::get_resource`] / [`World::resource`] (and the `_mut`
 /// variants), which return [`Ref`] / [`RefMut`] guards into the cell.
 ///
-/// # Why no `Send`/`Sync` bound
+/// # Why only `'static` today, `Send + Sync` later
 ///
-/// `add_resource` takes any `T: 'static`, including `!Send` and `!Sync`
-/// types (`winit::window::Window` on macOS, `Rc`, raw platform handles).
-/// `World` itself is therefore `!Send + !Sync`. This is fine while the
-/// scheduler is single-threaded; once parallel systems arrive in M4 the
-/// API splits Bevy-style into `add_resource` (send) and
-/// `add_non_send_resource` — additive on top of what is here today.
+/// `add_resource` takes any `T: 'static` — the minimum bound to drop
+/// a value into a `Box<dyn Any>` map. That isn't the bound real
+/// resources will ship with. Spark targets a heavy simulation and
+/// parallel system execution is a committed M4 requirement, not an
+/// optional extra. The agreed direction: the `Resource` and
+/// `Component` traits — introduced with the derive PR / entity-storage
+/// work — carry `Send + Sync + 'static`, [`SystemParam`](crate::SystemParam)
+/// impls thread that bound through, and the M4 scheduler uses it as
+/// the safety proof for lockless parallel execution.
+///
+/// This PR doesn't introduce the `Resource` trait yet, so there's
+/// genuinely no bound to add to the storage map today — the
+/// permissive `'static` defers the choice to the trait, where it
+/// belongs. `World` itself is `!Send + !Sync` by construction, matching
+/// the single-threaded scheduler that ships with this PR.
 ///
 /// # Examples
 ///
@@ -264,8 +273,11 @@ mod tests {
 
     #[test]
     fn non_send_resource_compiles() {
-        // `Rc<Cell<_>>` is `!Send + !Sync`. The `'static`-only bound on
-        // `add_resource` must accept it.
+        // `Rc<Cell<_>>` is `!Send + !Sync`. While there's no `Resource`
+        // trait yet, the storage map's bare `'static` bound has to
+        // accept it. Once the trait lands with `Send + Sync + 'static`
+        // (committed M4 direction), this test goes away in favour of a
+        // compile-fail check that `!Send` types can't be stored.
         let counter = Rc::new(Cell::new(0_u32));
         let mut world = World::new();
         world.add_resource(counter);
