@@ -3,6 +3,10 @@
 //!
 //! Filter priority: `RUST_LOG` → [`DEFAULT_FILTER`].
 //!
+//! The five level macros — [`trace!`], [`debug!`], [`info!`], [`warn!`],
+//! [`error!`] — are re-exported from `tracing`, so downstream crates
+//! can emit records without taking a direct `tracing` dependency.
+//!
 //! # Example
 //!
 //! ```
@@ -18,6 +22,10 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+
+/// Re-exports of `tracing`'s level macros. Use them as
+/// `spark_log::info!("…")` etc.; no direct `tracing` dep required.
+pub use tracing::{debug, error, info, trace, warn};
 
 /// Default filter when `RUST_LOG` is unset.
 ///
