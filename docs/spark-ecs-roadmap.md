@@ -13,7 +13,7 @@ expanded into full drafts in the project's `#10–#12` format below.
 
 - **#10 — Entities + component storage.** Sparse-set storage, `World` API.
 - **#11 — Queries.** `Query` as `SystemParam`. ⚠ Ships with
-  `<&mut T as WorldQuery>::iter_items` left `unimplemented!` — `Query<&mut T>`
+  `<&mut T as QueryData>::iter_items` left `unimplemented!` — `Query<&mut T>`
   does not actually work yet. Closed by **Draft 1** below.
 - **#12 — Commands + frame loop.** Deferred spawn/despawn, per-frame stages.
 
@@ -25,7 +25,9 @@ movement demo do not run. Must merge before the scheduler.
 
 **2. derive(Component/Resource) + `Send+Sync` + drop prelude** — draft below (Draft 2).
 - *Decisions:* explicit derive over blanket impl; traits become
-  `Send + Sync + 'static`; no `prelude` module.
+  `Send + Sync + 'static`; no `prelude` module; the proc-macro crate is
+  **nested inside the ECS crate** at `lib/ecs/macros/`, not a top-level
+  workspace sibling.
 - *Warnings:* breaking-ish refactor, touches every component/resource in
   demos+tests — do it now while they are few.
 
@@ -82,11 +84,11 @@ proven-disjoint access; `EntityAllocator` thread-safe; per-system
 
 ---
 
-## Draft 1 — spark-ecs: finish `Query<&mut T>` iteration — `WorldQuery` shared/exclusive split (M3 Issue B-fix)
+## Draft 1 — spark-ecs: finish `Query<&mut T>` iteration — `QueryData` shared/exclusive split (M3 Issue B-fix)
 
 ### Context
 
-#11 landed `Query` as a `SystemParam`, but `<&mut T as WorldQuery>::iter_items`
+#11 landed `Query` as a `SystemParam`, but `<&mut T as QueryData>::iter_items`
 is `unimplemented!`. The cause is the trait signature: `iter_items` takes
 `&State`, and `&mut T` items cannot be produced from a shared borrow of the
 state. Until this is fixed `Query<&mut T>` — and therefore the canonical
@@ -98,9 +100,9 @@ This is a **precondition for M3.5**: it must merge before the scheduler issue.
 
 **Goals**
 
-- Change `WorldQuery` iteration so `&mut T` items are reachable: exclusive
+- Change `QueryData` iteration so `&mut T` items are reachable: exclusive
   iteration takes `&mut State`.
-- `ReadOnlyWorldQuery` marker subtrait that gates `Query::iter(&self)`.
+- `ReadOnlyQueryData` marker subtrait that gates `Query::iter(&self)`.
 - `Query::iter_mut(&mut self)` works for any `D`; `Query::iter(&self)` exists
   only for read-only `D`.
 - Working iteration for `&T`, `&mut T`, `(&A, &B)`, `(&mut A, &B)`, `(&A, &mut B)`.
@@ -120,7 +122,7 @@ This is a **precondition for M3.5**: it must merge before the scheduler issue.
 `lib/ecs/src/query.rs`
 
 ```rust
-pub trait WorldQuery {
+pub trait QueryData {
     type Item<'w>;
     type State<'w>;
 
@@ -135,13 +137,13 @@ pub trait WorldQuery {
 
 /// Implemented only by queries that borrow nothing mutably.
 /// This is what gates `Query::iter(&self)`.
-pub trait ReadOnlyWorldQuery: WorldQuery {
+pub trait ReadOnlyQueryData: QueryData {
     fn iter_ref<'s>(
         state: &'s Self::State<'_>,
     ) -> Box<dyn Iterator<Item = (Entity, Self::Item<'s>)> + 's>;
 }
 
-impl<T: Component> WorldQuery for &T {
+impl<T: Component> QueryData for &T {
     type Item<'w> = &'w T;
     type State<'w> = Ref<'w, ComponentStorage<T>>;
     fn init_state(world: &World) -> Self::State<'_> { /* world.storage::<T>() */ }
@@ -150,14 +152,14 @@ impl<T: Component> WorldQuery for &T {
         Box::new(state.iter())
     }
 }
-impl<T: Component> ReadOnlyWorldQuery for &T {
+impl<T: Component> ReadOnlyQueryData for &T {
     fn iter_ref<'s>(state: &'s Self::State<'_>)
         -> Box<dyn Iterator<Item = (Entity, &'s T)> + 's> {
         Box::new(state.iter())
     }
 }
 
-impl<T: Component> WorldQuery for &mut T {
+impl<T: Component> QueryData for &mut T {
     type Item<'w> = &'w mut T;
     type State<'w> = RefMut<'w, ComponentStorage<T>>;
     fn init_state(world: &World) -> Self::State<'_> { /* world.storage_mut::<T>() */ }
@@ -167,11 +169,11 @@ impl<T: Component> WorldQuery for &mut T {
         Box::new(state.iter_mut())
     }
 }
-// No ReadOnlyWorldQuery for &mut T.
+// No ReadOnlyQueryData for &mut T.
 
 // Tuple (D1, D2): join. Drive whichever side is mutable via its `iter`,
 // look the other side up per-entity. (&mut A, &mut B) is excluded.
-impl<D1: WorldQuery, D2: WorldQuery> WorldQuery for (D1, D2) {
+impl<D1: QueryData, D2: QueryData> QueryData for (D1, D2) {
     type Item<'w>  = (D1::Item<'w>, D2::Item<'w>);
     type State<'w> = (D1::State<'w>, D2::State<'w>);
     // init_state: (D1::init_state(world), D2::init_state(world))
@@ -180,12 +182,12 @@ impl<D1: WorldQuery, D2: WorldQuery> WorldQuery for (D1, D2) {
     //       are present. Detail in the PR.
 }
 
-impl<'w, D: WorldQuery> Query<'w, D> {
+impl<'w, D: QueryData> Query<'w, D> {
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (Entity, D::Item<'_>)> {
         D::iter(&mut self.state)
     }
 }
-impl<'w, D: ReadOnlyWorldQuery> Query<'w, D> {
+impl<'w, D: ReadOnlyQueryData> Query<'w, D> {
     pub fn iter(&self) -> impl Iterator<Item = (Entity, D::Item<'_>)> {
         D::iter_ref(&self.state)
     }
@@ -220,8 +222,8 @@ RefCells, no conflict. &mut Position items are distinct (slice::iter_mut).
   elements) is std's responsibility. A mixed tuple drives one safe `iter_mut`
   and reads a *different* storage — disjoint `RefCell`s, no aliasing.
 - **The shared/exclusive split.** A query that borrows nothing mutably is
-  `ReadOnlyWorldQuery` and may be iterated through `&self`. A query with any
-  `&mut` is `WorldQuery`-only and needs `&mut self`. This is a simplified form
+  `ReadOnlyQueryData` and may be iterated through `&self`. A query with any
+  `&mut` is `QueryData`-only and needs `&mut self`. This is a simplified form
   of bevy's read-only-query machinery.
 
 ### Warnings (implementation)
@@ -248,20 +250,20 @@ RefCells, no conflict. &mut Position items are distinct (slice::iter_mut).
   per stage, negligible; keep it (consistent with #11).
 - **M4 chokepoint.** This iteration path runs through `RefMut` — the future
   `RefCell → UnsafeCell` migration point. Keep storage access funnelled through
-  `WorldQuery`; systems must never touch storages directly.
+  `QueryData`; systems must never touch storages directly.
 
 ### File-tree diff
 
 ```
 lib/ecs/src/
-└── query.rs   (modified — WorldQuery::iter takes &mut State; ReadOnlyWorldQuery;
+└── query.rs   (modified — QueryData::iter takes &mut State; ReadOnlyQueryData;
                  impls for &T / &mut T / (D1,D2); Query iter / iter_mut blocks)
 ```
 
 ### Acceptance criteria
 
-- [ ] `WorldQuery` exclusive iteration takes `&mut State`; lifetimes decoupled.
-- [ ] `ReadOnlyWorldQuery` implemented for `&T` and read-only tuples; gates `Query::iter`.
+- [ ] `QueryData` exclusive iteration takes `&mut State`; lifetimes decoupled.
+- [ ] `ReadOnlyQueryData` implemented for `&T` and read-only tuples; gates `Query::iter`.
 - [ ] `Query<&mut T>::iter_mut` yields `&mut T`; the #12 `movement` demo runs.
 - [ ] `(&mut A, &B)` and `(&A, &mut B)` iterate correctly.
 - [ ] `(&mut A, &mut B)` does not compile.
@@ -323,23 +325,34 @@ removes the `prelude` module in favour of explicit imports.
 
 ### Proposed shape
 
-`lib/ecs-macros/Cargo.toml`
+`lib/ecs/macros/Cargo.toml`  *(nested inside the ECS crate)*
 
 ```toml
 [package]
-name = "spark_ecs_macros"
-edition = "2021"
+name = "spark-ecs-macros"
+version = "0.1.0"
+
+# Inherited from [workspace.package] in the root manifest.
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
 
 [lib]
 proc-macro = true
 
+# Add these to [workspace.dependencies] in the root Cargo.toml as
+# exact pinned versions (project convention — never caret ranges).
+# Look up the latest stable at implementation time.
 [dependencies]
-syn = "2"
-quote = "1"
-proc-macro2 = "1"
+syn = { workspace = true, features = ["full"] }
+quote.workspace = true
+proc-macro2.workspace = true
 ```
 
-`lib/ecs-macros/src/lib.rs`
+`lib/ecs/macros/src/lib.rs`
 
 ```rust
 use proc_macro::TokenStream;
@@ -381,10 +394,21 @@ pub use commands::Commands;
 // no `prelude` module
 ```
 
+`lib/ecs/Cargo.toml`
+
+```toml
+[dependencies]
+spark_ecs_macros = { path = "macros" }   # relative — the crate is nested inside lib/ecs/
+```
+
 ### Warnings (implementation)
 
-- A `proc-macro = true` crate can export **only** proc macros — that is why
-  `spark_ecs_macros` is a separate crate.
+- A `proc-macro = true` crate can export **only** proc macros — so
+  `spark_ecs_macros` must be a separate crate; this is unavoidable. It is
+  **nested at `lib/ecs/macros/`** (not a top-level workspace sibling) so it
+  stays organizationally owned by `spark_ecs`. The only outward trace is one
+  `members` entry in the workspace `Cargo.toml`; that entry is mandatory in a
+  workspace and cannot be dropped.
 - `extern crate self as spark_ecs;` is required so the generated
   `::spark_ecs::Component` path resolves when the derive is used *inside*
   `spark_ecs` itself.
@@ -403,18 +427,18 @@ pub use commands::Commands;
 ### File-tree diff
 
 ```
-lib/ecs-macros/          (NEW crate — spark_ecs_macros)
-├── Cargo.toml
-└── src/lib.rs
 lib/ecs/
-├── Cargo.toml           (modified — dependency on spark_ecs_macros)
-└── src/lib.rs           (modified — Send+Sync traits; no blanket impl; no prelude)
-Cargo.toml               (modified — new workspace member)
+├── Cargo.toml           (modified — dependency spark_ecs_macros = { path = "macros" })
+├── src/lib.rs           (modified — Send+Sync traits; no blanket impl; no prelude)
+└── macros/              (NEW nested crate — spark_ecs_macros, proc-macro = true)
+    ├── Cargo.toml
+    └── src/lib.rs
+Cargo.toml               (modified — "lib/ecs/macros" added to workspace members)
 ```
 
 ### Acceptance criteria
 
-- [ ] `spark_ecs_macros` crate exists with `proc-macro = true`.
+- [ ] `spark_ecs_macros` crate exists with `proc-macro = true`, nested at `lib/ecs/macros/`.
 - [ ] `#[derive(Component)]` / `#[derive(Resource)]` generate the marker impls.
 - [ ] `Component` / `Resource` are `Send + Sync + 'static`; blanket impl gone.
 - [ ] `prelude` removed; imports are explicit throughout demos and tests.

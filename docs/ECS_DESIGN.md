@@ -1,6 +1,6 @@
 # Spark ECS — Architecture & Build Plan
 
-This is the design and step-by-step build plan for the `crates/ecs` crate. We're rolling it from scratch as a learning exercise.
+This is the design and step-by-step build plan for the `lib/ecs/` crate. We're rolling it from scratch as a learning exercise.
 
 ## Design philosophy
 
@@ -16,10 +16,10 @@ The non-negotiable rule: **all memory management is ECS-based**. The window hand
 - Full system traceability: every system call recorded with timing, access set, command/event counts.
 - Editor-friendly reflection: list entities, components, resources, system graph, frame timings — all readable at runtime.
 - Sparse-set storage for simplicity. Archetype migration possible later behind the same API.
+- **Parallel system execution is a committed M4 deliverable**, not a stretch goal: lockless via per-system access sets + `Send + Sync` component/resource bound. Phase 1 ships a sequential executor, but the `Access` model and DAG/batch structure are built from day one as the safety proof for the M4 switchover.
 - No `unsafe` until profiling demands it; safe Rust everywhere by default.
 
 **Non-goals (for v1):**
-- Parallel execution. Designed to be added in Phase 3; single-threaded scheduler first.
 - Archetype storage. Stretch refactor after the API stabilises.
 - Networking, save serialization, or scripting — separate concerns, layered on top later.
 
@@ -172,7 +172,7 @@ Query<(&Position, Option<&Velocity>)>                       // optional componen
 Query<(Entity, &Position)>                                  // entity ID alongside
 ```
 
-Filters available on day 1: `With<T>`, `Without<T>`, tuple of filters, `Or<(F1, F2)>`. Later: `Changed<T>`, `Added<T>` (Phase 3).
+Filters available on day 1: `With<T>`, `Without<T>`, tuple of filters. Deferred: `Or<(F1, F2)>` (post-M4); `Changed<T>`, `Added<T>` (Phase 2 — depends on the change-tick storage slot).
 
 ### System
 
@@ -369,7 +369,7 @@ fn main() {
 
 ## Derive macros
 
-Four derive/attribute macros, all living in a sibling proc-macro crate `crates/ecs-derive`:
+Four derive/attribute macros, all living in a nested proc-macro crate `spark-ecs-macros` at `lib/ecs/macros/`. The crate is nested (not a top-level `lib/*` sibling) so it stays organizationally owned by `spark-ecs`; consumers depend on and import only `spark_ecs`, which re-exports the derives:
 
 | Macro | What it does |
 |-------|--------------|
@@ -482,7 +482,7 @@ for sys in &world.resource::<FrameTrace>().workloads[0].systems {
 
 Zero-cost when the editor isn't attached — registration-time metadata only; the `FrameTrace` resource is updated regardless because tracing is cheap, but no one reads it. The editor is a separate plugin (`EditorPlugin`) that adds an egui overlay reading these APIs.
 
-## Parallel execution model (Phase 3)
+## Parallel execution model (committed for M4)
 
 Each system declares its access set via the `SystemParam::access()` method. The scheduler within a workload:
 
@@ -507,7 +507,7 @@ Batches:
 
 Determinism is preserved: parallel systems target disjoint data, so iteration order within a batch doesn't affect output.
 
-Phase 3 only — Phase 1 runs everything sequentially within a workload to keep the scheduler simple while we're learning.
+Phase 1 runs everything sequentially within a workload to keep the scheduler simple while we're learning. The parallel executor is the M4 deliverable (Stage 19) and is committed, not optional — Spark's simulation requires it. The `Access` model and DAG/batch structure are built from Phase 1 so M4 is a `RefCell → UnsafeCell` swap behind an already-correct scheduler.
 
 ## Internal implementation sketch
 
@@ -614,91 +614,109 @@ pub struct WorkloadData {
 }
 ```
 
-Phase 1: `Scheduler::run(world)` walks schedules → workloads → systems sequentially. Phase 3: builds parallel batches within a workload.
+Phase 1: `Scheduler::run(world)` walks schedules → workloads → systems sequentially. M4 (Stage 19): builds parallel batches within a workload via Rayon, using the per-system access set as the disjointness proof.
 
 ## Crate structure
 
+No `mod.rs` files — modern Rust convention uses `foo.rs` as the module file
+next to a `foo/` directory of submodules.
+
 ```
 lib/
-├── ecs/
-│   ├── Cargo.toml
-│   ├── src/
-│   │   ├── lib.rs              # re-exports
-│   │   ├── entity.rs           # Entity, EntityAllocator
-│   │   ├── storage.rs          # ComponentStorage<T>, AnyStorage
-│   │   ├── world.rs            # World
-│   │   ├── resource.rs         # Resource access, AnyResource
-│   │   ├── query/
-│   │   │   ├── mod.rs
-│   │   │   ├── data.rs         # QueryData trait, tuple impls
-│   │   │   ├── filter.rs       # With, Without, Or, ...
-│   │   │   └── iter.rs         # Query iteration
-│   │   ├── system/
-│   │   │   ├── mod.rs
-│   │   │   ├── param.rs        # SystemParam trait, all impls
-│   │   │   ├── function.rs     # IntoSystem, FunctionSystem
-│   │   │   └── system.rs       # System trait
-│   │   ├── schedule.rs         # Schedule enum, ScheduleData
-│   │   ├── workload.rs         # Workload labels, WorkloadData, builder
-│   │   ├── scheduler.rs        # Scheduler — runs schedules
-│   │   ├── commands.rs         # Commands, CommandQueue
-│   │   ├── events.rs           # Events<T>, EventReader, EventWriter
-│   │   ├── plugin.rs           # Plugin trait, App
-│   │   ├── trace.rs            # FrameTrace, SystemTrace, ChangeLog
-│   │   ├── reflect.rs          # Reflection APIs for the editor
-│   │   └── access.rs           # Access set, conflict detection
-│   └── tests/
-│       ├── entity.rs
-│       ├── storage.rs
-│       ├── query.rs
-│       ├── system.rs
-│       ├── workload.rs
-│       ├── commands.rs
-│       └── events.rs
-└── ecs-derive/
+└── ecs/
     ├── Cargo.toml
-    └── src/
-        ├── lib.rs
-        ├── component.rs        # #[derive(Component)]
-        ├── resource.rs         # #[derive(Resource)]
-        ├── event.rs            # #[derive(Event)]
-        ├── workload_label.rs   # #[derive(WorkloadLabel)]
-        ├── trace.rs            # #[derive(Trace)]
-        └── system.rs           # #[system] attribute
+    ├── src/
+    │   ├── lib.rs              # re-exports (incl. spark_ecs_macros::{Component, Resource, …})
+    │   ├── entity.rs           # Entity, EntityAllocator
+    │   ├── storage.rs          # ComponentStorage<T>, AnyStorage
+    │   ├── world.rs            # World
+    │   ├── resource.rs         # Resource access, AnyResource
+    │   ├── query.rs            # parent — Query<'_, D, F> + re-exports
+    │   ├── query/
+    │   │   ├── data.rs         # QueryData trait, tuple impls
+    │   │   ├── filter.rs       # With, Without (Or deferred)
+    │   │   └── iter.rs         # Query iteration
+    │   ├── system.rs           # parent — System trait + re-exports
+    │   ├── system/
+    │   │   ├── param.rs        # SystemParam trait, all impls
+    │   │   └── function.rs     # IntoSystem, FunctionSystem
+    │   ├── schedule.rs         # Schedule enum, ScheduleData
+    │   ├── workload.rs         # Workload labels, WorkloadData, builder
+    │   ├── scheduler.rs        # Scheduler — runs schedules
+    │   ├── commands.rs         # Commands, CommandQueue
+    │   ├── events.rs           # Events<T>, EventReader, EventWriter
+    │   ├── plugin.rs           # Plugin trait, App
+    │   ├── trace.rs            # FrameTrace, SystemTrace, ChangeLog
+    │   ├── reflect.rs          # Reflection APIs for the editor
+    │   └── access.rs           # Access set, conflict detection
+    ├── tests/
+    │   ├── entity.rs
+    │   ├── storage.rs
+    │   ├── query.rs
+    │   ├── system.rs
+    │   ├── workload.rs
+    │   ├── commands.rs
+    │   └── events.rs
+    └── macros/                 # nested proc-macro crate (spark-ecs-macros)
+        ├── Cargo.toml          # proc-macro = true; deps: syn, quote, proc-macro2
+        └── src/
+            ├── lib.rs
+            ├── component.rs    # #[derive(Component)]
+            ├── resource.rs     # #[derive(Resource)]
+            ├── event.rs        # #[derive(Event)]
+            ├── workload_label.rs # #[derive(WorkloadLabel)]
+            ├── trace.rs        # #[derive(Trace)]
+            └── system.rs       # #[system] attribute
 ```
+
+The nested `macros/` crate is a single mandatory `members = ["lib/ecs/macros", …]` entry in the workspace `Cargo.toml`. From every consumer's perspective the ECS is one cohesive package — they depend only on `spark-ecs`, which re-exports the derives.
 
 ## Cargo.toml
 
 ```toml
-# crates/ecs/Cargo.toml
+# lib/ecs/Cargo.toml
 [package]
 name = "spark-ecs"
+version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
 
 [dependencies]
-spark-core = { path = "../core" }
-spark-ecs-derive = { path = "../ecs-derive" }
+# spark-ecs is the deepest engine crate — no spark-core dep, no engine deps.
+# The proc-macro crate is nested at `macros/` and is the only dependency
+# besides workspace stdlib-adjacent helpers added as we land features.
+spark-ecs-macros = { path = "macros" }
 tracing.workspace = true
-hashbrown = "0.15"
 
 # No external ECS dependency — everything written from scratch.
 ```
 
 ```toml
-# crates/ecs-derive/Cargo.toml
+# lib/ecs/macros/Cargo.toml — nested proc-macro crate
 [package]
-name = "spark-ecs-derive"
+name = "spark-ecs-macros"
+version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
 
 [lib]
 proc-macro = true
 
+# Add these to [workspace.dependencies] in the root Cargo.toml as exact
+# pinned versions (project convention — never caret ranges). Look up the
+# latest stable at implementation time.
 [dependencies]
-syn = { version = "2", features = ["full"] }
-quote = "1"
-proc-macro2 = "1"
+syn = { workspace = true, features = ["full"] }
+quote.workspace = true
+proc-macro2.workspace = true
 ```
 
 ## Build plan — phases and stages
@@ -730,11 +748,11 @@ Test: insert/read/update/remove cycle.
 Test: movement system across 1k entities.
 
 **Stage 6 — Query filters** (1 day)
-`With<T>`, `Without<T>`, tuple-of-filters, `Or<(F1, F2)>`, `Option<&T>` in data.
+`With<T>`, `Without<T>`, tuple-of-filters, `Option<&T>` in data. `Or<(F1, F2)>` is **deferred to post-M4** — `With`/`Without` cover the day-1 needs, and `Or` requires extra `Access`-model handling that is easier to add once the parallel scheduler is in place.
 Test: filter combinations yield correct sets.
 
 **Stage 7 — Derive macros: `Component`, `Resource`, `Event`** (1–2 days)
-`crates/ecs-derive` crate. `#[derive(Component)]` registers in `ComponentRegistry`, captures name/debug fn. Same for the others.
+Nested `lib/ecs/macros/` proc-macro crate (`spark-ecs-macros`). `#[derive(Component)]` registers in `ComponentRegistry`, captures name/debug fn. Same for the others. `spark-ecs` re-exports the derives so consumers depend only on `spark-ecs`.
 Test: derived types show up in registry; can be enumerated.
 
 **Stage 8 — `SystemParam` for `Res<T>` and `ResMut<T>`** (1–2 days)
@@ -785,14 +803,14 @@ Test: walk all entities and dump their components via registry; assert structure
 Per-frame log of every command applied. Editor history panel reads from it.
 Test: spawn/insert/remove inside a system; verify entries in log.
 
-**After Phase 2: editor can introspect everything live.** The actual `EditorPlugin` (egui overlay) lives in `crates/editor`, not in `crates/ecs`, but consumes the APIs above.
+**After Phase 2: editor can introspect everything live.** The actual `EditorPlugin` (egui overlay) lives in `lib/editor/`, not in `lib/ecs/`, but consumes the APIs above.
 
 ### Phase 3 — Performance & polish (stages 19+)
 
-These are stretch; not required to ship Spark v1.
+Stage 19 (parallel execution) is **committed for M4**, not stretch. The remaining stages in this phase are optional.
 
-**Stage 19 — Parallel system execution**
-Track access sets per system. Within a workload, batch non-conflicting systems and run via Rayon. Determinism preserved by disjoint-data invariant.
+**Stage 19 — Parallel system execution** *(M4 — committed, not stretch)*
+Track access sets per system. Within a workload, batch non-conflicting systems and run via Rayon. Determinism preserved by disjoint-data invariant. The `Component`/`Resource` `Send + Sync + 'static` bound is the safety proof; `Access` declarations are the disjointness proof; conflicts are caught at registration time.
 Estimated: 3–5 days.
 
 **Stage 20 — `Local<T>` per-system state**
@@ -822,7 +840,7 @@ Smallest end-to-end demo of the whole pipeline: window opens, sprite shows, WASD
 ### Components
 
 ```rust
-// crates/core/src/types.rs
+// lib/core/src/types.rs
 #[derive(Component, Debug, Clone, Copy)]
 pub struct Position(pub Vec2);
 
@@ -1046,7 +1064,7 @@ impl Plugin for PowerCityPlugin {
 }
 ```
 
-Fully working Spark minimum-loop. Each system is small and focused; access sets are declared by the parameter types; Phase 3 parallelisation will batch non-conflicting systems automatically.
+Fully working Spark minimum-loop. Each system is small and focused; access sets are declared by the parameter types; the M4 parallel executor will batch non-conflicting systems automatically.
 
 ## Open questions
 
