@@ -5,8 +5,9 @@
 //! [`Application`] embeds a [`World`] so plugins have a canonical home
 //! for long-lived state.
 //!
-//! Public surface: [`Application`], [`Plugin`], [`stages::STARTUP`],
-//! [`EngineError`], [`World`], [`VERSION`].
+//! Public surface: [`Application`], [`Plugin`], [`stages`],
+//! [`EngineError`], [`World`], [`Res`], [`ResMut`], [`SystemParam`],
+//! [`IntoSystem`], [`VERSION`].
 //!
 //! # Example
 //!
@@ -36,7 +37,7 @@ mod stage;
 pub use application::Application;
 pub use error::EngineError;
 pub use plugin::Plugin;
-pub use spark_ecs::World;
+pub use spark_ecs::{IntoSystem, Res, ResMut, SystemParam, World};
 pub use stage::stages;
 
 /// Semantic version of `spark-core` from `Cargo.toml`.
