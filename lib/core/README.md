@@ -16,9 +16,11 @@ one. Brings four things together:
 - **[`EngineError`]** — the erased error type that flows through every
   plugin seam (a re-export of [`anyhow::Error`]).
 
-Plus convenience re-exports from `spark-ecs` so most game code only
-needs to depend on `spark-core`: `World`, `Res`, `ResMut`,
-`IntoSystem`, `SystemParam`.
+ECS items (`World`, `Res`, `ResMut`, `IntoSystem`, `SystemParam`) are
+**not** re-exported from this crate — import them from
+[`spark-ecs`](../spark_ecs/) directly. Any crate (engine or game) that
+writes systems adds `spark-ecs` to its `Cargo.toml` alongside
+`spark-core`.
 
 > **What does "composition root" mean?** It's the one place in a
 > program that wires everything together. In Spark that's your
@@ -145,7 +147,8 @@ A **system** is a regular Rust function. Its parameters tell the
 engine what to inject when it's called:
 
 ```rust
-use spark_core::{Application, Res, ResMut, stages};
+use spark_core::{Application, stages};
+use spark_ecs::{Res, ResMut};
 
 struct GameTime { elapsed: f32, dt: f32 }
 struct Score(u32);
@@ -206,7 +209,8 @@ You can introduce your own stages by writing a string constant. No
 registry, no enum, no central list to update:
 
 ```rust
-use spark_core::{Application, ResMut};
+use spark_core::Application;
+use spark_ecs::ResMut;
 
 const FIXED_UPDATE: &str = "fixed_update";
 
@@ -248,7 +252,8 @@ With no runner installed, `run` returns `Ok(())` right after step 2
 cleanly:
 
 ```rust
-use spark_core::{Application, ResMut, stages};
+use spark_core::{Application, stages};
+use spark_ecs::ResMut;
 
 struct Counter(u32);
 
@@ -355,8 +360,8 @@ You never construct an `EngineError` directly; the conversion through
 
 `spark-core` is the only crate that sits *above* `spark-ecs` and
 *below* every other engine crate. It depends on `spark-ecs` so
-`Application` can embed a [`World`]; crates above reach `World`,
-`Res`, `ResMut`, etc. through `spark-core`'s re-exports rather than
-adding a direct `spark-ecs` dependency. See
+`Application` can embed a [`World`]; crates above that need ECS items
+(`World`, `Res`, `ResMut`, `IntoSystem`, `SystemParam`) add a direct
+`spark-ecs` dependency rather than going through `spark-core`. See
 [`docs/PLAN.md`](../../docs/PLAN.md) for the full module dependency
 graph and milestone plan.
