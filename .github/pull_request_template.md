@@ -128,6 +128,7 @@ Architecture-concept topics to cover when relevant:
 ## Checklist
 
 - [ ] Rustdoc updated for every changed item per CLAUDE.md tiered policy (Tier 1/2/3)
+- [ ] Each touched crate's `README.md` is updated to reflect the change — or a line of the form `README-skip: <crate>: <reason>` is included above for crates that genuinely don't need a doc update (typo fixes, internal renames invisible to callers)
 - [ ] `CLAUDE.md` / `docs/PLAN.md` updated if a convention or milestone shifted
 - [ ] No `unsafe` introduced without explicit profiling justification
 - [ ] No `Box<dyn Error>` in any public API surface
