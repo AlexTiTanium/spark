@@ -42,19 +42,20 @@ program exits normally.
 
 ## Configuring the window
 
-[`WindowConfig`] is a plain struct with chainable builders. Hand a
-custom value to `WindowPlugin` via the public `config` field:
+[`WindowConfig`] is a plain struct with chainable builders. Pass it
+inline as the `config` field of `WindowPlugin` — it reads top-to-
+bottom and keeps the wiring in one expression:
 
 ```rust
 use spark_core::Application;
 use spark_window::{WindowConfig, WindowPlugin};
 
-let cfg = WindowConfig::default()
-    .with_title("My Spark Game")
-    .with_size(1920, 1080)
-    .with_resizable(false);
-
-let _app = Application::new().add_plugin(WindowPlugin { config: cfg });
+let _app = Application::new().add_plugin(WindowPlugin {
+    config: WindowConfig::default()
+        .with_title("Spark")
+        .with_size(1280, 720)
+        .with_resizable(true),
+});
 ```
 
 The defaults (`WindowConfig::default()`):
@@ -106,6 +107,137 @@ If you only want to see this crate's logs, scope the filter:
 ```bash
 RUST_LOG=spark_window=debug cargo run -p spark
 ```
+
+## The event loop, today and tomorrow
+
+A window isn't just a rectangle — it's a stream of events from the
+operating system. Key presses, mouse moves, redraw requests, window
+resizes, the "close" click: they all arrive as callbacks. The code
+that receives and dispatches those callbacks is the **event loop**.
+
+`spark-window` doesn't implement an event loop itself; it builds on
+[`winit`], the standard Rust cross-platform windowing library. `winit`
+papers over the per-OS differences (Win32, Cocoa, X11/Wayland, …) and
+gives us a uniform Rust interface:
+
+```text
+                        OS  (keyboard, mouse, repaint, …)
+                                    │
+                                    ▼
+                     winit::event_loop::EventLoop
+                                    │  callbacks
+                                    ▼
+              EventLoopRunner (lives in lib/window)
+                                    │  tracing events
+                                    ▼
+                              terminal / log file
+```
+
+### What happens today
+
+The loop is built once inside [`run`], then handed to winit via
+`run_app(&mut runner)`. From there, winit owns the main thread and
+dispatches each OS event to `EventLoopRunner::window_event`, where
+Spark just turns it into a `tracing` event (see *What ends up in the
+logs* above) — no simulation, no rendering, no input state collection
+yet.
+
+The control-flow mode is `ControlFlow::Wait`: the OS thread sleeps
+until a real event arrives. Easy on power, and fine while the engine
+is still being wired up — but the loop won't tick on its own, so it's
+the wrong mode for an actual game.
+
+### How the game loop will plug in
+
+Starting in M3 the control-flow mode flips to `ControlFlow::Poll`,
+which asks winit to call our handler as fast as the OS allows. That
+continuous tick is where the engine's per-frame work lives. The
+intended layout (from [`docs/PLAN.md`](../../docs/PLAN.md)):
+
+```text
+   ┌───────────────────────────────────────────────────┐
+   │  one frame                                        │
+   │                                                   │
+   │  AboutToWait  ┐                                   │
+   │               │                                   │
+   │   1. drain queued WindowEvents into an            │  ◀── Input
+   │      `InputState` resource                        │       collection
+   │                                                   │
+   │   2. run FixedUpdate schedule N times             │  ◀── Simulation
+   │      (60 Hz fixed timestep — deterministic)       │       (60 Hz)
+   │                                                   │
+   │   3. run Update schedule once                     │  ◀── Per-frame
+   │      (variable rate — animations, ECS commands)   │       game logic
+   │                                                   │
+   │  RedrawRequested ┐                                │
+   │                  │                                │
+   │   4. run Render schedule                          │  ◀── Rendering
+   │      (push a frame to the GPU)                    │       (variable)
+   │                                                   │
+   └───────────────────────────────────────────────────┘
+```
+
+Each step grows into its own crate as the milestones land:
+
+| Step | Where it'll live | Milestone |
+|-|-|-|
+| Input collection | `spark-input` produces an `InputState` resource each frame | M3 |
+| `FixedUpdate` | `spark-core` scheduler ticks at 60 Hz | M3 |
+| `Update` | `spark-core` scheduler, variable rate | M3 |
+| `Render` | `spark-render` consumes ECS state, draws via `wgpu` | M5 |
+
+For now, everything outside step 1's "turn OS events into log lines"
+is no-op. Hooking the per-frame schedule into `AboutToWait` is the
+next big step for this crate.
+
+## How `WindowPlugin` plugs into `Application`
+
+By default, `Application::run` is a normal loop: it executes startup
+systems and then runs the configured schedule. That works for
+headless tools. For a windowed game it can't, because the OS event
+loop has to own the main thread — `winit` will panic if you call its
+`run_app` from anywhere else on macOS or Windows.
+
+The solution is [`Application::set_runner`]. A *runner* is a single
+closure that takes the fully-built `Application` and is responsible
+for running it to completion. `WindowPlugin` installs one in its
+`build`:
+
+```rust,ignore
+impl Plugin for WindowPlugin {
+    fn build(&self, app: &mut Application) {
+        let config = self.config.clone();
+        app.set_runner(move |_app: Application| -> Result<(), EngineError> {
+            event_loop::run(config)?;
+            Ok(())
+        });
+    }
+}
+```
+
+When `Application::run()` fires, it hands itself to that closure
+instead of running the default loop. The closure's job is to drive
+the application until exit — for `WindowPlugin`, that means handing
+the main thread to `winit::EventLoop::run_app`. When the user closes
+the window, `run_app` returns, the closure returns `Ok(())`, and
+`Application::run` returns to the caller.
+
+Things worth knowing:
+
+- **One runner per `Application`.** `set_runner` overwrites. Plugins
+  that install startup systems (like `LogPlugin`) don't conflict, but
+  registering two runner-installing plugins means the last one wins.
+- **The runner owns the `Application`.** The closure takes
+  `Application` by value, so any resources, schedule, or queued events
+  must move into it. M3+ moves the whole `Application` into the
+  event-loop handler so per-frame systems can run inside winit's
+  callbacks.
+- **`set_runner` is what makes the plugin model windowed-game-
+  friendly.** Without it, anyone wanting to use winit would have to
+  bypass `Application` entirely. With it, windowed apps stay inside
+  the regular `add_plugin` flow.
+
+[`Application::set_runner`]: ../spark_core/struct.Application.html#method.set_runner
 
 ## Running without the plugin
 
