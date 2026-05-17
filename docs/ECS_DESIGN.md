@@ -17,7 +17,7 @@ The non-negotiable rule: **all memory management is ECS-based**. The window hand
 - Editor-friendly reflection: list entities, components, resources, system graph, frame timings — all readable at runtime.
 - Sparse-set storage for simplicity. Archetype migration possible later behind the same API.
 - **Parallel system execution is a committed M4 deliverable**, not a stretch goal: lockless via per-system access sets + `Send + Sync` component/resource bound. Phase 1 ships a sequential executor, but the `Access` model and DAG/batch structure are built from day one as the safety proof for the M4 switchover.
-- No `unsafe` until profiling demands it; safe Rust everywhere by default.
+- Default to safe Rust. `unsafe` is allowed when paired with a documented `# Safety` contract and an *enforced* check (runtime assertion, structural invariant, or type-level proof) — not reviewer trust — and confined to one `unsafe fn` per concern with `SAFETY:` comments at every call site. Example: roadmap issue 1b's `DenseMut::get` for multi-mut query joins, paired with `assert_no_self_conflict`.
 
 **Non-goals (for v1):**
 - Archetype storage. Stretch refactor after the API stabilises.
