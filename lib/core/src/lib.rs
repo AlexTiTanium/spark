@@ -1,29 +1,4 @@
-//! Foundation crate for the Spark engine.
-//!
-//! Sits one layer above [`spark_ecs`] in the dependency graph (see
-//! `docs/PLAN.md`): every other engine crate depends on this one.
-//! [`Application`] embeds a [`World`] so plugins have a canonical home
-//! for long-lived state.
-//!
-//! Public surface: [`Application`], [`Plugin`], [`stages`],
-//! [`EngineError`], [`World`], [`Res`], [`ResMut`], [`SystemParam`],
-//! [`IntoSystem`], [`VERSION`].
-//!
-//! # Example
-//!
-//! ```
-//! use spark_core::{Application, Plugin};
-//!
-//! struct HelloPlugin;
-//! impl Plugin for HelloPlugin {
-//!     fn build(&self, app: &mut Application) {
-//!         app.add_startup_system(|| Ok(()));
-//!     }
-//! }
-//!
-//! Application::new().add_plugin(HelloPlugin).run().unwrap();
-//! ```
-
+#![doc = include_str!("../README.md")]
 // `application::Application`, `plugin::Plugin`, `error::EngineError` —
 // the public names deliberately echo their modules so the crate root
 // reads like a Bevy-style plugin API.

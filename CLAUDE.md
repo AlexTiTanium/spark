@@ -171,6 +171,40 @@ Same tiering applies, scaled down:
 - Run `cargo test --doc` after editing doc tests.
 - Module headers (`//!`) follow the same tiering as items: trivial re-export modules get one line; modules with real responsibility get Tier 2.
 
+### Per-crate README conventions
+
+Every engine crate keeps its public-API usage guide in `lib/<name>/README.md`, single-sourced into rustdoc via `#![doc = include_str!("../README.md")]` at the top of `lib.rs`. GitHub renders it on the folder page; `cargo doc -p <crate> --no-deps --open` and (eventually) docs.rs render the same content as the crate's front page. Set `readme = "README.md"` in the crate's `Cargo.toml`.
+
+**Audience.** Write for a Rust beginner — someone a few months in, comfortable with `cargo run` and `Result`, but still learning the ecosystem. Define jargon inline the first time, and prefer concrete shell commands over abstract descriptions. The litmus test: a curious 14-year-old reading on a Saturday should finish each section knowing how they'd use the thing tomorrow.
+
+**Section order.** Use these headings in this order (skip any that don't apply). Do **not** prefix the heading text with a section number (`## 1. Plug it in` → `## Plug it in`) — numbering creates churn whenever a section is added, removed, or reordered, and adds nothing for the reader. When one section needs to point at another, link by name (`*Saving logs to a file* below`), not by ordinal.
+
+1. **`# <crate-name>`** title + a one-line summary directly under it.
+2. **What it is / why it exists** — short blockquote callout explaining the underlying concept (e.g. "what is `tracing`?") if a beginner wouldn't already know.
+3. **Plug it into the `Application`** — show the full `Application::new().add_plugin(...).run()` snippet that wires the crate in.
+4. **Using it from the game (`src/`)** — how the binary imports and calls the public API.
+5. **Using it from an engine crate (`lib/*`)** — when the answer differs (e.g. don't depend on this crate, depend on the underlying library directly). Spell out the exact `Cargo.toml` change.
+6. **Configuration** — env vars, features, feature flags. Show **real shell commands** (`RUST_LOG=spark=debug cargo run -p spark`), not abstract syntax.
+7. **Common patterns** — worked examples for the 2–3 most useful capabilities (structured logging, custom shaders, asset loading, …). One block of code per pattern, with a one-line "what this gives you" before it.
+8. **Errors / pitfalls** — known failure modes and how to avoid them.
+
+**Beginner reminders to include explicitly.** A pro reader skips them; a beginner copy-pastes a snippet and gets a compile error without them.
+
+- **Always show the `use` statements.** No "imports omitted" handwaving. If the example uses `info!`, the block opens with `use spark_log::info;`.
+- **Call out trait requirements.** If `#[derive(Debug)]` is required for the example to compile, say so in a comment on that line. Same for `Display`, `Clone`, etc.
+- **Name where output goes** (stderr vs stdout vs file vs window) once near the top.
+- **For shell snippets**, prefer the full command the reader would actually type (`RUST_LOG=warn cargo run -p spark`) over fragments.
+
+The `cargo doc` invocation for viewing rendered docs lives once in the root [`README.md`](README.md) — don't repeat it per crate.
+
+**Code blocks.** Use ` ```rust ` for runnable code — it becomes a doctest, kept honest by `cargo test --doc`. Use ` ```toml ` for `Cargo.toml` snippets. Use ` ```bash ` for shell commands. Reserve ` ```rust,ignore ` for code that genuinely cannot compile inside this crate's doctest harness; always explain why in a one-line comment above the block.
+
+**Examples have to teach.** A doctest that just calls the headline function teaches nothing. Set up realistic data, name the struct after a real game concept (`Player`, `Tile`, not `Foo`), log realistic field names. If the example doesn't show *why* a reader would call this code, it's not earning its keep.
+
+**Linking.** Rustdoc intra-doc links (`` [`Plugin`] ``, `` [`spark_core::EngineError`] ``) work in `cargo doc` / docs.rs but render as plain bracketed text on GitHub. That's an acceptable trade for single-sourcing — use them when the click-through is genuinely useful, don't sprinkle them on every identifier. For external links (std traits, RFCs), use explicit reference-style `[Display]: https://…` definitions at the bottom of the file.
+
+**Reference implementation.** `lib/log/README.md` is the canonical example. New crate READMEs should match its shape unless they have a clear reason to diverge.
+
 ## Project conventions
 
 These are non-obvious and worth keeping in mind:
@@ -181,6 +215,8 @@ These are non-obvious and worth keeping in mind:
 - **Crate naming.** Engine crates are named `spark-<module>` (e.g. `spark-ecs`, `spark-ecs-macros`) per the `Cargo.toml` examples in `ECS_DESIGN.md`. Internal paths use the unprefixed module name.
 - **Reference repo.** The author's earlier [AlexTiTanium/orange](https://github.com/AlexTiTanium/orange) is **reference material only** — borrow layout ideas, but write everything fresh. Do not import its code patterns or dependency versions.
 - **No Dependabot. Ever.** Dependabot is *persona non grata* on this project — do not propose it, do not add `.github/dependabot.yml`, do not suggest enabling Dependabot security updates in repo settings. The owner has made an explicit, standing decision against it; dependency bumps are handled manually. If a different automation surfaces the same need later (e.g. `cargo audit` in CI), that may be discussed, but Dependabot itself is off the table.
+- **GitHub templates are mandatory.** Every PR body must follow [`.github/pull_request_template.md`](.github/pull_request_template.md) — Summary → Context (with `Closes #` or "No tracking issue") → Changes (file-by-file or area-by-area) → Test plan → Risks & rollback → Checklist. The expandable Architecture diagrams and Learn sections become **required** when the PR introduces a new pattern, public API, structural change, or new dependency; delete those `<details>` blocks only when they genuinely don't apply (e.g. a one-line typo fix). For issues, use the matching template in [`.github/ISSUE_TEMPLATE/`](.github/ISSUE_TEMPLATE/) — `bug.md` for breakage, `feature-or-design.md` for new engine layers / architectural change, `chore.md` for tooling/CI/docs work. Blank issues are disabled by design (`config.yml`). When invoking `gh pr create` or `gh issue create`, write the filled-in template body to a temp file and pass `--body-file <path>`; do not hand-roll an ad-hoc body that skips required sections.
+- **Every PR that touches a crate updates that crate's README.** If a PR modifies any file under `lib/<crate>/src/`, it must also modify `lib/<crate>/README.md` so the rendered documentation tracks the code — public-API change or internal, no exceptions by default. The `readme-check` CI job in [`.github/workflows/ci.yml`](.github/workflows/ci.yml) enforces this on every pull request. The only escape hatch is a line in the PR body of the form `README-skip: <crate>: <one-line reason>` (e.g. `README-skip: spark-ecs: comment-only change, no observable behaviour shift`); reviewers are expected to push back if the reason looks thin. Don't use the skip marker as a default — it exists for typo fixes, internal renames invisible to the README, and cosmetic refactors only.
 - **Separation of concerns.** Process-wide state (panic hook, root error type) lives in `spark-core`. Per-layer events and typed errors live in the layer crate (`WindowError` in `spark-window`, future `RenderError` in `spark-render`, …). Logging install lives in a dedicated `spark-log` crate. The binary composes everything via `Application::new().add_plugin(...).run()` — every subsystem is a `Plugin`. Libraries never install global state on their own.
 - **Crates vs modules.** A new crate under `lib/` is justified by a **distinct architectural concern with its own deps and lifecycle** — windowing, logging, input, rendering, ECS, audio. Pure foundation types with no third-party deps and no lifecycle behaviour (math, ids, time newtypes, IDs) live as **modules inside `spark-core`**. Rule of thumb: if it would naturally implement `Plugin`, give it its own crate.
   - **Proc-macro carve-out.** Rust forces proc macros into a separate `proc-macro = true` crate (they can export nothing else), but a proc-macro crate is *not* a distinct architectural concern — it's a build-time artefact of its parent. Nest it inside the parent at `lib/<parent>/macros/` (e.g. `spark-ecs-macros` lives at `lib/ecs/macros/`) and re-export its derives from the parent so consumers depend on and import only the parent crate. The single outward trace is one mandatory entry in the workspace `members` list.

@@ -46,3 +46,73 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --all-targets --all-features
       - run: cargo test --all-features --no-fail-fast
+
+  # Enforces the rule from CLAUDE.md: any PR that touches a crate's
+  # `src/` must also update that crate's `README.md`, or include an
+  # explicit `README-skip: <crate>: <reason>` line in the PR body.
+  readme-check:
+    name: README updated for touched crates
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check README updates
+        shell: bash
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          changed=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
+
+          # Crates whose src/ was touched.
+          crates_with_src=$(printf '%s\n' "$changed" \
+            | grep -oE '^lib/[^/]+/src/' \
+            | sed -E 's|^lib/([^/]+)/src/$|\1|' \
+            | sort -u \
+            || true)
+
+          # Crates whose README was touched.
+          crates_with_readme=$(printf '%s\n' "$changed" \
+            | grep -E '^lib/[^/]+/README\.md$' \
+            | sed -E 's|^lib/([^/]+)/README\.md$|\1|' \
+            | sort -u \
+            || true)
+
+          missing=()
+          while IFS= read -r crate; do
+            [ -z "$crate" ] && continue
+            if printf '%s\n' "$crates_with_readme" | grep -qxF "$crate"; then
+              echo "OK  $crate — README updated."
+              continue
+            fi
+            if printf '%s' "$PR_BODY" | grep -qF "README-skip: $crate"; then
+              echo "OK  $crate — README skip marker found in PR body."
+              continue
+            fi
+            missing+=("$crate")
+          done <<< "$crates_with_src"
+
+          if [ ${#missing[@]} -gt 0 ]; then
+            {
+              echo
+              echo "::error::Crates with source changes whose README was not updated:"
+              for c in "${missing[@]}"; do
+                echo "::error::  - $c  (expected: lib/$c/README.md)"
+              done
+              echo "::error::"
+              echo "::error::Fix one of these for each crate listed above:"
+              echo "::error::  1. Update lib/<crate>/README.md to reflect the change, OR"
+              echo "::error::  2. Add a line of the form 'README-skip: <crate>: <reason>'"
+              echo "::error::     to the PR body (CLAUDE.md describes when this is appropriate)."
+            } >&2
+            exit 1
+          fi
+
+          echo
+          echo "All touched crates have updated READMEs or explicit skip markers."

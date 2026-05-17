@@ -7,6 +7,7 @@
 [package]
 name = "spark-ecs"
 version = "0.1.0"
+readme = "README.md"
 
 # Inherited from [workspace.package] in the root manifest.
 edition.workspace = true

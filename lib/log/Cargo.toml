@@ -5,6 +5,7 @@
 [package]
 name = "spark-log"
 version = "0.1.0"
+readme = "README.md"
 
 edition.workspace = true
 rust-version.workspace = true

@@ -55,7 +55,36 @@ cargo clippy          # lint
 cargo fmt             # format
 ```
 
-## Docs
+## Browsing the API docs
+
+Every engine crate ships its public-API guide as a `README.md` next to its `Cargo.toml` (e.g. [`lib/log/README.md`](./lib/log/README.md)), and that same file is the rustdoc front page for the crate. To render every workspace crate's docs into an interlinked HTML site and open it in your browser:
+
+```bash
+cargo doc --workspace --no-deps --open
+```
+
+- `--workspace` includes every member under `lib/*` plus the `spark` binary in `src/`.
+- `--no-deps` skips third-party dependencies (`tracing`, `winit`, `thiserror`, …) so the build is fast and the sidebar only lists your crates.
+- `--open` launches `target/doc/spark/index.html` in your default browser.
+
+For a single crate, swap `--workspace` for `-p <crate>`:
+
+```bash
+cargo doc -p spark-log --no-deps --open
+```
+
+### Refreshing after changes
+
+`cargo doc` only rebuilds what it thinks is stale — it does **not** delete old files from `target/doc/`. If you previously ran without `--no-deps` (or renamed/removed an item), the sidebar will still show those leftovers. Wipe the doc cache and rebuild:
+
+```bash
+cargo clean --doc                          # deletes target/doc only
+cargo doc --workspace --no-deps --open
+```
+
+`cargo clean --doc` leaves your compiled binaries in `target/debug` and `target/release` untouched — it's cheap and safe.
+
+## Design docs
 
 - [`docs/PLAN.md`](./docs/PLAN.md) — overall plan, module graph, milestones M1–M6+
 - [`docs/ECS_DESIGN.md`](./docs/ECS_DESIGN.md) — full ECS architecture, phased build plan
