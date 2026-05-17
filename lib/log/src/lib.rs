@@ -1,20 +1,4 @@
-//! `tracing` subscriber install, packaged as a [`Plugin`]. Register
-//! `LogPlugin` first so logging is live before any other plugin emits.
-//!
-//! Filter priority: `RUST_LOG` → [`DEFAULT_FILTER`].
-//!
-//! The five level macros — [`trace!`], [`debug!`], [`info!`], [`warn!`],
-//! [`error!`] — are re-exported from `tracing`, so downstream crates
-//! can emit records without taking a direct `tracing` dependency.
-//!
-//! # Example
-//!
-//! ```
-//! use spark_core::Application;
-//! use spark_log::LogPlugin;
-//!
-//! Application::new().add_plugin(LogPlugin).run().unwrap();
-//! ```
+#![doc = include_str!("../README.md")]
 
 use spark_core::{Application, Plugin};
 use thiserror::Error;
@@ -23,9 +7,16 @@ use tracing_subscriber::fmt;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-/// Re-exports of `tracing`'s level macros. Use them as
-/// `spark_log::info!("…")` etc.; no direct `tracing` dep required.
+/// Re-exports of `tracing`'s event macros, span macros, and the
+/// `#[instrument]` attribute.
+///
+/// Use them as `spark_log::info!("…")`,
+/// `spark_log::info_span!("…", field = value)`, and
+/// `#[spark_log::instrument]`. Downstream crates emitting through
+/// these never need a direct `tracing` dependency.
 pub use tracing::{debug, error, info, trace, warn};
+pub use tracing::{debug_span, error_span, info_span, trace_span, warn_span};
+pub use tracing::instrument;
 
 /// Default filter when `RUST_LOG` is unset.
 ///
