@@ -768,7 +768,7 @@ Test: extract a query from a world via the param trait.
 Test: write a regular function with two params, register it, invoke via the system box.
 
 **Stage 11 — `Schedule` enum + sequential scheduler** (1 day)
-`Schedule::Startup`, `First`, `PreUpdate`, `FixedUpdate`, `Update`, `PostUpdate`, `Render`, `Last`. Scheduler walks them in order, runs systems sequentially within each.
+`Schedule::Startup`, `First`, `PreUpdate`, `FixedUpdate`, `Update`, `PostUpdate`, `Render`, `Last`. Scheduler walks them in order, runs systems sequentially within each. **Replaces the M1–M3 stand-in** in `spark-core` (`pub mod stages { pub const STARTUP: &str = "startup"; … }`) — `add_system(stages::FOO, …)` call-sites migrate to `add_systems(Schedule::Foo, …)` in the same PR. See roadmap item 3.
 Test: three systems in three different schedules run in correct order.
 
 **Stage 12 — `Workload` + builder** (2 days)

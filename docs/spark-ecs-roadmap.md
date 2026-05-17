@@ -35,6 +35,20 @@ movement demo do not run. Must merge before the scheduler.
 - *Work:* `Access` declaration on every `SystemParam`; conflict detection;
   explicit `.before()/.after()`; topo-sorted DAG; system batching.
   Executor is **sequential** but the DAG/batch structure is built now.
+- *Stage-shape migration:* replace the M1–M3 stand-in
+  (`pub mod stages { pub const STARTUP: &str = "startup"; … }` in
+  `spark-core`) with the canonical `pub enum Schedule { Startup, First,
+  PreUpdate, FixedUpdate, Update, PostUpdate, Render, Last }` from
+  ECS_DESIGN.md. `add_system(stages::FOO, …)` becomes
+  `add_systems(Schedule::Foo, …)`. The enum gives compile-time
+  exhaustiveness for the editor's stage view and removes the
+  stringly-typed footgun. Existing callers (#9, #12) are updated in the
+  same PR.
+- *Workload labels:* introduce `#[derive(WorkloadLabel)]` (proc-macro in
+  `spark-ecs-macros`) and `app.add_workload(label, Schedule::Foo, |w| {…})`
+  per ECS_DESIGN.md. Workloads are how plugins group related systems
+  under a name; they sit *inside* a `Schedule` and are the granularity
+  the scheduler topo-sorts and batches.
 - *Decisions:* **B2** (explicit ordering + topo-sort, not registration order);
   **C1** (`Access` + DAG now, parallel executor committed for M4).
 - *Warnings:* `Access` is the **safety proof** for M4 lockless parallelism, not
@@ -42,7 +56,9 @@ movement demo do not run. Must merge before the scheduler.
   All storage access must funnel through one chokepoint so the M4
   `RefCell → UnsafeCell` swap stays local. `world_mut()` must remain
   unreachable from inside a system. Batches must exist even though the
-  executor walks them sequentially.
+  executor walks them sequentially. The `stages::` constants migration is
+  cross-cutting — touches `spark-core`, `spark-window`'s `EventLoopRunner`,
+  the binary, and every doc test that calls `add_system`.
 
 **4. Query filters — `With<T>` / `Without<T>`.**
 - *Work:* `QueryFilter` trait; `With`/`Without` impls; `Query` gets a filter param.
