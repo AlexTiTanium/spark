@@ -153,7 +153,8 @@ impl Application {
     /// # Examples
     ///
     /// ```
-    /// use spark_core::{stages, Application, ResMut};
+    /// use spark_core::{stages, Application};
+    /// use spark_ecs::ResMut;
     ///
     /// struct Counter(u32);
     ///
@@ -184,7 +185,8 @@ impl Application {
     /// # Examples
     ///
     /// ```
-    /// use spark_core::{stages, Application, ResMut};
+    /// use spark_core::{stages, Application};
+    /// use spark_ecs::ResMut;
     ///
     /// struct Counter(u32);
     ///

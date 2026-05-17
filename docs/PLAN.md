@@ -83,9 +83,10 @@ game    ── all of the above
 ```
 
 `spark-ecs` is the deepest crate so `Application` (in `spark-core`) can
-embed a `World` without inverting Cargo's no-cycle rule. Every crate
-above `core` reaches `World` through `spark_core::World`, keeping
-`spark-ecs` a transitive dep.
+embed a `World` without inverting Cargo's no-cycle rule. `spark-core`
+does **not** re-export ECS items — any crate above `core` that needs
+`World`, `Res`, `ResMut`, `IntoSystem`, or `SystemParam` adds a direct
+`spark-ecs` dep alongside `spark-core`.
 
 Each sub-crate owns its `Cargo.toml`.
 

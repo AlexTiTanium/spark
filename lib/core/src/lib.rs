@@ -12,7 +12,6 @@ mod stage;
 pub use application::Application;
 pub use error::EngineError;
 pub use plugin::Plugin;
-pub use spark_ecs::{IntoSystem, Res, ResMut, SystemParam, World};
 pub use stage::stages;
 
 /// Semantic version of `spark-core` from `Cargo.toml`.
