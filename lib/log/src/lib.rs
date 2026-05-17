@@ -14,9 +14,10 @@ use tracing_subscriber::util::SubscriberInitExt;
 /// `spark_log::info_span!("…", field = value)`, and
 /// `#[spark_log::instrument]`. Downstream crates emitting through
 /// these never need a direct `tracing` dependency.
-pub use tracing::{debug, error, info, trace, warn};
-pub use tracing::{debug_span, error_span, info_span, trace_span, warn_span};
-pub use tracing::instrument;
+pub use tracing::{
+    debug, debug_span, error, error_span, info, info_span, instrument, trace, trace_span, warn,
+    warn_span,
+};
 
 /// Default filter when `RUST_LOG` is unset.
 ///
