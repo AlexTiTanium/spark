@@ -188,10 +188,13 @@ impl<T: Component> ComponentStorage<T> {
             // Sparse slot holds a previous tenant's dense pointer
             // (stale generation). Through `World` this can't happen —
             // `despawn` cleans every storage. Direct callers of
-            // `ComponentStorage` may not, so fall through to the
-            // fresh-insert path and leave the old tenant's data put
-            // until its owner removes it.
-            self.sparse[slot] = None;
+            // `ComponentStorage` may not, so evict the dead entry
+            // through the same swap-remove dance `remove` uses;
+            // dropping it on the floor would leave an entry in
+            // `dense` / `entity_index` unreachable through any
+            // public API (a slow leak in the storage).
+            let stale = self.entity_index[di];
+            let _ = self.remove(stale);
         }
         let dense_idx = u32::try_from(self.dense.len())
             .expect("dense storage index space exhausted (u32::MAX components)");
