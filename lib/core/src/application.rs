@@ -112,6 +112,44 @@ impl Application {
         self
     }
 
+    /// Mutable access to the underlying [`World`] — an escape hatch
+    /// for plugin `build()` methods that need to pre-populate state
+    /// directly: spawning a level full of entities, seeding several
+    /// resources in a loop, or anything else for which
+    /// [`add_resource`](Self::add_resource) is too narrow.
+    ///
+    /// Inside a running system, prefer
+    /// [`Res<T>`](spark_ecs::Res) / [`ResMut<T>`](spark_ecs::ResMut)
+    /// (and the `Query` / `Commands` params that land in the next
+    /// PRs). This method is for the *registration* path, not the
+    /// per-frame path.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use spark_core::{Application, Plugin};
+    ///
+    /// struct Tile { x: i32, y: i32 }
+    /// struct Walkable;
+    ///
+    /// struct LevelPlugin;
+    /// impl Plugin for LevelPlugin {
+    ///     fn build(&self, app: &mut Application) {
+    ///         let world = app.world_mut();
+    ///         for y in 0..3 {
+    ///             for x in 0..3 {
+    ///                 world.spawn().insert(Tile { x, y }).insert(Walkable);
+    ///             }
+    ///         }
+    ///     }
+    /// }
+    ///
+    /// Application::new().add_plugin(LevelPlugin).run().unwrap();
+    /// ```
+    pub fn world_mut(&mut self) -> &mut World {
+        &mut self.world
+    }
+
     /// Registers a closure to run during startup. Closures fire in
     /// registration order; the first `Err` short-circuits
     /// [`run`](Self::run).

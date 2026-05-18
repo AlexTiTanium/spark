@@ -141,6 +141,43 @@ Systems read and write resources via `Res<T>` (read-only) and
 > built. Two `Application`s in the same process keep two independent
 > sets of resources. That's what makes tests trivial to write.
 
+### Escape hatch: `app.world_mut()`
+
+`add_resource` wires one value at a time, which is perfect when a
+plugin has a handful of singletons to seed. When a plugin instead
+needs to *pre-populate* the [`World`] with many entities and
+components — loading a level, seeding a tile grid, instantiating a
+fixture for tests — reach for [`Application::world_mut`] to get a
+plain `&mut World`:
+
+```rust
+use spark_core::{Application, Plugin};
+
+struct Tile { x: i32, y: i32 }
+struct Walkable;
+
+struct LevelPlugin;
+impl Plugin for LevelPlugin {
+    fn build(&self, app: &mut Application) {
+        let world = app.world_mut();
+        for y in 0..10 {
+            for x in 0..10 {
+                world.spawn().insert(Tile { x, y }).insert(Walkable);
+            }
+        }
+    }
+}
+
+Application::new().add_plugin(LevelPlugin).run().unwrap();
+```
+
+Use it from inside `Plugin::build` for the registration path, not
+from inside a running system — systems should pull state through
+`Res<T>` / `ResMut<T>` (and the `Query` / `Commands` params landing
+in the next PRs).
+
+[`Application::world_mut`]: struct.Application.html#method.world_mut
+
 ## Systems: code that runs
 
 A **system** is a regular Rust function. Its parameters tell the
