@@ -172,7 +172,7 @@ impl EntityAllocator {
     /// # Logic
     ///
     /// Verify liveness via [`is_alive`](Self::is_alive). On a live
-    /// handle: bump `generation[index]` (checked at `u32::MAX`),
+    /// handle: bump `generation[index]` (wrapping at `u32::MAX`),
     /// clear `alive[index]`, and push the index onto `free_list`. The
     /// slot stays in `generation` and `alive` — only the *free list*
     /// grows by one.
@@ -186,22 +186,6 @@ impl EntityAllocator {
     /// generation check on its own, but lets us reject stale handles
     /// to *never-allocated* slots without bounds-checking the
     /// generation vector first.
-    ///
-    /// Using [`u32::checked_add`] (not `wrapping_add`) keeps that
-    /// rejection *load-bearing*: a wrap-around at `u32::MAX` would
-    /// silently let a pre-wrap generation-`0` handle pass `is_alive`
-    /// for a freshly-allocated tenant of the same slot. The panic is
-    /// theoretical — `u32::MAX` destroys on one slot is roughly four
-    /// billion `destroy`/`allocate` cycles — but cheap to enforce,
-    /// and consistent with [`allocate`](Self::allocate)'s
-    /// `expect("entity index space exhausted")`.
-    ///
-    /// # Panics
-    ///
-    /// Panics with `entity generation space exhausted` if a single
-    /// slot has been recycled [`u32::MAX`] times. Effectively
-    /// unreachable in practice; the panic exists to keep the
-    /// generational-uniqueness guarantee honest.
     ///
     /// # How NOT to use
     ///
@@ -224,9 +208,7 @@ impl EntityAllocator {
             return false;
         }
         let slot = entity.index as usize;
-        self.generation[slot] = self.generation[slot]
-            .checked_add(1)
-            .expect("entity generation space exhausted (u32::MAX cycles on one slot)");
+        self.generation[slot] = self.generation[slot].wrapping_add(1);
         self.alive[slot] = false;
         self.free_list.push(entity.index);
         true
