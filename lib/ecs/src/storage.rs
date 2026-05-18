@@ -188,13 +188,15 @@ impl<T: Component> ComponentStorage<T> {
             // Sparse slot holds a previous tenant's dense pointer
             // (stale generation). Through `World` this can't happen —
             // `despawn` cleans every storage. Direct callers of
-            // `ComponentStorage` may not, so evict the dead entry
-            // through the same swap-remove dance `remove` uses;
-            // dropping it on the floor would leave an entry in
-            // `dense` / `entity_index` unreachable through any
-            // public API (a slow leak in the storage).
-            let stale = self.entity_index[di];
-            let _ = self.remove(stale);
+            // `ComponentStorage` may not, so reuse the dense slot in
+            // place: overwrite both `entity_index[di]` and
+            // `dense[di]`. The dead tenant's data is dropped here;
+            // nothing reachable through any public API was holding
+            // it. Returns `None` because *this* entity had no prior
+            // value.
+            self.entity_index[di] = entity;
+            self.dense[di] = value;
+            return None;
         }
         let dense_idx = u32::try_from(self.dense.len())
             .expect("dense storage index space exhausted (u32::MAX components)");
@@ -551,6 +553,48 @@ mod tests {
         assert_eq!(storage.remove(entities[1]), Some(Pos(1, 1)));
         assert_eq!(storage.get(entities[0]), Some(&Pos(0, 0)));
         assert!(storage.get(entities[1]).is_none());
+    }
+
+    #[test]
+    fn insert_with_fresh_handle_evicts_stale_tenant_in_place() {
+        // Regression for the stale-tenant branch in `insert`: when the
+        // sparse slot is still pointing at a dead previous tenant
+        // (only reachable when bypassing World — through World,
+        // despawn cleans every storage), inserting with a fresh
+        // handle must overwrite that dense slot in place, not push a
+        // new entry and orphan the old one.
+        let mut alloc = EntityAllocator::new();
+        let dead = alloc.allocate();
+        let mut storage = ComponentStorage::<Pos>::new();
+        storage.insert(dead, Pos(7, 7));
+        // Spawn a sibling at a different index so the storage has
+        // more than one dense entry — confirms we touch only the
+        // stale slot, not the sibling.
+        let sibling = alloc.allocate();
+        storage.insert(sibling, Pos(99, 99));
+
+        // Destroy `dead` *through the allocator only*; the storage
+        // is intentionally not cleaned, mimicking a direct
+        // `ComponentStorage` user who skipped a despawn cascade.
+        alloc.destroy(dead);
+        let fresh = alloc.allocate(); // reuses dead's slot, new generation
+        assert_eq!(dead.index, fresh.index);
+        assert_ne!(dead, fresh);
+
+        assert_eq!(storage.len(), 2);
+        let prev = storage.insert(fresh, Pos(1, 2));
+
+        // The fresh handle had no prior value of its own.
+        assert!(prev.is_none());
+        // Storage stays the same size — the stale entry was reused
+        // in place, not pushed alongside.
+        assert_eq!(storage.len(), 2);
+        // Fresh handle now resolves.
+        assert_eq!(storage.get(fresh), Some(&Pos(1, 2)));
+        // Stale handle no longer resolves.
+        assert!(storage.get(dead).is_none());
+        // Sibling untouched.
+        assert_eq!(storage.get(sibling), Some(&Pos(99, 99)));
     }
 
     #[test]
