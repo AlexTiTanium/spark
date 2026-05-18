@@ -15,10 +15,27 @@ license.workspace = true
 name = "spark"
 path = "main.rs"
 
-[lints]
-workspace = true
+# Lints inlined (not `workspace = true`) because we need to override one
+# pedantic lint locally — `needless_pass_by_value`. Cargo's lint table
+# is mutually exclusive between `workspace = true` and a local
+# `[lints.X]`, so the workspace defaults are mirrored here verbatim.
+# Keep this block in sync with `[workspace.lints.*]` in the root
+# `Cargo.toml` when those defaults change.
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+
+# `Res<T>` / `ResMut<T>` / `Query<D>` are SystemParam values: `IntoSystem`'s
+# calling convention hands them to user fns by value, never by reference.
+# The clippy `needless_pass_by_value` lint can't see that contract and
+# fires on every system signature. Suppress it for the binary crate
+# where systems live; engine crates still see the lint.
+needless_pass_by_value = "allow"
 
 [dependencies]
 spark-core = { path = "../lib/core" }
+spark-ecs = { path = "../lib/ecs" }
 spark-log = { path = "../lib/log" }
 spark-window = { path = "../lib/window" }
