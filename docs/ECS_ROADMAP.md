@@ -9,21 +9,35 @@ expanded into full drafts in the project's `#10–#12` format below.
 
 ## Roadmap
 
-### Open issues (in flight)
+### Shipped
 
-- **#10 — Entities + component storage.** Sparse-set storage, `World` API.
-- **#11 — Queries.** `Query` as `SystemParam`. ⚠ Ships with
-  `<&mut T as QueryData>::iter_items` left `unimplemented!` — `Query<&mut T>`
-  does not actually work yet. Closed by **Draft 1** below.
-- **#12 — Commands + frame loop.** Deferred spawn/despawn, per-frame stages.
+- **#10 → PR #20 — Entities + component storage.** Sparse-set storage, `World` API.
+- **#11 → PR #22 — Queries.** `Query` as `SystemParam`. Ships with the **full
+  `QueryData` shared/exclusive split** (`ReadOnlyQueryData` marker,
+  `iter` / `iter_mut`, `&mut T` impl, mixed-mut tuples, tuple arity 2/3/4) —
+  i.e. Draft 1 below **and** roadmap item 5 are already done. See
+  [`lib/ecs/src/query.rs:101-359`](../lib/ecs/src/query.rs#L101-L359).
+- **#12 → PR #24 — Commands + frame loop.** Deferred spawn/despawn,
+  per-frame stages, `WindowPlugin` runner owns `Application`.
+
+### In flight
+
+- **#26 — Multi-mut query joins + self-conflict detection.** The
+  legitimate remainder of the original Draft-3 plan: `(&mut A, &mut B)` via
+  one localised `unsafe fn`, plus `QueryAccess` and
+  `assert_no_self_conflict`. Body in Draft 3 below.
 
 ### To create — in order
 
-**1. Finish `&mut` query iteration** — full draft below (Draft 1).
-Precondition for everything else; without it `Query<&mut T>` and the `#12`
-movement demo do not run. Must merge before the scheduler.
+> **Status legend** — ✅ Done in main · 🟡 Filed (in flight) · ⬜ Not yet filed.
 
-**1b. Multi-mut query joins + query self-conflict detection.**
+**1. ~~Finish `&mut` query iteration~~ — ✅ DONE in main (PR #22).**
+The `QueryData` shared/exclusive split, `ReadOnlyQueryData` gate,
+`Query::iter` / `iter_mut`, and `&mut T` impl all landed with the
+`Query as SystemParam` work. Draft 1 below is preserved for archaeology;
+do not refile it. Originally filed as #25 and closed as stale.
+
+**1b. Multi-mut query joins + query self-conflict detection — 🟡 #26.**
 - *Work:* `(&mut A, &mut B)` (and wider mut tuples) via a small, localised
   `unsafe` block; query-level access collection on `QueryData`; reject any
   query where one component `TypeId` appears twice with a `&mut`
@@ -46,7 +60,7 @@ movement demo do not run. Must merge before the scheduler.
   introduced here is the primitive the scheduler (item 3) extends to
   `SystemParam` level — design it to be reused, not rewritten.
 
-**2. derive(Component/Resource) + `Send+Sync` + drop prelude** — draft below (Draft 2).
+**2. derive(Component/Resource) + `Send+Sync` + drop prelude — ⬜ not filed.** Draft below (Draft 2).
 - *Decisions:* explicit derive over blanket impl; traits become
   `Send + Sync + 'static`; no `prelude` module; the proc-macro crate is
   **nested inside the ECS crate** at `lib/ecs/macros/`, not a top-level
@@ -54,7 +68,7 @@ movement demo do not run. Must merge before the scheduler.
 - *Warnings:* breaking-ish refactor, touches every component/resource in
   demos+tests — do it now while they are few.
 
-**3. Scheduler / workload.**
+**3. Scheduler / workload — ⬜ not filed.**
 - *Work:* `Access` declaration on every `SystemParam` (aggregating the
   `QueryAccess` primitive from issue 1b); conflict detection; explicit
   `.before()/.after()`; topo-sorted DAG; system batching. Executor is
@@ -84,25 +98,26 @@ movement demo do not run. Must merge before the scheduler.
   cross-cutting — touches `spark-core`, `spark-window`'s `EventLoopRunner`,
   the binary, and every doc test that calls `add_system`.
 
-**4. Query filters — `With<T>` / `Without<T>`.**
+**4. Query filters — `With<T>` / `Without<T>` — ⬜ not filed.**
 - *Work:* `QueryFilter` trait; `With`/`Without` impls; `Query` gets a filter param.
 - *Decision:* **A2** — separate trait, second generic: `Query<'w, D, F = ()>`.
 - *Warnings:* `With<U>` contributes a **read** of `U` to the `Access` model —
   filters must report into `collect_access`. `Or` is deferred.
 
-**5. Query tuple arity 3–4.**
-- *Work:* extend the `macro_rules!` arity list.
-- *Warnings:* reuse the arity macro shared with `IntoSystem` (see #11) — do not
-  hand-write the 3- and 4-tuple impls.
+**5. ~~Query tuple arity 3–4~~ — ✅ DONE in main (PR #22).**
+Shipped alongside #11; see `impl_query_data_tuple!(D1, D2, D3)` and
+`impl_query_data_tuple!(D1, D2, D3, D4)` at
+[`lib/ecs/src/query.rs:358-359`](../lib/ecs/src/query.rs#L358-L359). The
+arity macro is shared with `IntoSystem` as planned.
 
-**6. `Time` + `WindowSize` resources.**
+**6. `Time` + `WindowSize` resources — ⬜ not filed.**
 - *Work:* `Time { delta, elapsed }` updated each frame in `EventLoopRunner`;
   `WindowSize` updated on `WindowEvent::Resized`.
 - *Warnings:* movement must use `delta` — the `#12` demo's `p.x += v.x` is
   FPS-dependent and is a bug. `WindowSize` as a resource lets render react to
   resize without the full event system.
 
-**7. Component change-tick storage slot.**
+**7. Component change-tick storage slot — ⬜ not filed.**
 - *Work:* add `changed_tick: Vec<u32>` to `ComponentStorage`, parallel to
   `dense`; set on `insert` / `get_mut`.
 - *Warnings:* `changed_tick` must be `swap_remove`d in lockstep with
@@ -110,7 +125,7 @@ movement demo do not run. Must merge before the scheduler.
   `Changed<T>` filter itself is a fast-follow after render, do not implement it
   here. Needs a `World`-level tick counter.
 
-**8. Bundles.**
+**8. Bundles — ⬜ not filed.**
 - *Work:* `Bundle` trait; tuple impl via `macro_rules!`; `#[derive(Bundle)]`.
 - *Warnings:* define overwrite semantics — inserting a bundle component an
   entity already has should overwrite (consistent with `World::insert`).
@@ -125,6 +140,11 @@ proven-disjoint access; `EntityAllocator` thread-safe; per-system
 ---
 
 ## Draft 1 — spark-ecs: finish `Query<&mut T>` iteration — `QueryData` shared/exclusive split (M3 Issue B-fix)
+
+> ✅ **DONE in main (PR #22).** Preserved for historical context — do not
+> refile. Originally filed as #25 and closed as stale. The shared/exclusive
+> split, `ReadOnlyQueryData` gate, mixed-mut tuples, and tuple arity 2/3/4
+> are all live in [`lib/ecs/src/query.rs:101-359`](../lib/ecs/src/query.rs#L101-L359).
 
 ### Context
 
@@ -345,6 +365,8 @@ optimisation (follow-up).
 
 ## Draft 2 — spark-ecs: derive(Component/Resource) + `Send+Sync` bound + drop prelude
 
+> ⬜ **Not yet filed.** Body is paste-ready when item 2 above is filed.
+
 ### Context
 
 Fixed design decision: component and resource membership is **explicit via a
@@ -516,6 +538,11 @@ Cargo.toml               (modified — "lib/ecs/macros" added to workspace membe
 ---
 
 ## Draft 3 — spark-ecs: multi-mut query joins `(&mut A, &mut B)` + query self-conflict detection (issue 1b)
+
+> 🟡 **Tracked as [#26](https://github.com/AlexTiTanium/spark/issues/26).**
+> The precondition this draft assumes (Draft 1's shared/exclusive split) is
+> already in main, so the issue body has been rewritten to reference main
+> instead of Draft 1.
 
 ### Context
 
