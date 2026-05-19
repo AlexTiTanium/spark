@@ -95,10 +95,10 @@ and adds `Operational`. The entity didn't *become* a different class
   (zero-sized like `Operational`) are fine. Components live in
   per-type storages inside the `World`.
 - **System** — a plain Rust function whose parameters describe what
-  it reads and writes. Today: `Res<T>`, `ResMut<T>`, and `Query<D>`
-  (for `D = &T`, `&mut T`, or a tuple of those). The remaining params
-  (`Commands`, `EventReader`/`Writer`, `Local`) land in follow-up PRs —
-  see *What's next* further down.
+  it reads and writes. Today: `Res<T>`, `ResMut<T>`, `Query<D>` (for
+  `D = &T`, `&mut T`, or a tuple of those), and `Commands` for
+  deferred spawn / despawn / insert. `EventReader`/`Writer` and
+  `Local` land in follow-up PRs — see *What's next* further down.
 
 ```rust
 // Runs today. `Time` here is a tiny stand-in for the future
@@ -1238,62 +1238,132 @@ borrows. No `world.get_thing()` calls; no manual locking.
 
 ## `Commands`: deferred mutations from inside a system
 
-Systems never mutate the world's *structure* directly — no calling
-`world.spawn(...)` inside a system. Instead, systems queue
-**commands** which the scheduler applies at the end of the workload.
-This keeps iteration stable (a system iterating `Query<&Plant>` can't
-have new plants pop into existence mid-loop) and keeps determinism
-intact for parallel execution.
+Systems can't mutate the world's *structure* directly — they hold
+borrows on component storages, and structural changes (spawning,
+inserting, despawning) would invalidate those borrows mid-iteration.
+Instead, systems queue **commands** that the engine applies at the
+end of the stage, when no system holds any borrow. This keeps
+iteration stable (a system iterating `Query<&Plant>` can't have new
+plants pop into existence mid-loop) and keeps determinism intact for
+parallel execution.
 
-```rust,ignore
-use spark_ecs::{Commands, Query, Res, EventReader, Entity};
+> **Status at a glance.** Today's [`Commands`](struct.Commands.html)
+> ships ✅ `spawn`, `despawn(entity)`, `EntityCommands::insert<T>`,
+> and `EntityCommands::id()`. Resource-touching commands
+> (`insert_resource`, `update_resource`), event sends (`send_event`),
+> bundle inserts (`spawn((A, B, C))`), component removes
+> (`.remove::<T>()`), and the `cmd.entity(e)` accessor are ⏳
+> follow-up PRs.
 
-fn place_plant_plan(
-    mut events: EventReader<TileClicked>,
-    economy: Res<Economy>,
-    mut cmd: Commands,
-) {
-    for click in events.read() {
-        if economy.capital >= 100.0 {
-            // Spawn a tuple of components — that's an "entity bundle".
-            cmd.spawn((
-                Plan { tile: click.tile, kind: BuildingKind::WaterWheel },
-                Position(click.tile.as_vec2()),
-                ConstructionProgress { current: 0.0, required: 30.0 },
-            ));
-            cmd.update_resource::<Economy>(|e| e.capital -= 100.0);
-        }
-    }
+```rust
+// ✅ Compiles and runs today.
+use spark_ecs::{Commands, IntoSystem, Query, World};
+
+struct Position { x: f32, y: f32 }
+struct Velocity { x: f32, y: f32 }
+
+fn spawn_pair(mut commands: Commands) {
+    commands.spawn()
+        .insert(Position { x: 0.0, y: 0.0 })
+        .insert(Velocity { x: 1.0, y: 0.5 });
+    commands.spawn()
+        .insert(Position { x: 5.0, y: 5.0 })
+        .insert(Velocity { x: -0.5, y: 0.5 });
 }
 
-fn finish_construction(
-    mut cmd: Commands,
-    completed: Query<Entity, With<ConstructionDone>>,
-) {
-    for entity in &completed {
-        cmd.entity(entity)
-           .remove::<ConstructionProgress>()
-           .remove::<ConstructionDone>()
-           .insert(Operational);
-    }
-}
+let mut world = World::new();
+let mut sys = IntoSystem::into_system(spawn_pair);
+sys(&world);
+// Component inserts are still queued — Query won't see them yet.
+assert_eq!(Query::<&Position>::from_world(&world).iter().count(), 0);
+world.flush_commands();
+// After flush the entities are reachable everywhere.
+assert_eq!(Query::<&Position>::from_world(&world).iter().count(), 2);
 ```
 
-Commands available:
+The handle returned by `spawn().id()` is real **immediately** —
+allocating a fresh slot is a counter bump on the `EntityAllocator`,
+no storage is touched, so there's nothing to defer for that piece.
+The component-insert operations chained after `spawn` are the queued
+parts. That's why the entity id is usable inside the same system —
+e.g. to despawn it on the same frame for a quick round-trip.
 
-| Command | Effect |
-|-|-|
-| `cmd.spawn((A, B, C))` | Spawn a new entity with the tuple as a bundle |
-| `cmd.despawn(entity)` | Remove the entity and all its components |
-| `cmd.entity(e).insert(c)` | Add component `c` to existing entity |
-| `cmd.entity(e).remove::<T>()` | Remove component `T` from entity |
-| `cmd.insert_resource(r)` | Add or replace a resource |
-| `cmd.update_resource::<T>(\|t\| …)` | Mutate a resource in-place |
-| `cmd.send_event(e)` | Equivalent to `EventWriter<E>::write(e)` |
+```rust
+// ✅ Compiles and runs today.
+use spark_ecs::{Commands, IntoSystem, Query, World};
 
-Commands flush **between workloads**, never inside one. So if
-workload A spawns an entity, workload B sees it; but two systems
-inside A both see the *old* state until A finishes.
+struct Tag;
+
+fn round_trip(mut commands: Commands) {
+    let id = commands.spawn().insert(Tag).id();
+    commands.despawn(id);
+}
+
+let mut world = World::new();
+let mut sys = IntoSystem::into_system(round_trip);
+sys(&world);
+world.flush_commands();
+assert_eq!(Query::<&Tag>::from_world(&world).iter().count(), 0);
+```
+
+### Flush timing
+
+`Application::run_stage(stage)` runs every system in the stage in
+registration order, then calls `world.flush_commands()`. So:
+
+- A `spawn` in `STARTUP` is visible in every `PRE_UPDATE` /
+  `UPDATE` / `POST_UPDATE` system that follows.
+- A `spawn` in `UPDATE` is visible in `POST_UPDATE` of the same
+  frame.
+- Two systems both running in `UPDATE`: the second one does **not**
+  see entities the first one queued. They flush together at the
+  stage boundary.
+
+### Commands available today
+
+| Command | Effect | Status |
+|-|-|-|
+| `commands.spawn()` | Allocates a fresh entity synchronously; returns `EntityCommands` for chained queued inserts. | ✅ |
+| `commands.despawn(entity)` | Queues `World::despawn(entity)` for the next flush. | ✅ |
+| `commands.spawn().insert::<T>(value)` | Queues an `insert::<T>(entity, value)` on the just-spawned entity. Chainable. | ✅ |
+| `commands.spawn().id()` | Synchronously-allocated `Entity` — usable inside the same system. | ✅ |
+| `commands.spawn((A, B, C))` | Bundle insert — `spawn` with a tuple of components. | ⏳ Bundle PR |
+| `commands.entity(e).insert(c)` / `.remove::<T>()` | Mutate an existing entity. | ⏳ EntityCommands-for-existing-entity PR |
+| `commands.insert_resource(r)` / `.update_resource::<T>(\|t\| …)` | Resource touches via commands. | ⏳ additive |
+| `commands.send_event(e)` | Equivalent to `EventWriter<E>::write(e)`. | ⏳ Events PR |
+
+### Why disjoint cells make this work
+
+A single system can take both `Commands` and `Query<&mut T>` for any
+`T` without `RefCell` panicking. The reason: `Commands` borrows the
+[`World`](struct.World.html)'s `entities` cell (for synchronous
+`spawn`) and `pending` cell (for queued ops); `Query<&mut T>`
+borrows the storage cell for `T`. Disjoint cells, no runtime
+collision.
+
+```rust
+// ✅ Compiles and runs today. Commands + Query<&mut T> in one signature.
+use spark_ecs::{Commands, IntoSystem, Query, World};
+
+struct Position { x: f32, y: f32 }
+
+fn mirror_each(q: Query<&Position>, mut commands: Commands) {
+    // Iterate live positions, queue a mirrored sibling for each.
+    let snapshots: Vec<(f32, f32)> = q.iter().map(|p| (p.x, p.y)).collect();
+    for (x, y) in snapshots {
+        commands.spawn().insert(Position { x: -x, y: -y });
+    }
+}
+
+let mut world = World::new();
+world.spawn().insert(Position { x: 1.0, y: 2.0 });
+
+let mut sys = IntoSystem::into_system(mirror_each);
+sys(&world);
+world.flush_commands();
+// Originals (1, 2) + mirrored (-1, -2) = 2 entities.
+assert_eq!(Query::<&Position>::from_world(&world).iter().count(), 2);
+```
 
 ## `Events<T>`: messages between systems
 

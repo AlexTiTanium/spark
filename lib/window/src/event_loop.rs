@@ -1,13 +1,17 @@
-//! OS event-loop driver.
+//! OS event-loop driver — also the per-frame scheduler.
 //!
-//! [`run`] builds a [`winit::event_loop::EventLoop`], pairs it with an
+//! [`run`] takes an owned [`Application`] plus a [`WindowConfig`],
+//! builds a [`winit::event_loop::EventLoop`], pairs it with an
 //! internal `EventLoopRunner` that implements
 //! [`ApplicationHandler`](winit::application::ApplicationHandler), and
-//! hands the loop to winit. Every OS event we care about is emitted as
-//! a `tracing` event from here.
+//! hands the loop to winit. On every `RedrawRequested`, the runner
+//! ticks the per-frame stages — `PRE_UPDATE → UPDATE → POST_UPDATE` —
+//! then asks winit for the next redraw. That's the entire per-frame
+//! loop the engine ships with M3.
 
 use std::num::NonZeroU32;
 
+use spark_core::{Application, stages};
 use tracing::{debug, info, trace};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -19,9 +23,14 @@ use crate::config::WindowConfig;
 use crate::error::WindowError;
 
 /// Opens the window from `config` and drives the OS event loop until
-/// the user closes it. Blocks the calling thread; must run on the main
-/// thread. Uses [`ControlFlow::Wait`]; switches to
-/// [`ControlFlow::Poll`] in M3+ when fixed-timestep sim arrives.
+/// the user closes it, ticking [`Application`]'s per-frame stages on
+/// every `RedrawRequested`. Blocks the calling thread; must run on the
+/// main thread. Uses [`ControlFlow::Wait`] — `Window::request_redraw`
+/// wakes the loop for the next frame, naturally throttled by the OS.
+///
+/// Typically reached via
+/// [`WindowPlugin`](crate::WindowPlugin)'s runner closure rather than
+/// called directly.
 ///
 /// # Errors
 ///
@@ -32,18 +41,19 @@ use crate::error::WindowError;
 /// # Examples
 ///
 /// ```no_run
-/// spark_window::run(
-///     spark_window::WindowConfig::default()
-///         .with_title("Tiny")
-///         .with_size(320, 240),
-/// )?;
+/// use spark_core::Application;
+/// use spark_window::{run, WindowConfig};
+///
+/// let app = Application::new();
+/// run(app, WindowConfig::default().with_title("Tiny").with_size(320, 240))?;
 /// # Ok::<(), spark_window::WindowError>(())
 /// ```
-pub fn run(config: WindowConfig) -> Result<(), WindowError> {
+pub fn run(app: Application, config: WindowConfig) -> Result<(), WindowError> {
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Wait);
 
     let mut runner = EventLoopRunner {
+        app,
         config,
         window: None,
     };
@@ -58,18 +68,24 @@ pub fn run(config: WindowConfig) -> Result<(), WindowError> {
     Ok(())
 }
 
-/// State held across calls into the OS event loop. `window` is
-/// `Option` because winit only creates it after the loop is active
-/// ([`ApplicationHandler::resumed`]). M4 will move this state onto the
-/// ECS `World` as resources.
+/// State held across calls into the OS event loop.
+///
+/// `app` is the owned [`Application`] — the runner ticks its stages on
+/// every `RedrawRequested`. `window` is `Option` because winit only
+/// creates it after the loop is active
+/// ([`ApplicationHandler::resumed`]). M4 will move the window onto the
+/// ECS `World` as a resource.
 struct EventLoopRunner {
+    app: Application,
     config: WindowConfig,
     window: Option<Window>,
 }
 
 impl ApplicationHandler for EventLoopRunner {
-    /// Builds the OS window from `self.config`. winit calls this once on
-    /// desktop platforms, and again on every foreground on mobile.
+    /// Builds the OS window from `self.config`, then asks winit to
+    /// deliver the first `RedrawRequested` — that's what kicks the
+    /// per-frame loop into motion. winit calls this once on desktop
+    /// platforms and again on every foreground on mobile.
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
@@ -91,6 +107,9 @@ impl ApplicationHandler for EventLoopRunner {
                     scale_factor = window.scale_factor(),
                     "window created"
                 );
+                // Kick the redraw chain — without this, the loop sits
+                // idle in `Wait` mode until an external event fires.
+                window.request_redraw();
                 self.window = Some(window);
             }
             Err(err) => {
@@ -100,9 +119,14 @@ impl ApplicationHandler for EventLoopRunner {
         }
     }
 
-    /// Routes each OS event to the right `tracing` level: lifecycle at
-    /// `info`, per-input at `debug`, high-rate cursor moves at `trace`.
-    /// `CloseRequested` calls `event_loop.exit()` so [`run`] returns.
+    /// Routes each OS event to the right handler.
+    ///
+    /// - `CloseRequested`: exits the loop so [`run`] returns.
+    /// - `RedrawRequested`: ticks `PRE_UPDATE → UPDATE → POST_UPDATE`,
+    ///   then requests the next redraw to keep the loop alive.
+    /// - Lifecycle / input events: logged at appropriate `tracing`
+    ///   levels (cursor at `trace`, input at `debug`, focus/resize at
+    ///   `info`).
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
@@ -113,6 +137,19 @@ impl ApplicationHandler for EventLoopRunner {
             WindowEvent::CloseRequested => {
                 info!("close requested; exiting event loop");
                 event_loop.exit();
+            }
+            WindowEvent::RedrawRequested => {
+                // Per-frame tick. Each stage flushes its pending
+                // commands at the end of its run via
+                // `Application::run_stage`.
+                self.app.run_stage(stages::PRE_UPDATE);
+                self.app.run_stage(stages::UPDATE);
+                self.app.run_stage(stages::POST_UPDATE);
+                // Request the next frame. Under `ControlFlow::Wait`
+                // this is what wakes the loop for the next tick.
+                if let Some(window) = self.window.as_ref() {
+                    window.request_redraw();
+                }
             }
             WindowEvent::Resized(size) => {
                 let nonzero = (NonZeroU32::new(size.width), NonZeroU32::new(size.height));

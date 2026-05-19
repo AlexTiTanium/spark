@@ -11,8 +11,11 @@ one. Brings four things together:
   plugin is a *registrar*: it tells the `Application` what resources
   to insert, what systems to run, and (optionally) what runner to
   use.
-- **[`stages`]** — named slots in the schedule (`STARTUP`, `UPDATE`,
-  plus any custom names you introduce).
+- **[`stages`]** — named slots in the schedule (`STARTUP`,
+  `PRE_UPDATE`, `UPDATE`, `POST_UPDATE`, plus any custom names you
+  introduce). `run_stage` flushes pending
+  [`Commands`](../spark_ecs/struct.Commands.html) at every stage
+  boundary.
 - **[`EngineError`]** — the erased error type that flows through every
   plugin seam (a re-export of [`anyhow::Error`]).
 
@@ -173,8 +176,7 @@ Application::new().add_plugin(LevelPlugin).run().unwrap();
 
 Use it from inside `Plugin::build` for the registration path, not
 from inside a running system — systems should pull state through
-`Res<T>` / `ResMut<T>` (and the `Query` / `Commands` params landing
-in the next PRs).
+`Res<T>` / `ResMut<T>` / `Query<…>` / `Commands` system params.
 
 [`Application::world_mut`]: struct.Application.html#method.world_mut
 
@@ -234,13 +236,28 @@ mechanism.
 ## Stages: when systems run
 
 A **stage** is a named slot in the schedule — just a `&'static str`.
-Spark ships two:
+Spark ships four:
 
 - `stages::STARTUP` — fires once during `Application::run`, after
   every `add_startup_system` closure has finished.
-- `stages::UPDATE` — fires every time you call
-  `Application::run_stage(stages::UPDATE)`. The per-frame driver
-  inside `WindowPlugin`'s event loop ticks it automatically in M3+.
+- `stages::PRE_UPDATE` — first per-frame stage. Convention: input
+  gather, time tick, anything that prepares state the rest of the
+  frame consumes.
+- `stages::UPDATE` — main per-frame stage. The bulk of game logic
+  (movement, AI, spawning, despawning) lives here.
+- `stages::POST_UPDATE` — last per-frame stage. Convention: cleanup
+  and bookkeeping that should run after `UPDATE`'s commands have
+  flushed and the world has settled.
+
+`WindowPlugin`'s runner ticks the three per-frame stages on every
+`RedrawRequested`. With no window driver, you can tick them yourself
+with `app.run_stage(name)` — useful for headless tests.
+
+Each `run_stage` call **runs every system in registration order,
+then flushes pending [`Commands`](../spark_ecs/struct.Commands.html)
+into the world**. A `commands.spawn().insert(…)` queued in `UPDATE`
+becomes visible to `POST_UPDATE` of the same frame, and to every
+system in every later frame.
 
 You can introduce your own stages by writing a string constant. No
 registry, no enum, no central list to update:
@@ -266,9 +283,10 @@ app.run_stage(FIXED_UPDATE);            // Tick = 2
 ```
 
 Systems on `STARTUP` fire automatically inside `run()`; systems on
-`UPDATE` and any custom stage need a caller to invoke
-`run_stage(name)` to drive them. Until M3 lands, that caller is *you*
-(via the snippet above).
+the per-frame stages run automatically inside `WindowPlugin`'s
+runner. Custom stages need a caller to invoke `run_stage(name)` to
+drive them (M3 ships an accumulator-driven `FIXED_UPDATE` driver as
+a follow-up).
 
 ## The `run()` lifecycle
 
@@ -318,12 +336,19 @@ until done" call.
 Install one with `Application::set_runner`:
 
 ```rust
-use spark_core::{Application, EngineError};
+use spark_core::{Application, EngineError, stages};
 
 Application::new()
-    .set_runner(|_app: Application| -> Result<(), EngineError> {
+    .set_runner(|mut app: Application| -> Result<(), EngineError> {
         // …drive the application here. For a windowed game this is
-        // where `winit::EventLoop::run_app(&mut handler)` goes.
+        // where `winit::EventLoop::run_app(&mut handler)` goes, and
+        // the handler calls `app.run_stage(stages::UPDATE)` on every
+        // RedrawRequested. For tests, a tick-N loop suffices:
+        for _ in 0..3 {
+            app.run_stage(stages::PRE_UPDATE);
+            app.run_stage(stages::UPDATE);
+            app.run_stage(stages::POST_UPDATE);
+        }
         Ok(())
     })
     .run()
@@ -343,9 +368,8 @@ Two things to know:
   caller's side.
 
 The closure's signature — `FnOnce(Application) -> Result<(), EngineError>` —
-is stable through M4, when the runner will use its supplied
-`Application` to drive per-frame schedules (`UPDATE`, eventual
-`FIXED_UPDATE` / `RENDER`) inside the event loop.
+is stable: M3's `WindowPlugin` uses it to own the `Application` and
+tick `PRE_UPDATE → UPDATE → POST_UPDATE` on every winit redraw.
 
 ## Errors
 

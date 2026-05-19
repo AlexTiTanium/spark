@@ -120,9 +120,9 @@ impl Application {
     ///
     /// Inside a running system, prefer
     /// [`Res<T>`](spark_ecs::Res) / [`ResMut<T>`](spark_ecs::ResMut)
-    /// (and the `Query` / `Commands` params that land in the next
-    /// PRs). This method is for the *registration* path, not the
-    /// per-frame path.
+    /// / [`Query<…>`](spark_ecs::Query) / [`Commands`](spark_ecs::Commands).
+    /// This method is for the *registration* path, not the per-frame
+    /// path.
     ///
     /// # Examples
     ///
@@ -148,6 +148,34 @@ impl Application {
     /// ```
     pub fn world_mut(&mut self) -> &mut World {
         &mut self.world
+    }
+
+    /// Shared access to the underlying [`World`].
+    ///
+    /// Useful from runners and from tests that want to inspect post-
+    /// tick state — e.g. a headless runner that ticks N frames, then
+    /// asserts component values via `app.world()`. Inside running
+    /// systems, prefer [`Res<T>`](spark_ecs::Res),
+    /// [`Query<…>`](spark_ecs::Query), and the other `SystemParam`s.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use spark_core::{stages, Application};
+    /// use spark_ecs::ResMut;
+    ///
+    /// struct Counter(u32);
+    ///
+    /// let mut app = Application::new();
+    /// app.add_resource(Counter(0))
+    ///    .add_system(stages::UPDATE, |mut c: ResMut<Counter>| { c.0 += 1; });
+    /// app.run_stage(stages::UPDATE);
+    /// app.run_stage(stages::UPDATE);
+    /// assert_eq!(app.world().resource::<Counter>().0, 2);
+    /// ```
+    #[must_use]
+    pub fn world(&self) -> &World {
+        &self.world
     }
 
     /// Registers a closure to run during startup. Closures fire in
@@ -218,7 +246,19 @@ impl Application {
     }
 
     /// Runs every system registered to `stage` once, in registration
-    /// order. No-op for stages that have no registered systems.
+    /// order, then [flushes pending
+    /// commands](spark_ecs::World::flush_commands) into the world.
+    ///
+    /// The flush is what makes [`Commands`](spark_ecs::Commands)
+    /// usable across stages: a system that runs in
+    /// [`stages::STARTUP`] and queues a `spawn().insert(Position)` has
+    /// the resulting entity visible to systems in
+    /// [`stages::PRE_UPDATE`] (and every later stage) — but *not* to
+    /// later systems within the same `STARTUP` pass. One flush per
+    /// stage boundary.
+    ///
+    /// No-op for stages that have no registered systems (the flush
+    /// still runs, but it's cheap when the queue is empty).
     ///
     /// # Examples
     ///
@@ -237,8 +277,7 @@ impl Application {
     ///    .add_system(stages::UPDATE, tick);
     /// app.run_stage(stages::UPDATE);
     /// app.run_stage(stages::UPDATE);
-    /// // Counter is now 2; the runner never has to wake up to drive UPDATE
-    /// // explicitly in this PR.
+    /// assert_eq!(app.world().resource::<Counter>().0, 2);
     /// ```
     pub fn run_stage(&mut self, stage: &str) {
         if let Some(systems) = self.stages.get_mut(stage) {
@@ -246,6 +285,7 @@ impl Application {
                 system(&self.world);
             }
         }
+        self.world.flush_commands();
     }
 
     /// Installs the runner — the closure that takes the main thread
