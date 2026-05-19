@@ -14,7 +14,7 @@ See **[GAME_DESIGN.md](./GAME_DESIGN.md)** for the game concept, **[ECS_DESIGN.m
 
 1. **Engine-as-learning.** Touch every layer of a modern Rust game engine — windowing, wgpu, ECS, assets, audio, UI — and understand it from the inside.
 2. **Ship Spark.** A small but complete power + city game (see `GAME_DESIGN.md` for scope).
-3. **Modern Rust.** Edition 2024, current dependency versions, idiomatic patterns. No `lazy_static!`, no `extern crate`, no `mod.rs`, etc.
+3. **Modern Rust.** Edition 2024, current dependency versions, idiomatic patterns. No `lazy_static!`, no `extern crate`, etc.
 
 Guiding rule: **build the engine the game needs, not a general-purpose engine.** Engine and game grow together.
 
@@ -219,7 +219,7 @@ The migration is additive on the engine side — `Application` and its helpers s
 
 - `edition = "2018"` → **2024**
 - `extern crate foo;` → delete, unnecessary since 2018
-- `mod.rs` files → use `foo.rs` next to `foo/` directory
+- `mod.rs` files → **prefer** `foo.rs` next to `foo/` directory (better editor-tab labels and symmetric refactor when a single-file module grows into a folder), but `mod.rs` is acceptable when contributor preference outweighs the ergonomics — pick one style per module, don't mix within a single subtree
 - `lazy_static!` → `std::sync::LazyLock` (stable since 1.80)
 - `try!(...)` → `?`
 - `failure` / `error-chain` → `thiserror` (libs) + `anyhow` (apps)

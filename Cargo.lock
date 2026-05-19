@@ -1171,6 +1171,7 @@ name = "spark"
 version = "0.1.0"
 dependencies = [
  "spark-core",
+ "spark-ecs",
  "spark-log",
  "spark-window",
 ]
