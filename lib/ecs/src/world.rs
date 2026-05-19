@@ -19,6 +19,7 @@ use std::any::{Any, TypeId};
 use std::cell::{Ref, RefCell, RefMut};
 use std::collections::HashMap;
 
+use crate::commands::CommandQueue;
 use crate::entity::{Entity, EntityAllocator};
 use crate::storage::{AnyStorage, Component, ComponentStorage};
 
@@ -72,9 +73,18 @@ use crate::storage::{AnyStorage, Component, ComponentStorage};
 /// ```
 #[derive(Default)]
 pub struct World {
-    entities: EntityAllocator,
+    // Wrapped in `RefCell` so [`crate::Commands::spawn`] can
+    // `borrow_mut` the allocator through a shared `&World` borrow —
+    // the same trick we already use per-component-storage and
+    // per-resource. Through `&mut World` we still reach the underlying
+    // allocator with `get_mut()` (no runtime borrow check).
+    entities: RefCell<EntityAllocator>,
     components: HashMap<TypeId, RefCell<Box<dyn AnyStorage>>>,
     resources: HashMap<TypeId, RefCell<Box<dyn Any>>>,
+    // Deferred ops queued by [`crate::Commands`] within a stage and
+    // drained by [`flush_commands`](Self::flush_commands) at the stage
+    // boundary. One cell per `World`; the queue itself is FIFO.
+    pending: RefCell<CommandQueue>,
 }
 
 impl World {
@@ -276,7 +286,9 @@ impl World {
     /// assert!(world.is_alive(entity));
     /// ```
     pub fn spawn(&mut self) -> EntityMut<'_> {
-        let entity = self.entities.allocate();
+        // `&mut self` lets us reach the allocator without a runtime
+        // borrow check via `get_mut()`.
+        let entity = self.entities.get_mut().allocate();
         EntityMut {
             world: self,
             entity,
@@ -313,13 +325,13 @@ impl World {
     /// assert!(!world.despawn(e));      // second despawn is a no-op
     /// ```
     pub fn despawn(&mut self, entity: Entity) -> bool {
-        if !self.entities.is_alive(entity) {
+        if !self.entities.get_mut().is_alive(entity) {
             return false;
         }
         for cell in self.components.values_mut() {
             cell.get_mut().remove_entity(entity);
         }
-        self.entities.destroy(entity)
+        self.entities.get_mut().destroy(entity)
     }
 
     /// Returns `true` iff this exact handle (matching index *and*
@@ -338,7 +350,7 @@ impl World {
     /// ```
     #[must_use]
     pub fn is_alive(&self, entity: Entity) -> bool {
-        self.entities.is_alive(entity)
+        self.entities.borrow().is_alive(entity)
     }
 
     /// Attaches `value` to `entity`. Returns the previous component
@@ -368,7 +380,7 @@ impl World {
     /// assert!((old.0 - 1.0).abs() < f32::EPSILON);
     /// ```
     pub fn insert<T: Component>(&mut self, entity: Entity, value: T) -> Option<T> {
-        if !self.entities.is_alive(entity) {
+        if !self.entities.get_mut().is_alive(entity) {
             return None;
         }
         let cell = self
@@ -405,7 +417,7 @@ impl World {
     /// assert!(world.get::<Position>(e).is_none());
     /// ```
     pub fn remove<T: Component>(&mut self, entity: Entity) -> Option<T> {
-        if !self.entities.is_alive(entity) {
+        if !self.entities.get_mut().is_alive(entity) {
             return None;
         }
         let cell = self.components.get_mut(&TypeId::of::<T>())?;
@@ -441,7 +453,7 @@ impl World {
     /// ```
     #[must_use]
     pub fn get<T: Component>(&self, entity: Entity) -> Option<Ref<'_, T>> {
-        if !self.entities.is_alive(entity) {
+        if !self.entities.borrow().is_alive(entity) {
             return None;
         }
         let cell = self.components.get(&TypeId::of::<T>())?;
@@ -478,7 +490,7 @@ impl World {
     /// ```
     #[must_use]
     pub fn get_mut<T: Component>(&self, entity: Entity) -> Option<RefMut<'_, T>> {
-        if !self.entities.is_alive(entity) {
+        if !self.entities.borrow().is_alive(entity) {
             return None;
         }
         let cell = self.components.get(&TypeId::of::<T>())?;
@@ -489,6 +501,71 @@ impl World {
                 .get_mut(entity)
         })
         .ok()
+    }
+
+    // -------- deferred command queue --------
+
+    /// Drains every queued [`crate::Commands`] op into this world, in
+    /// push order.
+    ///
+    /// Called by
+    /// [`Application::run_stage`](../../spark_core/struct.Application.html#method.run_stage)
+    /// at every stage boundary, after the stage's systems have all
+    /// run. Ops that enqueue more ops (e.g. a closure that constructs
+    /// a fresh [`crate::Commands`] mid-flush) are picked up by the
+    /// internal loop and applied in the same call.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use spark_ecs::{Commands, IntoSystem, Query, World};
+    ///
+    /// struct Tag;
+    ///
+    /// let mut world = World::new();
+    /// let mut sys = IntoSystem::into_system(|mut commands: Commands| {
+    ///     commands.spawn().insert(Tag);
+    /// });
+    /// sys(&world);
+    /// assert_eq!(Query::<&Tag>::from_world(&world).iter().count(), 0);
+    /// world.flush_commands();
+    /// assert_eq!(Query::<&Tag>::from_world(&world).iter().count(), 1);
+    /// ```
+    pub fn flush_commands(&mut self) {
+        loop {
+            // Snatch the queue's contents — `self.pending` is now a
+            // fresh empty queue, so any op that re-enqueues during the
+            // inner flush lands there and we catch it on the next
+            // iteration.
+            let mut queue = std::mem::take(self.pending.get_mut());
+            if queue.is_empty() {
+                return;
+            }
+            queue.flush(self);
+        }
+    }
+
+    // -------- internal cell handles (Commands plumbing) --------
+    //
+    // Crate-private — `Commands` is the only sanctioned caller. The
+    // borrowed cells are disjoint from every component storage, which
+    // is why a system can take `Commands` and `Query<&mut T>` for any
+    // `T` in the same signature without panicking at runtime.
+
+    /// Returns a reference to the [`RefCell`] guarding the
+    /// [`EntityAllocator`]. Used by [`crate::Commands::spawn`] to
+    /// allocate synchronously without `&mut World`.
+    #[must_use]
+    pub(crate) fn entities_cell(&self) -> &RefCell<EntityAllocator> {
+        &self.entities
+    }
+
+    /// Returns a reference to the [`RefCell`] guarding the pending
+    /// [`CommandQueue`]. Used by [`crate::Commands`] to enqueue
+    /// deferred ops through a shared world borrow.
+    #[must_use]
+    pub(crate) fn pending_cell(&self) -> &RefCell<CommandQueue> {
+        &self.pending
     }
 
     // -------- storage handles (Query plumbing) --------

@@ -108,7 +108,7 @@ If you only want to see this crate's logs, scope the filter:
 RUST_LOG=spark_window=debug cargo run -p spark
 ```
 
-## The event loop, today and tomorrow
+## The event loop and the per-frame tick
 
 A window isn't just a rectangle — it's a stream of events from the
 operating system. Key presses, mouse moves, redraw requests, window
@@ -128,67 +128,116 @@ gives us a uniform Rust interface:
                                     │  callbacks
                                     ▼
               EventLoopRunner (lives in lib/window)
-                                    │  tracing events
-                                    ▼
-                              terminal / log file
+                                    │
+                  ┌─────────────────┼──────────────────┐
+                  ▼                 ▼                  ▼
+            tracing events  Application::run_stage   request_redraw
+                                  (per frame)
 ```
 
-### What happens today
+### Per-frame schedule, today
 
 The loop is built once inside [`run`], then handed to winit via
-`run_app(&mut runner)`. From there, winit owns the main thread and
-dispatches each OS event to `EventLoopRunner::window_event`, where
-Spark just turns it into a `tracing` event (see *What ends up in the
-logs* above) — no simulation, no rendering, no input state collection
-yet.
+`run_app(&mut runner)`. The runner owns the [`Application`] that was
+handed to it from the [`set_runner`](`Application::set_runner`)
+closure. On every `WindowEvent::RedrawRequested`, the runner ticks
+the per-frame stages, then asks winit for the next redraw:
+
+```text
+   ┌────────────────────────────────────────────────┐
+   │  one frame (on RedrawRequested) — TODAY        │
+   │                                                │
+   │   1. app.run_stage(PRE_UPDATE)                 │  ◀── input / time
+   │      → flush queued commands                   │
+   │                                                │
+   │   2. app.run_stage(UPDATE)                     │  ◀── game logic
+   │      → flush queued commands                   │       (movement,
+   │                                                │        spawning)
+   │   3. app.run_stage(POST_UPDATE)                │  ◀── settled-state
+   │      → flush queued commands                   │       bookkeeping
+   │                                                │
+   │   4. window.request_redraw()                   │  ◀── queue next
+   │                                                │       frame
+   └────────────────────────────────────────────────┘
+```
+
+Each `run_stage(_)` call runs every system registered to that stage
+in registration order, then drains pending [`spark_ecs::Commands`]
+into the [`spark_ecs::World`]. So a system that calls
+`commands.spawn().insert(Position { … })` in `UPDATE` has its entity
+visible in `POST_UPDATE` of the same frame, and to every system in
+every later frame.
 
 The control-flow mode is `ControlFlow::Wait`: the OS thread sleeps
-until a real event arrives. Easy on power, and fine while the engine
-is still being wired up — but the loop won't tick on its own, so it's
-the wrong mode for an actual game.
+between frames and `window.request_redraw()` is what wakes it for
+the next tick. This is **temporary** — it's the minimum that makes
+the per-frame stages tick at all without a render path. It works
+because the OS compositor schedules the redraw at roughly its native
+cadence, so frames don't free-spin and CPU stays cool. The cost: no
+sub-frame precision and no way to drain queued input events between
+ticks. Both come back when the loop flips to `Poll` (see below).
 
-### How the game loop will plug in
+### Where we're headed
 
-Starting in M3 the control-flow mode flips to `ControlFlow::Poll`,
-which asks winit to call our handler as fast as the OS allows. That
-continuous tick is where the engine's per-frame work lives. The
-intended layout (from [`docs/PLAN.md`](../../docs/PLAN.md)):
+The shipping shape is a stepping stone. The target loop — the one
+[`docs/PLAN.md`](../../docs/PLAN.md) calls for — separates input,
+fixed-timestep simulation, variable-rate game logic, and rendering
+into distinct slots driven by two different winit hooks:
 
 ```text
    ┌───────────────────────────────────────────────────┐
-   │  one frame                                        │
+   │  one frame — TARGET                               │
    │                                                   │
-   │  AboutToWait  ┐                                   │
-   │               │                                   │
+   │  about_to_wait  ┐    (ControlFlow::Poll)          │
+   │                 │                                 │
    │   1. drain queued WindowEvents into an            │  ◀── Input
    │      `InputState` resource                        │       collection
    │                                                   │
-   │   2. run FixedUpdate schedule N times             │  ◀── Simulation
+   │   2. run FIXED_UPDATE schedule N times            │  ◀── Simulation
    │      (60 Hz fixed timestep — deterministic)       │       (60 Hz)
    │                                                   │
-   │   3. run Update schedule once                     │  ◀── Per-frame
+   │   3. run UPDATE schedule once                     │  ◀── Per-frame
    │      (variable rate — animations, ECS commands)   │       game logic
    │                                                   │
-   │  RedrawRequested ┐                                │
-   │                  │                                │
-   │   4. run Render schedule                          │  ◀── Rendering
+   │  RedrawRequested  ┐                               │
+   │                   │                               │
+   │   4. run RENDER schedule                          │  ◀── Rendering
    │      (push a frame to the GPU)                    │       (variable)
    │                                                   │
    └───────────────────────────────────────────────────┘
 ```
 
-Each step grows into its own crate as the milestones land:
+What's different from today:
 
-| Step | Where it'll live | Milestone |
+- **`ControlFlow::Poll`** instead of `Wait`. Poll asks winit to fire
+  `about_to_wait` as fast as the OS allows. That's where the
+  per-frame *simulation* lives — independent of when the GPU is ready
+  to draw. With `Wait`, sim and render are conflated into the single
+  `RedrawRequested` handler; with `Poll`, they separate cleanly.
+- **Two hooks, not one.** `about_to_wait` runs input + sim every
+  iteration; `RedrawRequested` only fires the render schedule. The
+  swapchain (via `wgpu`) is what gates `RedrawRequested` cadence, so
+  rendering paces against vsync without us doing anything special.
+- **A real `FIXED_UPDATE` stage** with an accumulator, so simulation
+  stays deterministic across hardware (a save/replay/multiplayer
+  prerequisite).
+- **Per-frame `KeyboardInput` / `MouseInput` events** drain into an
+  `InputState` resource before any sim runs, instead of being
+  consumed inline as `tracing` events.
+
+Each piece grows into its own crate as the milestones land:
+
+| Capability | Where it'll live | Milestone |
 |-|-|-|
-| Input collection | `spark-input` produces an `InputState` resource each frame | M3 |
-| `FixedUpdate` | `spark-core` scheduler ticks at 60 Hz | M3 |
-| `Update` | `spark-core` scheduler, variable rate | M3 |
-| `Render` | `spark-render` consumes ECS state, draws via `wgpu` | M5 |
+| Input collection — drain `KeyboardInput` / `MouseInput` into an `InputState` resource | `spark-input` | M3 follow-up |
+| `FIXED_UPDATE` stage + accumulator (60 Hz, deterministic) | `spark-core` | M3 follow-up |
+| `ControlFlow::Wait → Poll` flip + `about_to_wait` driver | `spark-window` | lands with `FIXED_UPDATE` |
+| `RENDER` stage that pushes a frame to the GPU | `spark-render` (`wgpu` + WGSL) | M5 |
+| Multi-threaded scheduler | `spark-ecs` parallel executor | M4 |
 
-For now, everything outside step 1's "turn OS events into log lines"
-is no-op. Hooking the per-frame schedule into `AboutToWait` is the
-next big step for this crate.
+The per-stage pattern — *run every system, then flush pending
+`Commands`* — is settled and won't change. New stages slot in around
+the existing three; the body of `run_stage` stays the same.
 
 ## How `WindowPlugin` plugs into `Application`
 
@@ -207,8 +256,8 @@ for running it to completion. `WindowPlugin` installs one in its
 impl Plugin for WindowPlugin {
     fn build(&self, app: &mut Application) {
         let config = self.config.clone();
-        app.set_runner(move |_app: Application| -> Result<(), EngineError> {
-            event_loop::run(config)?;
+        app.set_runner(move |app: Application| -> Result<(), EngineError> {
+            event_loop::run(app, config)?;
             Ok(())
         });
     }
@@ -216,9 +265,11 @@ impl Plugin for WindowPlugin {
 ```
 
 When `Application::run()` fires, it hands itself to that closure
-instead of running the default loop. The closure's job is to drive
-the application until exit — for `WindowPlugin`, that means handing
-the main thread to `winit::EventLoop::run_app`. When the user closes
+instead of returning early. The closure's job is to drive the
+application until exit — for `WindowPlugin`, that means moving the
+`Application` into the `EventLoopRunner` and handing the main thread
+to `winit::EventLoop::run_app`. Each `RedrawRequested` ticks the
+per-frame stages on that owned `Application`. When the user closes
 the window, `run_app` returns, the closure returns `Ok(())`, and
 `Application::run` returns to the caller.
 
@@ -228,10 +279,8 @@ Things worth knowing:
   that install startup systems (like `LogPlugin`) don't conflict, but
   registering two runner-installing plugins means the last one wins.
 - **The runner owns the `Application`.** The closure takes
-  `Application` by value, so any resources, schedule, or queued events
-  must move into it. M3+ moves the whole `Application` into the
-  event-loop handler so per-frame systems can run inside winit's
-  callbacks.
+  `Application` by value; the `EventLoopRunner` stores it as a field
+  and ticks `PRE_UPDATE → UPDATE → POST_UPDATE` on every redraw.
 - **`set_runner` is what makes the plugin model windowed-game-
   friendly.** Without it, anyone wanting to use winit would have to
   bypass `Application` entirely. With it, windowed apps stay inside
@@ -242,18 +291,22 @@ Things worth knowing:
 ## Running without the plugin
 
 Most code goes through `WindowPlugin`. If you're writing a tiny
-example or a tool that doesn't use the full `Application` scaffolding,
-[`run`] is the same function the plugin delegates to:
+example or a tool that doesn't use the full `add_plugin` chain,
+[`run`] is the same function the plugin delegates to. It takes an
+already-built [`Application`] plus a [`WindowConfig`]:
 
 ```rust,no_run
+use spark_core::Application;
 use spark_window::{WindowConfig, run};
 
-run(WindowConfig::default().with_title("Tiny example"))?;
+let app = Application::new();  // add systems / resources here first
+run(app, WindowConfig::default().with_title("Tiny example"))?;
 # Ok::<(), spark_window::WindowError>(())
 ```
 
-It still blocks on the main thread and still returns once the user
-closes the window.
+It still blocks on the main thread, ticks the per-frame stages on the
+owned `Application` (see *Per-frame schedule* above), and returns
+once the user closes the window.
 
 ## Errors
 

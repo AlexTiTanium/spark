@@ -1,5 +1,5 @@
 //! [`WindowPlugin`] — wires [`crate::run`] into [`Application`] as the
-//! runner.
+//! runner that owns the per-frame loop.
 
 use spark_core::{Application, EngineError, Plugin};
 
@@ -7,7 +7,9 @@ use crate::config::WindowConfig;
 use crate::event_loop;
 
 /// Installs [`crate::run`] as the [`Application`]'s runner — the
-/// closure that owns the main thread once startup has finished.
+/// closure that owns the main thread once startup has finished and
+/// ticks `PRE_UPDATE → UPDATE → POST_UPDATE` on every winit
+/// `RedrawRequested`.
 ///
 /// # Examples
 ///
@@ -32,8 +34,8 @@ pub struct WindowPlugin {
 impl Plugin for WindowPlugin {
     fn build(&self, app: &mut Application) {
         let config = self.config.clone();
-        app.set_runner(move |_app: Application| -> Result<(), EngineError> {
-            event_loop::run(config)?;
+        app.set_runner(move |app: Application| -> Result<(), EngineError> {
+            event_loop::run(app, config)?;
             Ok(())
         });
     }
