@@ -422,6 +422,27 @@ impl<T: Component> ComponentStorage<T> {
         self.dense_idx_of(entity).is_some()
     }
 
+    /// Hands out the three parallel arrays for one specific consumer:
+    /// the `DenseMut` random-access view that powers the
+    /// `(D1, &mut T)` tuple impl — i.e. the multi-mut path
+    /// (`Query<(&mut A, &mut B)>`). `dense` mutably, `sparse` and
+    /// `entity_index` by shared reference.
+    ///
+    /// Crate-private on purpose — raw access to the parallel arrays
+    /// would break every invariant `ComponentStorage` is built around if
+    /// called from outside the query layer.
+    ///
+    /// `entity_index` lets the random-access view perform the
+    /// generation check before handing out `&mut T`, matching
+    /// [`get`](Self::get) / [`get_mut`](Self::get_mut)'s discipline.
+    pub(crate) fn split_for_join(&mut self) -> (&mut [T], &[Option<u32>], &[Entity]) {
+        (
+            self.dense.as_mut_slice(),
+            self.sparse.as_slice(),
+            self.entity_index.as_slice(),
+        )
+    }
+
     /// Resolves the dense index for `entity` if it's live in this
     /// storage. Checks both the sparse pointer *and* the generation
     /// via `entity_index` to reject stale handles.

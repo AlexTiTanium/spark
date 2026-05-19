@@ -85,15 +85,28 @@ movement demo do not run. Must merge before the scheduler.
   the binary, and every doc test that calls `add_system`.
 
 **4. Query filters — `With<T>` / `Without<T>`.**
-- *Work:* `QueryFilter` trait; `With`/`Without` impls; `Query` gets a filter param.
-- *Decision:* **A2** — separate trait, second generic: `Query<'w, D, F = ()>`.
-- *Warnings:* `With<U>` contributes a **read** of `U` to the `Access` model —
-  filters must report into `collect_access`. `Or` is deferred.
+> ⚠️ **Discuss before opening an implementation issue.** The design
+> sketch below (`Query<'w, D, F = ()>` with a separate `QueryFilter`
+> trait) is one option, not a final decision. Open questions: filter
+> composition (tuples vs explicit `And<…>`), where `Or` fits without
+> wedging the API, whether filters should be a *third* generic on
+> `Query` or fold into `D` (`Query<(&Plant, With<Operational>)>`),
+> how filter access interacts with the scheduler's per-system access
+> aggregation, and whether the syntax should mirror Bevy's exactly or
+> diverge for clarity. Resolve these in a design doc / draft issue
+> first; the implementation issue lands after.
+- *Work (tentative):* `QueryFilter` trait; `With`/`Without` impls;
+  `Query` gets a filter param.
+- *Decision (tentative):* **A2** — separate trait, second generic:
+  `Query<'w, D, F = ()>`.
+- *Warnings:* `With<U>` contributes a **read** of `U` to the `Access`
+  model — filters must report into `collect_access`. `Or` is deferred.
 
-**5. Query tuple arity 3–4.**
-- *Work:* extend the `macro_rules!` arity list.
-- *Warnings:* reuse the arity macro shared with `IntoSystem` (see #11) — do not
-  hand-write the 3- and 4-tuple impls.
+**5. ~~Query tuple arity 3–4~~ — completed.**
+- *Status:* Shipped with issue 1b. `impl_all_tuple!` Cartesian-products
+  the `&` / `&mut` flags at arities 2–5 (every combination, including
+  fully-mutable). Extending to arity 6+ is one line —
+  `impl_all_tuple!(A, B, C, D, E, F);` — with no new mechanism.
 
 **6. `Time` + `WindowSize` resources.**
 - *Work:* `Time { delta, elapsed }` updated each frame in `EventLoopRunner`;
@@ -554,8 +567,11 @@ primitive that the scheduler issue (roadmap item 3) extends.
 
 - Making `(&mut A, &A)` / `(&mut A, &mut A)` *work* — they are rejected; that
   is the point.
-- Wider mut tuples `(&mut A, &mut B, &mut C)` — ride on tuple arity 3–4
-  (roadmap item 5); the `unsafe` lookup here generalises to them unchanged.
+- ~~Wider mut tuples `(&mut A, &mut B, &mut C)` — ride on tuple arity 3–4
+  (roadmap item 5)~~ **Folded in.** The unified `impl_all_tuple!` macro
+  Cartesian-products the `&` / `&mut` flags, so every combination at
+  arity 2–4 (including all-mut at any arity, and read-driver +
+  mut-non-driver) ships with this issue. Adding arity 5+ is one line.
 - Hoisting the conflict check to registration time — that is the scheduler's
   job (item 3). Here it runs per query construction (a few `TypeId`
   comparisons, negligible).
@@ -757,12 +773,13 @@ lib/ecs/src/
 
 | Where next | Adds |
 | --- | --- |
-| This issue | `(&mut A, &mut B)`; one `unsafe fn`; `QueryAccess` + self-conflict check |
-| Arity (item 5) | wider mut tuples ride the same `DenseMut` lookup unchanged |
+| This issue | `impl_all_tuple!` macro — Cartesian product of `&` / `&mut` at arities 2–5 (every combination, including all-mut); one `unsafe fn`; `QueryAccess` + self-conflict check |
+| Arity 6+ | one line per arity (`impl_all_tuple!(A, B, C, D, E, F);`) — no new mechanism needed; monomorphisation cost doubles each step |
 | Scheduler (item 3) | reuses `QueryAccess`; aggregates to `SystemParam` level; hoists conflict detection to registration time; adds cross-system conflicts → DAG |
 | M4 | `RefCell → UnsafeCell` — the self-conflict check becomes the *sole* same-component guard; the `unsafe fn` contract is unchanged |
 
 ### Out of scope
 
-`par_iter`; registration-time conflict hoisting (item 3); wider-than-2 mut
-tuples (item 5); leading-storage `min` optimisation; change detection.
+`par_iter`; registration-time conflict hoisting (item 3); arities beyond 5
+(one-line extension when needed); leading-storage `min` optimisation;
+change detection.

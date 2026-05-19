@@ -19,10 +19,11 @@ other engine crate (including `spark-core`) sits on top.
 > `cargo test --doc -p spark-ecs`. Code blocks tagged ` ```rust,ignore `
 > show types that don't exist yet (`Commands`, `Workload`, `Event`);
 > they're the spec of what's coming, not what's runnable. `Query`
-> exists today for `&T` / `&mut T` and 2-/3-/4-tuples (plus nested
-> tuples like `((&A, &B), (&C, &D))`); the spec-frozen extensions
-> (filters, `Option<&T>`, `Entity`-as-data, multi-mut joins) are
-> marked inline as ⏳ in the *What's next* section. The forward-looking
+> exists today for `&T` / `&mut T` and every `&` / `&mut` combination
+> of 2-/3-/4-/5-tuples (including multi-mut at any arity, e.g.
+> `(&mut A, &mut B, &mut C)`); the spec-frozen extensions (filters,
+> `Option<&T>`, `Entity`-as-data) are marked inline as ⏳ in the
+> *What's next* section. The forward-looking
 > design is settled — see [`docs/ECS_DESIGN.md`](../../docs/ECS_DESIGN.md)
 > for the full engineering reference and [`docs/PLAN.md`](../../docs/PLAN.md)
 > for the milestone plan.
@@ -1016,17 +1017,80 @@ assert!((x - 2.0).abs() < f32::EPSILON);
 assert!((y - 4.0).abs() < f32::EPSILON);
 ```
 
-Tuples scale to arity 4, and they nest, so `Query<((&A, &B), (&C, &D))>`
-works too. See *`Query<D, F>`: finding entities* under *What's next*
-below for the full table of data shapes, plus the filters and
-`Entity`-as-data shapes coming in follow-up PRs.
+Tuples scale flat to arity 4 (`(&A, &B, &C)`, `(&A, &B, &C, &D)`, with
+the same mut-driver and multi-mut variants as arity 2). Tuples do
+**not** nest: `Query<((&A, &B), &C)>` and `Query<(&A, (&B, &C))>` are
+not supported shapes — flatten to `Query<(&A, &B, &C)>` instead.
+See *`Query<D, F>`: finding entities* under *What's next* below for
+the full table of data shapes, plus the filters and `Entity`-as-data
+shapes coming in follow-up PRs.
+
+**Two-mut join — both elements mutable.** Useful when one component
+needs to be both read and mutated alongside another (e.g. apply drag to
+`Velocity` while integrating it into `Position`):
+
+```rust
+use spark_ecs::{Query, World};
+
+struct Position { x: f32, y: f32 }
+struct Velocity { x: f32, y: f32 }
+
+let mut world = World::new();
+world.spawn()
+    .insert(Position { x: 0.0, y: 0.0 })
+    .insert(Velocity { x: 1.0, y: 0.5 });
+
+{
+    let mut q = Query::<(&mut Position, &mut Velocity)>::from_world(&world);
+    for (pos, vel) in q.iter_mut() {
+        pos.x += vel.x;
+        pos.y += vel.y;
+        // Drag on the way out — only possible because Velocity is `&mut` too.
+        vel.x *= 0.9;
+        vel.y *= 0.9;
+    }
+}
+
+let (vx, vy) = Query::<&Velocity>::from_world(&world)
+    .iter()
+    .map(|v| (v.x, v.y))
+    .next()
+    .unwrap();
+assert!((vx - 0.9).abs() < 1e-6);
+assert!((vy - 0.45).abs() < 1e-6);
+```
+
+Under the hood, the multi-mut path uses one tightly contracted
+`unsafe fn` to look up the non-driver storage's `&mut T` by entity.
+That contract — "each entity is visited once per join" — is upheld by
+the driver iterator's shape (`slice::iter_mut`, structurally one pass)
+plus a runtime check that the data shape never names the same
+component twice. The check (`QueryAccess::assert_no_self_conflict`)
+runs inside `Query::from_world` **before** any storage is borrowed and
+turns the would-be `(&mut A, &A)` aliasing case into a precise panic:
+
+```rust,should_panic
+use spark_ecs::{Query, World};
+
+struct Position(f32, f32);
+
+let mut world = World::new();
+world.spawn().insert(Position(0.0, 0.0));
+
+// Panics: "query has conflicting access to component `Position` (written and read)".
+let _q = Query::<(&mut Position, &Position)>::from_world(&world);
+```
 
 **Borrow rules.** Two `Query<&T>` over the same `T` in one system
 coexist — shared borrows of the same storage stack. Two `Query<&mut T>`
 over the same `T` panic on the second fetch (the `RefCell` rule). Two
-`Query<&mut T>` over *different* `T`s are fine — disjoint cells. The
-M4 scheduler will hoist same-type conflicts to a registration-time
-error.
+`Query<&mut T>` over *different* `T`s are fine — disjoint cells. Two
+mut references to the *same* component inside a single query
+(`Query<(&mut A, &mut A)>`, `Query<(&mut A, &A)>`, or the reversed
+`(&A, &mut A)`) panic at `from_world` from the self-conflict check,
+with a message naming the offending component. The M4 scheduler will
+hoist same-type conflicts *across* systems to registration-time
+errors.
 
 # What's next
 
@@ -1041,30 +1105,37 @@ A query is a declarative spec of which entities a system wants. The
 **data shape** says which components to read or write, the **filter**
 says how to narrow the set.
 
-> **Status at a glance.** Data shapes for `&T`, `&mut T`, and 2-/3-/4-
-> tuples (including nested tuples like `((&A, &B), (&C, &D))`) are
-> ✅ shipping today via [`Query<D>`](struct.Query.html). Filters
-> (`With`/`Without`), `Option<&T>`, `Entity`-as-data, and multi-mut
-> joins are ⏳ follow-up PRs. Each subsection below calls out which
-> bits are runnable now and which are spec-frozen.
+> **Status at a glance.** Data shapes for `&T`, `&mut T`, and every
+> `&` / `&mut` combination of flat 2-/3-/4-/5-tuples (including
+> multi-mut at any arity) are ✅ shipping today via
+> [`Query<D>`](struct.Query.html). Filters (`With`/`Without`),
+> `Option<&T>`, and `Entity`-as-data are ⏳ follow-up PRs. Each
+> subsection below calls out which bits are runnable now and which
+> are spec-frozen.
 
 ### Data shapes
 
 ```rust,ignore
-// ✅ today:
+// ✅ today — every `&` / `&mut` combination of 2-/3-/4-/5-tuples,
+//          generated by one `impl_all_tuple!` invocation per arity:
 Query<&Position>                            // immutable single
 Query<&mut Position>                        // mutable single
-Query<(&Position, &Velocity)>               // tuple: read both
-Query<(&mut Position, &Velocity)>           // tuple: write one, read one (mut driver first)
-Query<(&A, &B, &C)>                         // arity 3
-Query<(&A, &B, &C, &D)>                     // arity 4
-Query<((&A, &B), (&C, &D))>                 // nested tuples — recurse through the 2-tuple impl
+Query<(&Position, &Velocity)>               // read-read
+Query<(&mut Position, &Velocity)>           // mut driver, read non-driver
+Query<(&Position, &mut Velocity)>           // read driver, mut non-driver
+Query<(&mut Position, &mut Velocity)>       // multi-mut (self-conflict checked)
+Query<(&A, &B, &C)>                         // arity 3, all-read
+Query<(&mut A, &B, &C)>                     // arity 3, mut at any position…
+Query<(&A, &mut B, &mut C)>                 //   …including multiple positions
+Query<(&mut A, &mut B, &mut C)>             //   …or all of them
+Query<(&A, &B, &C, &D)>                     // arity 4, same story
+Query<(&mut A, &mut B, &mut C, &mut D)>     //   …up to fully mutable
+Query<(&A, &B, &C, &D, &E)>                 // arity 5, same story
+Query<(&mut A, &mut B, &mut C, &mut D, &mut E)>  //   …up to fully mutable
 
 // ⏳ coming:
 Query<(Entity, &Position)>                  // include the Entity ID
 Query<(&Position, Option<&Velocity>)>       // Velocity may be absent
-Query<(&mut A, &mut B)>                     // multi-mut, with self-conflict detection
-Query<(&A, &mut B)>                         // mut-not-first; today, write as (&mut B, &A)
 ```
 
 Iteration shape today is **path B** (Bevy-style): `Query<&T>::iter()`
@@ -1142,11 +1213,16 @@ Query<&Plant, Or<(With<Operational>, With<UnderMaintenance>)>>
 // — DATA SHAPES —
 Query<&T>                                    // ✅ read
 Query<&mut T>                                // ✅ write
-Query<(&A, &B)>                              // ✅ read tuple
-Query<(&mut A, &B)>                          // ✅ mixed (mut driver first)
-Query<(&A, &B, &C)>                          // ✅ arity 3
-Query<(&A, &B, &C, &D)>                      // ✅ arity 4
-Query<((&A, &B), (&C, &D))>                  // ✅ nested tuples
+// Every `&` / `&mut` combination at arity 2, 3, 4, and 5 is ✅ today;
+// runtime self-conflict check catches `(&mut A, &A)` / `(&mut A, &mut A)`.
+Query<(&A, &B)>                              // ✅ arity 2: all 4 combos
+Query<(&mut A, &mut B)>                      // ✅   (incl. multi-mut)
+Query<(&A, &B, &C)>                          // ✅ arity 3: all 8 combos
+Query<(&mut A, &mut B, &mut C)>              // ✅   (incl. fully mutable)
+Query<(&A, &B, &C, &D)>                      // ✅ arity 4: all 16 combos
+Query<(&mut A, &mut B, &mut C, &mut D)>      // ✅   (incl. fully mutable)
+Query<(&A, &B, &C, &D, &E)>                  // ✅ arity 5: all 32 combos
+Query<(&mut A, &mut B, &mut C, &mut D, &mut E)>  // ✅ (incl. fully mutable)
 Query<Entity>                                // ⏳ just the ID, no component
 Query<(Entity, &Position, &mut Velocity)>    // ⏳ ID + multiple components
 Query<&Position, ()>                         // ⏳ explicit empty filter
@@ -1164,10 +1240,10 @@ Or<(F1, F2)>       // OR of filters — after With/Without
 Changed<T>         // only entities whose T was mutated this frame
 Added<T>           // only entities that gained T this frame
 
-// — DEFERRED, NEEDS UNSAFE —         ⏳ multi-mut issue
-Query<(&mut A, &mut B)>  // two mutable joins; ships with a localised
-                         // `unsafe` block plus a query self-conflict check.
-                         // Until then, the trait bounds make it a compile error.
+// — ARITY 6+ —                       follow-up (one line per arity)
+// Add `impl_all_tuple!(A, B, C, D, E, F);` in query.rs to unlock all
+// 64 `&` / `&mut` combinations at arity 6. Pure mechanical extension —
+// but monomorphisation cost doubles per step, weigh against need.
 ```
 
 ### Iteration and cost
@@ -1196,13 +1272,20 @@ cities-with-names runs in 50 iterations, not 50 × 200.
 Filters are essentially free: `With<T>`/`Without<T>` are a single
 sparse lookup per candidate entity, no component fetch.
 
-> **`(&mut A, &mut B)` is not allowed.** Composing two mutable joins
-> would require aliasing reasoning the engine refuses to do in safe
-> code — driving one storage's `iter_mut` while also `iter_mut`-ing
-> another that may overlap can't be proven disjoint without unsafe.
-> The trait bounds make it a compile error rather than a runtime
-> hazard. Use `(&mut A, &B)` instead, swap if needed, and revisit
-> when M4's parallel executor brings proven-disjoint access.
+> **Every `&` / `&mut` combination ships at arity 2-5.** Reads use
+> the storage's safe `get`; mutable non-driver lookups fetch per
+> entity via a tightly contracted `unsafe fn` (`DenseMut::get`).
+> Soundness rests on two facts the engine *enforces*: each driver
+> iteration visits an entity at most once (structural), and the
+> data shape never names the same component twice (runtime check in
+> `QueryAccess::assert_no_self_conflict`, run from `Query::from_world`
+> before any storage borrow). `Query<(&mut A, &mut A)>`,
+> `Query<(&mut A, &A)>`, and the reversed `Query<(&A, &mut A)>` panic
+> at `from_world` with a precise message rather than tripping the
+> `RefCell` "already borrowed" later. To unlock arity 6+, add one
+> `impl_all_tuple!(A, B, C, D, E, F);` line in `query.rs` — the
+> Cartesian-product macro generates every combination automatically,
+> though monomorphisation cost doubles per step.
 
 ### Mixing queries, resources, commands, events
 
