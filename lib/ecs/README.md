@@ -17,12 +17,15 @@ other engine crate (including `spark-core`) sits on top.
 > **Today vs tomorrow.** Code blocks tagged ` ```rust ` compile and
 > run today — they're doc tests, kept honest by
 > `cargo test --doc -p spark-ecs`. Code blocks tagged ` ```rust,ignore `
-> show types that don't exist yet (`Query`, `Commands`, `Workload`,
-> `Event`); they're the spec of what's coming, not what's runnable.
-> The forward-looking design is settled — see
-> [`docs/ECS_DESIGN.md`](../../docs/ECS_DESIGN.md) for the full
-> engineering reference and [`docs/PLAN.md`](../../docs/PLAN.md) for
-> the milestone plan.
+> show types that don't exist yet (`Commands`, `Workload`, `Event`);
+> they're the spec of what's coming, not what's runnable. `Query`
+> exists today for `&T` / `&mut T` and 2-/3-/4-tuples (plus nested
+> tuples like `((&A, &B), (&C, &D))`); the spec-frozen extensions
+> (filters, `Option<&T>`, `Entity`-as-data, multi-mut joins) are
+> marked inline as ⏳ in the *What's next* section. The forward-looking
+> design is settled — see [`docs/ECS_DESIGN.md`](../../docs/ECS_DESIGN.md)
+> for the full engineering reference and [`docs/PLAN.md`](../../docs/PLAN.md)
+> for the milestone plan.
 
 ## Why ECS instead of OOP?
 
@@ -92,17 +95,38 @@ and adds `Operational`. The entity didn't *become* a different class
   (zero-sized like `Operational`) are fine. Components live in
   per-type storages inside the `World`.
 - **System** — a plain Rust function whose parameters describe what
-  it reads and writes. Today: `Res<T>`, `ResMut<T>`. The full set
-  (`Query`, `Commands`, `EventReader`/`Writer`, `Local`) lands in
-  follow-up PRs — see *What's next* further down.
+  it reads and writes. Today: `Res<T>`, `ResMut<T>`, and `Query<D>`
+  (for `D = &T`, `&mut T`, or a tuple of those). The remaining params
+  (`Commands`, `EventReader`/`Writer`, `Local`) land in follow-up PRs —
+  see *What's next* further down.
 
-```rust,ignore
-// What the full system shape will look like once `Query` lands:
+```rust
+// Runs today. `Time` here is a tiny stand-in for the future
+// `spark-time` resource — the real one arrives with the frame-loop
+// PR. Everything else (`Res`, `Query`, the tuple join, `iter_mut`)
+// is real spark-ecs API.
+use spark_ecs::{IntoSystem, Query, Res, World};
+
+struct Time { delta: f32 }
+struct Position(f32, f32);
+struct Velocity(f32, f32);
+
 fn integrate(time: Res<Time>, mut q: Query<(&mut Position, &Velocity)>) {
-    for (mut pos, vel) in q.iter_mut() {
+    for (pos, vel) in q.iter_mut() {
         pos.0 += vel.0 * time.delta;
     }
 }
+
+let mut world = World::new();
+world.add_resource(Time { delta: 0.016 });
+world.spawn().insert(Position(0.0, 0.0)).insert(Velocity(60.0, 0.0));
+
+let mut sys = IntoSystem::into_system(integrate);
+sys(&world);
+// 60 units/sec × 0.016 sec ≈ 0.96. Extract the value into a `f32`
+// before the `Query` drops — `&Position` can't outlive its query.
+let x = Query::<&Position>::from_world(&world).iter().map(|p| p.0).next().unwrap();
+assert!((x - 0.96).abs() < 0.001);
 ```
 
 This declarative shape — *the function signature is the interface* —
@@ -845,12 +869,13 @@ system(&world);
 assert_eq!(world.resource::<Score>().0, 32);
 ```
 
-Two parameter types ship in this PR:
+Three parameter types ship today:
 
 | Param | Effect |
 |-|-|
 | `Res<T>` | Immutable borrow of resource `T`. Derefs to `&T`. |
 | `ResMut<T>` | Mutable borrow of resource `T`. Derefs to `&mut T`. |
+| `Query<D>` | Walks every entity matching the data shape `D` (a single `&T`/`&mut T` or a 2-/3-/4-tuple of those). See *Walking entities with `Query<D>`* below. |
 
 The wrapper supports arities 0..=4. Adding a fifth would mean adding
 one more line to the `impl_into_system!` macro list.
@@ -883,11 +908,132 @@ assert_eq!(world.resource::<A>().0, 1);
 assert_eq!(world.resource::<B>().0, "ok");
 ```
 
+### Walking entities with `Query<D>`
+
+`Query<D>` is the third `SystemParam`. While `Res<T>` / `ResMut<T>`
+borrow a *single* resource, `Query<D>` walks *every* entity that
+matches the data shape `D`. The shape can be one component (`&T` or
+`&mut T`) or a tuple of components; in the tuple case, only entities
+that hold **every** element in the shape are yielded.
+
+Path B (Bevy-style): `iter()` / `iter_mut()` yield `D::Item<'_>`
+directly — `Query<&T>` yields `&T`, not `(Entity, &T)`. The entity id
+becomes available later via the planned `Query<(Entity, &T)>` shape.
+
+**Single-component read.** The simplest query — every entity with a
+`Health` component:
+
+```rust
+use spark_ecs::{Query, World};
+
+struct Health(u32);
+
+let mut world = World::new();
+world.spawn().insert(Health(50));
+world.spawn().insert(Health(100));
+
+let total: u32 = Query::<&Health>::from_world(&world)
+    .iter()
+    .map(|h| h.0)
+    .sum();
+assert_eq!(total, 150);
+```
+
+**Two-component join — the canonical movement system.** Drives the
+first storage and sparse-looks-up the second. Entities missing either
+component are skipped:
+
+```rust
+use spark_ecs::{Query, World};
+
+struct Position { x: f32, y: f32 }
+struct Velocity { x: f32, y: f32 }
+
+let mut world = World::new();
+world.spawn()
+    .insert(Position { x: 0.0, y: 0.0 })
+    .insert(Velocity { x: 1.0, y: 0.5 });
+// Lonely Position with no Velocity — the join must skip it.
+world.spawn().insert(Position { x: 100.0, y: 100.0 });
+
+{
+    // Scope the query so its `RefMut` drops before the read below.
+    let mut q = Query::<(&mut Position, &Velocity)>::from_world(&world);
+    for (pos, vel) in q.iter_mut() {
+        pos.x += vel.x;
+        pos.y += vel.y;
+    }
+}
+
+let xs: Vec<f32> = Query::<&Position>::from_world(&world)
+    .iter()
+    .map(|p| p.x)
+    .collect();
+assert!(xs.contains(&1.0));     // joined entity moved by (1.0, 0.5)
+assert!(xs.contains(&100.0));   // lonely entity untouched
+```
+
+**As a `SystemParam` in a real system.** No explicit `from_world` —
+the runner threads the query in for you, the same way it does
+`Res<T>` / `ResMut<T>`. This is also the right place to introduce a
+`Time`-style resource (a tiny stand-in until the real `spark-time`
+crate lands):
+
+```rust
+use spark_ecs::{IntoSystem, Query, Res, World};
+
+// Stand-in for the future `Time` resource — same shape, no engine
+// integration. Real per-frame `delta` arrives with the frame-loop PR.
+struct Time { delta: f32 }
+
+struct Position { x: f32, y: f32 }
+struct Velocity { x: f32, y: f32 }
+
+fn integrate(time: Res<Time>, mut q: Query<(&mut Position, &Velocity)>) {
+    for (pos, vel) in q.iter_mut() {
+        pos.x += vel.x * time.delta;
+        pos.y += vel.y * time.delta;
+    }
+}
+
+let mut world = World::new();
+world.add_resource(Time { delta: 0.5 });
+world.spawn()
+    .insert(Position { x: 0.0, y: 0.0 })
+    .insert(Velocity { x: 2.0, y: 4.0 });
+
+let mut sys = IntoSystem::into_system(integrate);
+sys(&world);
+sys(&world);
+// Two ticks at delta = 0.5 → position advanced by (2.0, 4.0) total.
+// Pull the values out before the `Query` drops.
+let (x, y) = Query::<&Position>::from_world(&world)
+    .iter()
+    .map(|p| (p.x, p.y))
+    .next()
+    .unwrap();
+assert!((x - 2.0).abs() < f32::EPSILON);
+assert!((y - 4.0).abs() < f32::EPSILON);
+```
+
+Tuples scale to arity 4, and they nest, so `Query<((&A, &B), (&C, &D))>`
+works too. See *`Query<D, F>`: finding entities* under *What's next*
+below for the full table of data shapes, plus the filters and
+`Entity`-as-data shapes coming in follow-up PRs.
+
+**Borrow rules.** Two `Query<&T>` over the same `T` in one system
+coexist — shared borrows of the same storage stack. Two `Query<&mut T>`
+over the same `T` panic on the second fetch (the `RefCell` rule). Two
+`Query<&mut T>` over *different* `T`s are fine — disjoint cells. The
+M4 scheduler will hoist same-type conflicts to a registration-time
+error.
+
 # What's next
 
-The types below are **spec-frozen** but don't ship in this PR. Code
-blocks are `rust,ignore` because the types don't exist yet — read
-them as "here's the shape coming next".
+The types below are **spec-frozen**. Some ship today (✅) and some
+don't (⏳). Code blocks tagged `rust,ignore` are spec-frozen but use
+types that haven't landed yet — read them as "here's the shape coming
+next". Code blocks tagged `rust` compile and run today.
 
 ## `Query<D, F>`: finding entities
 
@@ -895,31 +1041,85 @@ A query is a declarative spec of which entities a system wants. The
 **data shape** says which components to read or write, the **filter**
 says how to narrow the set.
 
+> **Status at a glance.** Data shapes for `&T`, `&mut T`, and 2-/3-/4-
+> tuples (including nested tuples like `((&A, &B), (&C, &D))`) are
+> ✅ shipping today via [`Query<D>`](struct.Query.html). Filters
+> (`With`/`Without`), `Option<&T>`, `Entity`-as-data, and multi-mut
+> joins are ⏳ follow-up PRs. Each subsection below calls out which
+> bits are runnable now and which are spec-frozen.
+
 ### Data shapes
 
 ```rust,ignore
+// ✅ today:
 Query<&Position>                            // immutable single
 Query<&mut Position>                        // mutable single
 Query<(&Position, &Velocity)>               // tuple: read both
-Query<(&mut Position, &Velocity)>           // tuple: write one, read one
+Query<(&mut Position, &Velocity)>           // tuple: write one, read one (mut driver first)
+Query<(&A, &B, &C)>                         // arity 3
+Query<(&A, &B, &C, &D)>                     // arity 4
+Query<((&A, &B), (&C, &D))>                 // nested tuples — recurse through the 2-tuple impl
+
+// ⏳ coming:
 Query<(Entity, &Position)>                  // include the Entity ID
 Query<(&Position, Option<&Velocity>)>       // Velocity may be absent
+Query<(&mut A, &mut B)>                     // multi-mut, with self-conflict detection
+Query<(&A, &mut B)>                         // mut-not-first; today, write as (&mut B, &A)
 ```
 
-Iterating returns tuples in the same shape:
+Iteration shape today is **path B** (Bevy-style): `Query<&T>::iter()`
+yields `&T`, **not** `(Entity, &T)`. If the system needs the entity, it
+will be asked for via the `Query<(Entity, &T)>` shape once that's
+landed.
 
-```rust,ignore
+```rust
+// ✅ Compiles and runs today.
+use spark_ecs::{Query, World};
+
+struct Position(f32, f32);
+struct Velocity(f32, f32);
+
+let mut world = World::new();
+world.spawn().insert(Position(0.0, 0.0)).insert(Velocity(1.0, 0.0));
+
+let mut q = Query::<(&mut Position, &Velocity)>::from_world(&world);
+for (pos, vel) in q.iter_mut() {
+    pos.0 += vel.0;
+    pos.1 += vel.1;
+}
+```
+
+```rust
+// ✅ Runs today with a local `Time` stand-in. The real `spark-time`
+// `Time` resource lands with the frame-loop PR; the shape stays
+// identical.
+use spark_ecs::{IntoSystem, Query, Res, World};
+
+struct Time { delta: f32 }
+struct Position(f32, f32);
+struct Velocity(f32, f32);
+
 fn integrate(time: Res<Time>, mut q: Query<(&mut Position, &Velocity)>) {
-    for (mut pos, vel) in q.iter_mut() {
+    for (pos, vel) in q.iter_mut() {
         pos.0 += vel.0 * time.delta;
     }
 }
+
+let mut world = World::new();
+world.add_resource(Time { delta: 0.5 });
+world.spawn().insert(Position(0.0, 0.0)).insert(Velocity(2.0, 0.0));
+
+let mut sys = IntoSystem::into_system(integrate);
+sys(&world);
+// Pull the value out before the `Query` drops.
+let x = Query::<&Position>::from_world(&world).iter().map(|p| p.0).next().unwrap();
+assert!((x - 1.0).abs() < f32::EPSILON);
 ```
 
 ### Filters
 
-Add a second type parameter to narrow further. Filters don't *fetch*
-the component, they only *gate* the iteration:
+⏳ **Coming next.** Add a second type parameter to narrow further.
+Filters don't *fetch* the component, they only *gate* the iteration:
 
 ```rust,ignore
 // Operational plants only (Operational is a marker — zero-sized).
@@ -940,31 +1140,34 @@ Query<&Plant, Or<(With<Operational>, With<UnderMaintenance>)>>
 
 ```rust,ignore
 // — DATA SHAPES —
-Query<&T>                                    // read
-Query<&mut T>                                // write
-Query<(&A, &B)>                              // read tuple
-Query<(&mut A, &B)>                          // mixed
-Query<(&A, &B, &C)>                          // arity grows freely
-Query<Entity>                                // just the ID, no component
-Query<(Entity, &Position, &mut Velocity)>    // ID + multiple components
-Query<&Position, ()>                         // explicit empty filter
+Query<&T>                                    // ✅ read
+Query<&mut T>                                // ✅ write
+Query<(&A, &B)>                              // ✅ read tuple
+Query<(&mut A, &B)>                          // ✅ mixed (mut driver first)
+Query<(&A, &B, &C)>                          // ✅ arity 3
+Query<(&A, &B, &C, &D)>                      // ✅ arity 4
+Query<((&A, &B), (&C, &D))>                  // ✅ nested tuples
+Query<Entity>                                // ⏳ just the ID, no component
+Query<(Entity, &Position, &mut Velocity)>    // ⏳ ID + multiple components
+Query<&Position, ()>                         // ⏳ explicit empty filter
 
-// — FILTERS (initial set) —
+// — FILTERS (initial set) —          ⏳ filters PR
 With<T>            // entity must have T (but don't fetch T)
 Without<T>         // entity must NOT have T
 (F1, F2, F3)       // AND of filters
 
-// — OPTIONAL DATA —
+// — OPTIONAL DATA —                  ⏳ optional-fetch PR
 Option<&T>         // fetch T if present, give None otherwise
 
-// — DEFERRED (follow-ups after the initial Query lands) —
-Or<(F1, F2)>       // OR of filters — comes after With/Without
+// — DEFERRED —                       ⏳ later follow-ups
+Or<(F1, F2)>       // OR of filters — after With/Without
 Changed<T>         // only entities whose T was mutated this frame
 Added<T>           // only entities that gained T this frame
 
-// — NOT SUPPORTED — explicitly refuses to compile —
-// Query<(&mut A, &mut B)>  // two mutable joins; needs aliasing reasoning
-//                          // that belongs to M4 parallel-executor work.
+// — DEFERRED, NEEDS UNSAFE —         ⏳ multi-mut issue
+Query<(&mut A, &mut B)>  // two mutable joins; ships with a localised
+                         // `unsafe` block plus a query self-conflict check.
+                         // Until then, the trait bounds make it a compile error.
 ```
 
 ### Iteration and cost
@@ -972,8 +1175,9 @@ Added<T>           // only entities that gained T this frame
 The driver-storage trick is what keeps queries fast. To resolve
 `Query<(&A, &B)>` the engine:
 
-1. Picks the **smallest** of `A`'s storage and `B`'s storage as the
-   *driver*.
+1. Today: picks the **first element** as the *driver*. The smaller-
+   storage optimisation (pick the smaller of A's and B's storage) is
+   a planned ⏳ follow-up.
 2. Iterates the driver's `dense` array.
 3. For each entity, looks up the other component via O(1) sparse-set
    access. Skips if absent.

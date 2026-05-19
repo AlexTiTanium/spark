@@ -60,11 +60,23 @@ use crate::World;
 pub trait SystemParam {
     /// The concrete value handed to the user's system fn. Carries the
     /// borrow lifetime `'w` taken from the [`&World`] argument.
-    type Item<'w>;
+    ///
+    /// The `Self: 'w` bound is the GAT well-formedness rule modern Rust
+    /// asks for on every lifetime-generic associated type. `Res<'a, T>`
+    /// and `ResMut<'a, T>` thread this through as `'a: 'w`;
+    /// `Query<'_, D>` does it as `D: 'w`.
+    type Item<'w>
+    where
+        Self: 'w;
 
     /// Builds an `Item<'w>` from a shared world borrow. Called once per
-    /// param every time the wrapped system runs.
-    fn fetch(world: &World) -> Self::Item<'_>;
+    /// param every time the wrapped system runs. The explicit `'w`
+    /// makes the world's borrow lifetime nameable in every impl's
+    /// where clause, which is what lets the `Self: 'w` GAT bound
+    /// resolve cleanly per call site.
+    fn fetch<'w>(world: &'w World) -> Self::Item<'w>
+    where
+        Self: 'w;
 }
 
 /// Immutable borrow of a resource of type `T`. Created by the system
@@ -118,9 +130,15 @@ impl<T: 'static> Deref for Res<'_, T> {
     }
 }
 
-impl<T: 'static> SystemParam for Res<'_, T> {
-    type Item<'w> = Res<'w, T>;
-    fn fetch(world: &World) -> Self::Item<'_> {
+impl<'a, T: 'static> SystemParam for Res<'a, T> {
+    type Item<'w>
+        = Res<'w, T>
+    where
+        'a: 'w;
+    fn fetch<'w>(world: &'w World) -> Self::Item<'w>
+    where
+        'a: 'w,
+    {
         Res(world.resource::<T>())
     }
 }
@@ -186,9 +204,15 @@ impl<T: 'static> DerefMut for ResMut<'_, T> {
     }
 }
 
-impl<T: 'static> SystemParam for ResMut<'_, T> {
-    type Item<'w> = ResMut<'w, T>;
-    fn fetch(world: &World) -> Self::Item<'_> {
+impl<'a, T: 'static> SystemParam for ResMut<'a, T> {
+    type Item<'w>
+        = ResMut<'w, T>
+    where
+        'a: 'w;
+    fn fetch<'w>(world: &'w World) -> Self::Item<'w>
+    where
+        'a: 'w,
+    {
         ResMut(world.resource_mut::<T>())
     }
 }

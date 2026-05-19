@@ -490,6 +490,60 @@ impl World {
         })
         .ok()
     }
+
+    // -------- storage handles (Query plumbing) --------
+    //
+    // Crate-private on purpose: queries are the only sanctioned way for
+    // engine code to walk a whole `ComponentStorage<T>`. These two
+    // accessors are the query-iteration chokepoint for the M4
+    // `RefCell → UnsafeCell` swap; the per-entity accessors above
+    // (`get`, `get_mut`, `insert`, `remove`, `despawn`) touch the same
+    // cells through different paths and migrate alongside.
+
+    /// Returns a shared borrow of the storage for `T`, or `None` if no
+    /// entity has ever held a `T` (no insert has lazily created the
+    /// cell yet).
+    ///
+    /// The returned [`Ref`] holds a runtime shared borrow on the
+    /// underlying cell; while it is live, [`storage_mut`](Self::storage_mut)
+    /// for the same `T` panics.
+    ///
+    /// # Panics
+    ///
+    /// Panics only on internal invariant violation — the storage stored
+    /// under `TypeId::of::<T>()` must be a `ComponentStorage<T>`. This
+    /// can only fail if a future change subverts the type-keyed map.
+    #[must_use]
+    pub(crate) fn storage<T: Component>(&self) -> Option<Ref<'_, ComponentStorage<T>>> {
+        let cell = self.components.get(&TypeId::of::<T>())?;
+        Some(Ref::map(cell.borrow(), |b| {
+            b.as_any()
+                .downcast_ref::<ComponentStorage<T>>()
+                .expect("TypeId key and stored storage type must agree")
+        }))
+    }
+
+    /// Returns an exclusive borrow of the storage for `T`, or `None` if
+    /// no entity has ever held a `T`.
+    ///
+    /// # Panics
+    ///
+    /// - Panics if the storage is already borrowed (shared or
+    ///   exclusive). That is the [`RefCell`] rule that lets two
+    ///   `Query<&mut T>` over the same `T` in one system surface as a
+    ///   runtime panic until the M4 scheduler catches the conflict at
+    ///   registration time.
+    /// - Panics on internal invariant violation if the storage stored
+    ///   under `TypeId::of::<T>()` is not a `ComponentStorage<T>`.
+    #[must_use]
+    pub(crate) fn storage_mut<T: Component>(&self) -> Option<RefMut<'_, ComponentStorage<T>>> {
+        let cell = self.components.get(&TypeId::of::<T>())?;
+        Some(RefMut::map(cell.borrow_mut(), |b| {
+            b.as_any_mut()
+                .downcast_mut::<ComponentStorage<T>>()
+                .expect("TypeId key and stored storage type must agree")
+        }))
+    }
 }
 
 /// Chainable builder returned by [`World::spawn`].
