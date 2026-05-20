@@ -4,10 +4,13 @@
 //!
 //! - `LogPlugin` installs the `tracing` subscriber as a startup
 //!   closure.
-//! - `SandboxPlugin` queues four demo entities through `Commands` in
-//!   STARTUP and registers the per-frame systems
-//!   (`integrate_movement`, `decay_health`, …) on `PRE_UPDATE` /
-//!   `UPDATE` / `POST_UPDATE`.
+//! - `SandboxPlugin` (in `crate::sandbox`) is the umbrella demo
+//!   plugin. It inserts the shared resources every sub-sandbox uses
+//!   (`TickCount`), then nests each sub-sandbox plugin via
+//!   `app.add_plugin(...)`. Today that's just `EcsSandboxPlugin`
+//!   (queues demo entities via `Commands` in STARTUP and registers
+//!   `physics_step` / `decay_health` / `player_regen` / …); future
+//!   render or input sub-sandboxes plug in next to it.
 //! - `WindowPlugin` opens the OS window and installs the runner that
 //!   ticks `PRE_UPDATE → UPDATE → POST_UPDATE` on every winit
 //!   `RedrawRequested`.

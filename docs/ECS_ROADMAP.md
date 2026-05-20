@@ -12,11 +12,13 @@ expanded into full drafts in the project's `#10–#12` format below.
 ### Shipped
 
 - **#10 → PR #20 — Entities + component storage.** Sparse-set storage, `World` API.
-- **#11 → PR #22 — Queries.** `Query` as `SystemParam`. Ships with the **full
-  `QueryData` shared/exclusive split** (`ReadOnlyQueryData` marker,
-  `iter` / `iter_mut`, `&mut T` impl, mixed-mut tuples, tuple arity 2/3/4) —
-  i.e. Draft 1 below **and** roadmap item 5 are already done. See
-  [`lib/ecs/src/query.rs:101-359`](../lib/ecs/src/query.rs#L101-L359).
+- **#11 → PR #22 — Queries.** `Query` as `SystemParam`. Ships the
+  **`QueryData` shared/exclusive split** (`ReadOnlyQueryData` marker,
+  `iter` / `iter_mut`, `&mut T` impl, mut-driver tuples, read-tuple
+  arity 2/3/4) — i.e. Draft 1 below is done, and roadmap item 5's
+  read-tuple arities. **#26 then extends item 5** to every `&` / `&mut`
+  combination via `impl_all_tuple!` (see item 5 below). Trait surface:
+  [`lib/ecs/src/query.rs`](../lib/ecs/src/query.rs).
 - **#12 → PR #24 — Commands + frame loop.** Deferred spawn/despawn,
   per-frame stages, `WindowPlugin` runner owns `Application`.
 
@@ -99,16 +101,31 @@ do not refile it. Originally filed as #25 and closed as stale.
   the binary, and every doc test that calls `add_system`.
 
 **4. Query filters — `With<T>` / `Without<T>` — ⬜ not filed.**
-- *Work:* `QueryFilter` trait; `With`/`Without` impls; `Query` gets a filter param.
-- *Decision:* **A2** — separate trait, second generic: `Query<'w, D, F = ()>`.
-- *Warnings:* `With<U>` contributes a **read** of `U` to the `Access` model —
-  filters must report into `collect_access`. `Or` is deferred.
+> ⚠️ **Discuss before opening an implementation issue.** The design
+> sketch below (`Query<'w, D, F = ()>` with a separate `QueryFilter`
+> trait) is one option, not a final decision. Open questions: filter
+> composition (tuples vs explicit `And<…>`), where `Or` fits without
+> wedging the API, whether filters should be a *third* generic on
+> `Query` or fold into `D` (`Query<(&Plant, With<Operational>)>`),
+> how filter access interacts with the scheduler's per-system access
+> aggregation, and whether the syntax should mirror Bevy's exactly or
+> diverge for clarity. Resolve these in a design doc / draft issue
+> first; the implementation issue lands after.
+- *Work (tentative):* `QueryFilter` trait; `With`/`Without` impls;
+  `Query` gets a filter param.
+- *Decision (tentative):* **A2** — separate trait, second generic:
+  `Query<'w, D, F = ()>`.
+- *Warnings:* `With<U>` contributes a **read** of `U` to the `Access`
+  model — filters must report into `collect_access`. `Or` is deferred.
 
-**5. ~~Query tuple arity 3–4~~ — ✅ DONE in main (PR #22).**
-Shipped alongside #11; see `impl_query_data_tuple!(D1, D2, D3)` and
-`impl_query_data_tuple!(D1, D2, D3, D4)` at
-[`lib/ecs/src/query.rs:358-359`](../lib/ecs/src/query.rs#L358-L359). The
-arity macro is shared with `IntoSystem` as planned.
+**5. ~~Query tuple arity 3–4~~ — ✅ DONE (PR #22, extended by #26).**
+Read-only tuple arities 2/3/4 shipped alongside #11. **#26 then
+replaced the per-arity `impl_query_data_tuple!` macros with the
+unified `impl_all_tuple!`**, which Cartesian-products the `&` / `&mut`
+flags to cover *every* combination at arities 2–5 (read, mixed,
+mut-not-first, and fully-mutable multi-mut). Extending to arity 6+ is
+one line — `impl_all_tuple!(A, B, C, D, E, F);` — with no new
+mechanism (monomorphisation cost doubles per step).
 
 **6. `Time` + `WindowSize` resources — ⬜ not filed.**
 - *Work:* `Time { delta, elapsed }` updated each frame in `EventLoopRunner`;
@@ -130,6 +147,29 @@ arity macro is shared with `IntoSystem` as planned.
 - *Warnings:* define overwrite semantics — inserting a bundle component an
   entity already has should overwrite (consistent with `World::insert`).
 
+**9. `IntoIterator` for `&Query` / `&mut Query` (loop sugar) — ⬜ not filed.**
+- *Work:* impl `IntoIterator` for `&Query<'_, D>` (yields `D::Item` via
+  `iter_ref`, bound `D: ReadOnlyQueryData`) and for `&mut Query<'_, D>`
+  (yields `D::Item` via `iter`, any `D: QueryData`). Lets systems write
+  `for x in &q` / `for (pos, vel) in &mut q` instead of
+  `for x in q.iter()` / `for (pos, vel) in q.iter_mut()`. Path B is
+  preserved — yielded items carry no `Entity` prefix, exactly matching
+  the existing `iter` / `iter_mut`.
+- *Decision:* **additive, not a replacement.** Keep `iter` / `iter_mut`
+  — they read clearer at call sites and are required for adapter chains
+  (`q.iter().map(…).filter(…)`). `IntoIterator` is sugar for the bare
+  `for` loop only. `IntoIter` is the same `Box<dyn Iterator<Item =
+  D::Item<'a>> + 'a>` the trait methods already return, so no new
+  iterator type is introduced.
+- *Warnings:* **do not** impl `IntoIterator for Query` by value — that
+  consumes the query and drops its `Ref` / `RefMut` storage guards
+  mid-iteration. Only the `&Query` / `&mut Query` reference forms are
+  sound. The `&Query` impl must carry the `D: ReadOnlyQueryData` bound
+  (same gate as `Query::iter`) so a `&mut`-containing shape can't be
+  iterated through a shared borrow. Small, self-contained, non-blocking
+  — can ride along with any query-touching PR rather than waiting in
+  line.
+
 **Then: Render milestone** — does not need parallelism.
 
 **Then: M4 — parallelism (committed, not optional).**
@@ -143,8 +183,10 @@ proven-disjoint access; `EntityAllocator` thread-safe; per-system
 
 > ✅ **DONE in main (PR #22).** Preserved for historical context — do not
 > refile. Originally filed as #25 and closed as stale. The shared/exclusive
-> split, `ReadOnlyQueryData` gate, mixed-mut tuples, and tuple arity 2/3/4
-> are all live in [`lib/ecs/src/query.rs:101-359`](../lib/ecs/src/query.rs#L101-L359).
+> split, `ReadOnlyQueryData` gate, mut-driver tuples, and read-tuple arity
+> 2/3/4 are all live in [`lib/ecs/src/query.rs`](../lib/ecs/src/query.rs).
+> Note the tuple-impl mechanism this draft sketches (`impl_query_data_tuple!`)
+> was later replaced by `impl_all_tuple!` in #26 — see roadmap item 5.
 
 ### Context
 
@@ -581,8 +623,11 @@ primitive that the scheduler issue (roadmap item 3) extends.
 
 - Making `(&mut A, &A)` / `(&mut A, &mut A)` *work* — they are rejected; that
   is the point.
-- Wider mut tuples `(&mut A, &mut B, &mut C)` — ride on tuple arity 3–4
-  (roadmap item 5); the `unsafe` lookup here generalises to them unchanged.
+- ~~Wider mut tuples `(&mut A, &mut B, &mut C)` — ride on tuple arity 3–4
+  (roadmap item 5)~~ **Folded in.** The unified `impl_all_tuple!` macro
+  Cartesian-products the `&` / `&mut` flags, so every combination at
+  arity 2–4 (including all-mut at any arity, and read-driver +
+  mut-non-driver) ships with this issue. Adding arity 5+ is one line.
 - Hoisting the conflict check to registration time — that is the scheduler's
   job (item 3). Here it runs per query construction (a few `TypeId`
   comparisons, negligible).
@@ -784,12 +829,13 @@ lib/ecs/src/
 
 | Where next | Adds |
 | --- | --- |
-| This issue | `(&mut A, &mut B)`; one `unsafe fn`; `QueryAccess` + self-conflict check |
-| Arity (item 5) | wider mut tuples ride the same `DenseMut` lookup unchanged |
+| This issue | `impl_all_tuple!` macro — Cartesian product of `&` / `&mut` at arities 2–5 (every combination, including all-mut); one `unsafe fn`; `QueryAccess` + self-conflict check |
+| Arity 6+ | one line per arity (`impl_all_tuple!(A, B, C, D, E, F);`) — no new mechanism needed; monomorphisation cost doubles each step |
 | Scheduler (item 3) | reuses `QueryAccess`; aggregates to `SystemParam` level; hoists conflict detection to registration time; adds cross-system conflicts → DAG |
 | M4 | `RefCell → UnsafeCell` — the self-conflict check becomes the *sole* same-component guard; the `unsafe fn` contract is unchanged |
 
 ### Out of scope
 
-`par_iter`; registration-time conflict hoisting (item 3); wider-than-2 mut
-tuples (item 5); leading-storage `min` optimisation; change detection.
+`par_iter`; registration-time conflict hoisting (item 3); arities beyond 5
+(one-line extension when needed); leading-storage `min` optimisation;
+change detection.

@@ -1,45 +1,48 @@
-//! The plugin entry point.
+//! Top-level sandbox composer.
 //!
-//! [`SandboxPlugin`] registers a `Commands`-based seed system on
-//! `STARTUP` and the per-frame systems on `PRE_UPDATE` / `UPDATE` /
-//! `POST_UPDATE`. It installs *no* runner — that's `WindowPlugin`'s
-//! job. The whole point of M3 Issue C is that any plugin can register
-//! systems and the `WindowPlugin`'s per-frame loop ticks them; the
-//! sandbox is the canonical demo of that.
+//! [`SandboxPlugin`] is what `main.rs` adds. Its job is to:
+//!
+//!  1. Insert the resources every sub-sandbox shares
+//!     (today: just [`TickCount`]).
+//!  2. Register each sub-sandbox plugin in turn via
+//!     `app.add_plugin(...)` — a nested-plugin pattern that lets
+//!     each subsystem demo live in its own folder with its own
+//!     local components, while reusing the shared ones from
+//!     `crate::sandbox::components`.
+//!
+//! To add a new sub-sandbox (e.g. a future render demo): create
+//! `src/sandbox/<name>/` mirroring `ecs/`'s layout, expose
+//! `<Name>SandboxPlugin`, and add one `.add_plugin(<Name>SandboxPlugin)`
+//! line in [`SandboxPlugin::build`] below.
 
-use spark_core::{Application, Plugin, stages};
+use spark_core::{Application, Plugin};
 
+use super::ecs::EcsSandboxPlugin;
 use super::resources::TickCount;
-use super::systems::{
-    decay_health, integrate_movement, report_initial, report_player_position, report_tick_summary,
-    spawn_demo,
-};
 
-/// Plugin that wires the sandbox demo into an [`Application`].
+/// The umbrella sandbox plugin — adds shared resources, then
+/// composes every sub-sandbox.
 ///
-/// Build order: the resource lands first, then every system. Seeding
-/// happens inside [`spawn_demo`] during `STARTUP` (via `Commands`) so
-/// the entities are visible to every later stage's queries — the
-/// flush at the `STARTUP` boundary makes them so before `PRE_UPDATE`
-/// fires.
+/// This is the plugin `main.rs` registers. Sub-sandbox plugins
+/// (`EcsSandboxPlugin`, future `RenderSandboxPlugin`, …) are nested
+/// inside this one's `build`, so a binary that wants the full
+/// playground just adds `SandboxPlugin` and gets everything.
 pub struct SandboxPlugin;
 
 impl Plugin for SandboxPlugin {
     fn build(&self, app: &mut Application) {
-        // ----- Resources -----
+        // ----- Shared resources -----
+        //
+        // Add these *before* any sub-sandbox plugin runs, so
+        // sub-sandbox systems can rely on them via
+        // `Res<T>` / `ResMut<T>` from their very first tick.
         app.add_resource(TickCount(0));
 
-        // ----- Systems -----
+        // ----- Sub-sandboxes -----
         //
-        // STARTUP:     queue the four demo entities via `Commands`.
-        // PRE_UPDATE:  one-shot initial report (first tick only).
-        // UPDATE:      the per-tick demo loop — movement, decay, snapshot.
-        // POST_UPDATE: player-position log, on settled state.
-        app.add_system(stages::STARTUP, spawn_demo)
-            .add_system(stages::PRE_UPDATE, report_initial)
-            .add_system(stages::UPDATE, integrate_movement)
-            .add_system(stages::UPDATE, decay_health)
-            .add_system(stages::UPDATE, report_tick_summary)
-            .add_system(stages::POST_UPDATE, report_player_position);
+        // Each sub-sandbox owns its own entities, components, and
+        // systems. They share resources / components defined at the
+        // `crate::sandbox` level (above) and add their own locally.
+        app.add_plugin(EcsSandboxPlugin);
     }
 }

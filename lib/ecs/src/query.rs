@@ -61,16 +61,40 @@
 //!
 //! # Joins
 //!
-//! For `Query<(&mut A, &B)>` the tuple impl drives `A`'s storage and
-//! sparse-looks-up `B` per entity. Only entities present in both
-//! storages survive. The read side must be [`ReadOnlyQueryData`]:
-//! looking up `&mut B` from a borrowed `RefMut` would need a lending
-//! iterator, which std's `Iterator` cannot express in safe Rust. The
-//! follow-up multi-mut issue adds `(&mut A, &mut B)` via a localised
-//! `unsafe` block.
+//! Tuple queries drive the first element and look the rest up per
+//! entity. **Every `&` / `&mut` combination** at arities 2–5 is
+//! supported: a single [`impl_all_tuple!`] invocation per arity
+//! Cartesian-products the flag positions and emits one `QueryData`
+//! impl for each combination (plus a `ReadOnlyQueryData` impl for the
+//! all-read case). At arity 2 that's 4 impls; arity 3 is 8; arity 4
+//! is 16; arity 5 is 32. All bounds are on concrete `Component`
+//! parameters, never on a generic `D1: QueryData`, so nested tuple
+//! shapes (`((A, B), C)`, `(A, (B, C))`) don't match any impl.
+//!
+//! Adding arity 6+ is one line — `impl_all_tuple!(A, B, C, D, E, F);`
+//! — and gives 64 impls for every flag combination at that arity.
+//! Note that monomorphisation cost doubles with each step: weigh it
+//! against actual need before extending past 5.
+//!
+//! Read-only lookups use the storage's safe
+//! [`ComponentStorage::get`]. Mutable non-driver lookups use a
+//! [`DenseMut`] random-access view — the crate's single `unsafe fn`.
+//! Its contract — "each entity is touched at most once per
+//! iteration" — rests on two facts the engine *enforces*:
+//!
+//!  1. The driver iterator visits each entity at most once (structural
+//!     property of `slice::iter_mut` zipped with `entity_index`).
+//!  2. The same component type never appears twice in the data shape —
+//!     enforced at [`Query::from_world`] by
+//!     [`QueryAccess::assert_no_self_conflict`] *before* any storage is
+//!     borrowed. `(&mut A, &A)` (in either element order) and
+//!     `(&mut A, &mut A)` panic with a precise diagnostic instead of
+//!     the `RefCell`'s "already borrowed".
 
 use std::cell::{Ref, RefMut};
+use std::marker::PhantomData;
 
+use crate::access::QueryAccess;
 use crate::entity::Entity;
 use crate::storage::{Component, ComponentStorage};
 use crate::system::SystemParam;
@@ -125,6 +149,16 @@ pub trait QueryData {
         Self: 's,
         Self: 'w,
         'w: 's;
+
+    /// Records which component types this data shape reads and writes
+    /// into `access`. `&T` pushes a read, `&mut T` pushes a write,
+    /// tuples push each element in shape order.
+    ///
+    /// Called by [`Query::from_world`] *before* [`init_state`](Self::init_state)
+    /// so the per-query self-conflict check sees the access set before
+    /// any storage is borrowed. The scheduler (roadmap item 3) reuses
+    /// the same call to aggregate access at `SystemParam` level.
+    fn collect_access(access: &mut QueryAccess);
 }
 
 /// [`QueryData`] that borrows nothing mutably — the marker that gates
@@ -195,6 +229,10 @@ impl<T: Component> QueryData for &T {
             None => Box::new(std::iter::empty()),
         }
     }
+
+    fn collect_access(access: &mut QueryAccess) {
+        access.add_read::<T>();
+    }
 }
 
 impl<T: Component> ReadOnlyQueryData for &T {
@@ -254,38 +292,258 @@ impl<T: Component> QueryData for &mut T {
             None => Box::new(std::iter::empty()),
         }
     }
+
+    fn collect_access(access: &mut QueryAccess) {
+        access.add_write::<T>();
+    }
 }
 
 // No ReadOnlyQueryData for &mut T — that's the entire point of the split.
 
-// -------- Tuple impls (arity 2, 3, 4) --------
+// -------- DenseMut: the single `unsafe fn` powering (D1, &mut T) --------
 
-/// Emits a `QueryData` and `ReadOnlyQueryData` impl pair for a tuple
-/// arity ≥ 2.
+/// Mutable random-access view into one storage's `dense`, used by the
+/// `(D1, &mut T)` arity-2 impl to hand out `&mut T` by entity.
 ///
-/// **Driver convention.** `$D1` drives iteration; every other element
-/// sparse-looks up per entity. That's why everything after `$D1` is
-/// bounded by [`ReadOnlyQueryData`]: a `&mut T` lookup off a shared
-/// `Ref<…>` would need a lending iterator, which `Iterator` cannot
-/// express in safe Rust. Practical fallout: `(&mut A, &B, &C)` works,
-/// `(&A, &mut B, …)` does not (re-order to put the mut side first),
-/// and multi-mut tuples land with the dedicated multi-mut issue.
+/// The driver walks D1 with its normal `iter`; this view is the
+/// random-access lookup for the second element, which needs a raw
+/// `*mut T` + index (the price of leaving the borrow checker). The full
+/// soundness argument lives on [`DenseMut::get`]'s `# Safety` block and
+/// the module-level *Joins* docs.
 ///
-/// **Variable names shadow type names.** Each `$D` does double duty in
-/// the expanded body — once as a type generic in paths like
-/// `$D::lookup(…)`, once as a `let`-bound state variable. Rust resolves
-/// type vs value by syntactic position; the `#[allow(non_snake_case)]`
-/// quiets the lint that would otherwise fire on `D2`, `D3`, … . This
-/// is the same shadow trick [`crate::IntoSystem`]'s arity macro uses.
-macro_rules! impl_query_data_tuple {
-    ($D1:ident $(, $D:ident)+) => {
-        impl<$D1: QueryData $(, $D: ReadOnlyQueryData)+> QueryData for ($D1, $($D,)+) {
+/// `PhantomData<&'s mut [T]>` ties the view's lifetime to the
+/// storage's exclusive borrow (so it cannot dangle) and gives `T` the
+/// invariance that `&mut` requires.
+pub(crate) struct DenseMut<'s, T> {
+    ptr: *mut T,
+    len: usize,
+    sparse: &'s [Option<u32>],
+    entity_index: &'s [Entity],
+    _marker: PhantomData<&'s mut [T]>,
+}
+
+// The whole point of `DenseMut` is to host one carefully-contracted
+// `unsafe fn` (and one inner `unsafe` block) — scope the workspace's
+// `unsafe_code = "warn"` lint allowance to this impl rather than
+// relaxing it crate-wide.
+#[allow(unsafe_code)]
+impl<'s, T> DenseMut<'s, T> {
+    /// Builds a view from the storage's exclusively-borrowed `dense`
+    /// slice plus shared borrows of its `sparse` table and
+    /// `entity_index`. All three at lifetime `'s`; converting `dense`
+    /// to a raw pointer consumes the unique borrow, and
+    /// `PhantomData<&'s mut [T]>` keeps the lifetime tracked.
+    fn new(dense: &'s mut [T], sparse: &'s [Option<u32>], entity_index: &'s [Entity]) -> Self {
+        Self {
+            ptr: dense.as_mut_ptr(),
+            len: dense.len(),
+            sparse,
+            entity_index,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Returns a mutable reference to `entity`'s component, or `None`
+    /// if this storage has no entry for `entity` (or holds a stale
+    /// handle to a recycled slot — same generation check
+    /// [`ComponentStorage::get_mut`] uses).
+    ///
+    /// # Safety
+    ///
+    /// Across the whole lifetime `'s`, `get` must never be called twice
+    /// with the same `entity`. Two `&mut T` to one dense slot would
+    /// alias. See the module-level *Joins* docs for how the
+    /// `(D1, &mut T)` arity-2 impl upholds this — structural driver
+    /// shape plus [`QueryAccess::assert_no_self_conflict`] at query
+    /// construction.
+    ///
+    /// Also assumes `ComponentStorage`'s sparse/dense parallel-array
+    /// invariant: every `Some(idx)` in `sparse` points at an in-bounds
+    /// `dense` slot. The `debug_assert!` catches violations in tests;
+    /// release builds trust the invariant — or rather, the
+    /// bounds-checked `entity_index[dense_idx]` access below would
+    /// panic first, so reaching the `ptr.add` proves the index is in
+    /// bounds.
+    unsafe fn get(&self, entity: Entity) -> Option<&'s mut T> {
+        let dense_idx = (*self.sparse.get(entity.index as usize)?)? as usize;
+        debug_assert!(
+            dense_idx < self.len,
+            "sparse/dense desync — ComponentStorage swap_remove invariant violated"
+        );
+        // Generation check + implicit bounds check. A stale `Entity`
+        // whose `index` collides with a different live tenant returns
+        // `None`, matching `ComponentStorage::get_mut`. The Vec
+        // indexing is bounds-checked in release too, so reaching the
+        // `ptr.add` below proves `dense_idx < entity_index.len() ==
+        // dense.len() == self.len`.
+        if self.entity_index[dense_idx] != entity {
+            return None;
+        }
+        // SAFETY: `dense_idx < self.len` (established by the
+        // bounds-checked `entity_index[dense_idx]` above plus the
+        // sparse/dense parallel-array invariant), and by this fn's
+        // contract this entity is fetched at most once across `'s`, so
+        // no other live `&mut` overlaps this slot.
+        Some(unsafe { &mut *self.ptr.add(dense_idx) })
+    }
+}
+
+// -------- Tuple impls (arity 2 – 5) --------
+//
+// One public macro covers every supported tuple shape:
+// [`impl_all_tuple!($T1, $T2, …)`] emits **every 2^N combination** of
+// `&` / `&mut` flags across the type parameters at that arity. The
+// shapes you get from `impl_all_tuple!(A, B)`:
+//
+// ```text
+//   (&A, &B)         (&mut A, &B)
+//   (&A, &mut B)     (&mut A, &mut B)
+// ```
+//
+// Arity 3 / 4 / 5 expand to 8 / 16 / 32 impls respectively. Each impl
+// is monomorphised once per concrete instantiation, so users only pay
+// for shapes they actually construct.
+//
+// **No nested tuples.** All bounds are on concrete `Component`
+// parameters (`A: Component`, `B: Component`, …), never on a generic
+// `D1: QueryData`. That structurally rules out `((A, B), C)`,
+// `(A, (B, C))`, and similar — they don't match any impl pattern.
+// Arity grows through additional `impl_all_tuple!` invocations, not
+// through tuple recursion.
+//
+// **Extending arity past 5.** Add one line below:
+// `impl_all_tuple!(A, B, C, D, E, F);` unlocks arity 6 (64 combos).
+// Monomorphisation cost doubles with each step — weigh it against
+// real need before extending.
+
+// ---- Helper macros (file-private) -----------------------------------
+//
+// Each helper takes a flag token (`R` for read = `&T`, `W` for write =
+// `&mut T`) followed by a type ident, and emits the right Rust syntax
+// for that position. They keep `impl_one_combo!` body free of
+// per-flag branching.
+
+/// `&'w T` for `R`, `&'w mut T` for `W`.
+macro_rules! item_type {
+    (R $T:ident, $w:lifetime) => { &$w $T };
+    (W $T:ident, $w:lifetime) => { &$w mut $T };
+}
+
+/// `Option<Ref<'w, ComponentStorage<T>>>` for `R`, `Option<RefMut<…>>`
+/// for `W`. Matches the per-element borrow guard the `Query` holds for
+/// the iteration's lifetime.
+macro_rules! state_type {
+    (R $T:ident, $w:lifetime) => { Option<Ref<$w, ComponentStorage<$T>>> };
+    (W $T:ident, $w:lifetime) => { Option<RefMut<$w, ComponentStorage<$T>>> };
+}
+
+/// `world.storage::<T>()` for `R`, `world.storage_mut::<T>()` for `W`.
+macro_rules! init_storage {
+    (R $T:ident, $world:expr) => {
+        $world.storage::<$T>()
+    };
+    (W $T:ident, $world:expr) => {
+        $world.storage_mut::<$T>()
+    };
+}
+
+/// `access.add_read::<T>()` for `R`, `access.add_write::<T>()` for `W`.
+macro_rules! access_call {
+    (R $T:ident, $access:expr) => {
+        $access.add_read::<$T>();
+    };
+    (W $T:ident, $access:expr) => {
+        $access.add_write::<$T>();
+    };
+}
+
+/// Builds the per-iteration lookup handle for one non-driver position.
+///
+/// - `R`: reborrow the state as `&'s Option<Ref<…>>`. The closure
+///   reads through `.as_ref()?.get(entity)`.
+/// - `W`: build an `Option<DenseMut<'s, T>>` from
+///   [`ComponentStorage::split_for_join`]. The closure reads through
+///   the `unsafe fn` [`DenseMut::get`].
+macro_rules! build_non_driver_fetch {
+    (R, $state:ident) => {
+        &*$state
+    };
+    (W, $state:ident) => {
+        $state.as_mut().map(|refmut| {
+            let (dense, sparse, entity_index) = refmut.split_for_join();
+            DenseMut::new(dense, sparse, entity_index)
+        })
+    };
+}
+
+/// Per-entity lookup for one non-driver position.
+///
+/// - `R`: safe `storage.get(entity)`.
+/// - `W`: `DenseMut::get(entity)`, the crate's single `unsafe fn`. The
+///   safety contract is upheld by the impl's overall design: the
+///   driver visits each entity at most once, and the self-conflict
+///   check in `Query::from_world` rules out the same component
+///   appearing twice. See the *Joins* section in the module-level
+///   docs for the full argument.
+macro_rules! fetch_non_driver {
+    (R, $fetch:expr, $entity:expr) => {
+        $fetch.as_ref()?.get($entity)?
+    };
+    (W, $fetch:expr, $entity:expr) => {
+        // SAFETY: driver visits each entity once, conflict check
+        // guarantees disjoint storages. Module-level docs for details.
+        unsafe { $fetch.as_ref()?.get($entity)? }
+    };
+}
+
+/// Driver iterator over the first storage. `R` uses safe `.iter()`,
+/// `W` uses safe `.iter_mut()` (both inherited from `ComponentStorage`).
+macro_rules! drive_iter {
+    (R, $state:ident) => {
+        match $state {
+            Some(s) => Box::new(s.iter()),
+            None => Box::new(std::iter::empty()),
+        }
+    };
+    (W, $state:ident) => {
+        match $state {
+            Some(s) => Box::new(s.iter_mut()),
+            None => Box::new(std::iter::empty()),
+        }
+    };
+}
+
+// ---- impl_one_combo: one impl per flag sequence ----------------------
+//
+// Takes a sequence `$flag $T,` of `R`/`W` flags paired with type idents.
+// First arm matches all-`R` sequences and emits both `QueryData` and
+// `ReadOnlyQueryData`. Second arm matches any sequence with at least
+// one `W` (because the first arm requires the literal `R` at every
+// position) and emits only `QueryData`. The `@gen` and `@readonly`
+// internal arms hold the shared bodies.
+
+macro_rules! impl_one_combo {
+    // All-R: also emit ReadOnly.
+    (R $First:ident, $(R $Rest:ident,)+) => {
+        impl_one_combo!(@gen R $First, $(R $Rest,)+);
+        impl_one_combo!(@readonly $First $(, $Rest)+);
+    };
+    // Mixed (at least one W): only QueryData.
+    ($first_flag:ident $First:ident, $($rest_flag:ident $Rest:ident,)+) => {
+        impl_one_combo!(@gen $first_flag $First, $($rest_flag $Rest,)+);
+    };
+
+    (@gen $first_flag:ident $First:ident, $($rest_flag:ident $Rest:ident,)+) => {
+        #[allow(unsafe_code)]
+        impl<$First: Component, $($Rest: Component),+>
+            QueryData for (item_type!($first_flag $First, '_), $(item_type!($rest_flag $Rest, '_),)+)
+        {
             type Item<'w>
-                = ($D1::Item<'w>, $($D::Item<'w>,)+)
+                = (item_type!($first_flag $First, 'w), $(item_type!($rest_flag $Rest, 'w),)+)
             where
                 Self: 'w;
             type State<'w>
-                = ($D1::State<'w>, $($D::State<'w>,)+)
+                = (state_type!($first_flag $First, 'w), $(state_type!($rest_flag $Rest, 'w),)+)
             where
                 Self: 'w;
 
@@ -293,7 +551,7 @@ macro_rules! impl_query_data_tuple {
             where
                 Self: 'w,
             {
-                ($D1::init_state(world), $($D::init_state(world),)+)
+                (init_storage!($first_flag $First, world), $(init_storage!($rest_flag $Rest, world),)+)
             }
 
             #[allow(non_snake_case)]
@@ -305,22 +563,31 @@ macro_rules! impl_query_data_tuple {
                 Self: 'w,
                 'w: 's,
             {
-                let ($D1, $($D,)+) = state;
-                // Pre-reborrow each non-driver state as `&'s` *before*
-                // moving into the closure. Inside the closure each call
-                // would otherwise only see a transient `&$D::State<'_>`
-                // with closure-body lifetime, not `'s` — and
-                // `$D::lookup` would then yield items with that shorter
-                // lifetime, breaking the iterator's `Item<'s>`.
-                $(let $D: &'s $D::State<'w> = &*$D;)+
-                Box::new($D1::iter($D1).filter_map(move |(entity, item_1)| {
-                    Some((entity, (item_1, $($D::lookup($D, entity)?,)+)))
+                let ($First, $($Rest,)+) = state;
+                $(let $Rest = build_non_driver_fetch!($rest_flag, $Rest);)+
+                let driver: Box<dyn Iterator<Item = (Entity, item_type!($first_flag $First, 's))> + 's> =
+                    drive_iter!($first_flag, $First);
+                Box::new(driver.filter_map(move |(entity, item_first)| {
+                    Some((
+                        entity,
+                        (
+                            item_first,
+                            $(fetch_non_driver!($rest_flag, $Rest, entity),)+
+                        ),
+                    ))
                 }))
             }
-        }
 
-        impl<$D1: ReadOnlyQueryData $(, $D: ReadOnlyQueryData)+> ReadOnlyQueryData
-            for ($D1, $($D,)+)
+            fn collect_access(access: &mut QueryAccess) {
+                access_call!($first_flag $First, access);
+                $(access_call!($rest_flag $Rest, access);)+
+            }
+        }
+    };
+
+    (@readonly $First:ident $(, $Rest:ident)+) => {
+        impl<$First: Component, $($Rest: Component),+>
+            ReadOnlyQueryData for (&$First, $(&$Rest,)+)
         {
             #[allow(non_snake_case)]
             fn iter_ref<'s, 'w>(
@@ -331,9 +598,19 @@ macro_rules! impl_query_data_tuple {
                 Self: 'w,
                 'w: 's,
             {
-                let ($D1, $($D,)+) = state;
-                Box::new($D1::iter_ref($D1).filter_map(move |(entity, item_1)| {
-                    Some((entity, (item_1, $($D::lookup($D, entity)?,)+)))
+                let ($First, $($Rest,)+) = state;
+                let driver: Box<dyn Iterator<Item = (Entity, &'s $First)> + 's> = match $First {
+                    Some(s) => Box::new(s.iter()),
+                    None => Box::new(std::iter::empty()),
+                };
+                Box::new(driver.filter_map(move |(entity, item_first)| {
+                    Some((
+                        entity,
+                        (
+                            item_first,
+                            $($Rest.as_ref()?.get(entity)?,)+
+                        ),
+                    ))
                 }))
             }
 
@@ -347,16 +624,53 @@ macro_rules! impl_query_data_tuple {
                 Self: 'w,
                 'w: 's,
             {
-                let ($D1, $($D,)+) = state;
-                Some(($D1::lookup($D1, entity)?, $($D::lookup($D, entity)?,)+))
+                let ($First, $($Rest,)+) = state;
+                Some((
+                    $First.as_ref()?.get(entity)?,
+                    $($Rest.as_ref()?.get(entity)?,)+
+                ))
             }
         }
     };
 }
 
-impl_query_data_tuple!(D1, D2);
-impl_query_data_tuple!(D1, D2, D3);
-impl_query_data_tuple!(D1, D2, D3, D4);
+// ---- impl_all_tuple_cartesian: tt-muncher Cartesian product ----------
+//
+// Recursively assigns each remaining type ident both an `R` and a `W`
+// flag, accumulating the flag-type pairs. When the type list is empty,
+// the accumulator names one specific flag sequence and `impl_one_combo!`
+// emits its impl(s). For N input types this generates 2^N
+// `impl_one_combo!` calls.
+
+macro_rules! impl_all_tuple_cartesian {
+    (@start [$($acc:tt)*]) => {
+        impl_one_combo!($($acc)*);
+    };
+    (@start [$($acc:tt)*] $Head:ident, $($Tail:ident,)*) => {
+        impl_all_tuple_cartesian!(@start [$($acc)* R $Head,] $($Tail,)*);
+        impl_all_tuple_cartesian!(@start [$($acc)* W $Head,] $($Tail,)*);
+    };
+}
+
+/// Emits every `QueryData` impl (and the `ReadOnlyQueryData` impl for
+/// the all-read combination) for a tuple of the given type parameters
+/// at *every* `&` / `&mut` combination.
+///
+/// One line per arity. `impl_all_tuple!(A, B, C)` generates 2^3 = 8
+/// impls covering `(&A, &B, &C)`, `(&mut A, &B, &C)`,
+/// `(&A, &mut B, &C)`, …, `(&mut A, &mut B, &mut C)`. The macro
+/// requires arity ≥ 2 (single-component shapes are handled by the
+/// `&T` / `&mut T` impls earlier in the file).
+macro_rules! impl_all_tuple {
+    ($A:ident, $($B:ident),+) => {
+        impl_all_tuple_cartesian!(@start [] $A, $($B,)+);
+    };
+}
+
+impl_all_tuple!(A, B);
+impl_all_tuple!(A, B, C);
+impl_all_tuple!(A, B, C, D);
+impl_all_tuple!(A, B, C, D, E);
 
 // -------- Query<'w, D> --------
 
@@ -440,10 +754,24 @@ impl<'w, D: QueryData + 'w> Query<'w, D> {
     /// tests and doc examples; system fns receive their `Query` from
     /// the runner via [`SystemParam::fetch`].
     ///
+    /// Runs [`QueryAccess::assert_no_self_conflict`] on the data
+    /// shape's access set *before* touching any storage, so shapes like
+    /// `(&mut A, &A)` or `(&mut A, &mut A)` panic with a precise
+    /// message naming the offending component instead of the
+    /// [`RefCell`]'s "already borrowed".
+    ///
+    /// [`RefCell`]: std::cell::RefCell
+    ///
     /// # Panics
     ///
-    /// Panics when `D` contains a `&mut T` and that storage is already
-    /// borrowed (shared or exclusive).
+    /// - Panics if the data shape names the same component twice with
+    ///   at least one `&mut` (`(&mut A, &A)`, `(&mut A, &mut A)`, or
+    ///   the reversed `(&A, &mut A)`). The panic originates from
+    ///   [`QueryAccess::assert_no_self_conflict`].
+    /// - Panics when `D` contains a `&mut T` and that storage is already
+    ///   borrowed (shared or exclusive) — the `RefCell` rule, fired
+    ///   from a second concurrent query over the same storage in a
+    ///   different `Query` value.
     ///
     /// # Examples
     ///
@@ -460,6 +788,15 @@ impl<'w, D: QueryData + 'w> Query<'w, D> {
     /// ```
     #[must_use]
     pub fn from_world(world: &'w World) -> Self {
+        // Order matters: check before borrow. `init_state` calls
+        // `world.storage_mut::<T>()` per `&mut T` in the shape, and
+        // `(&mut A, &A)` would otherwise surface as the `RefCell`'s
+        // generic "already borrowed" rather than this module's
+        // specific "query has conflicting access to component `A`"
+        // diagnostic.
+        let mut access = QueryAccess::default();
+        D::collect_access(&mut access);
+        access.assert_no_self_conflict();
         Self {
             state: D::init_state(world),
         }
@@ -499,6 +836,39 @@ impl<'w, D: QueryData + 'w> Query<'w, D> {
     ///     .sum();
     /// assert!((sums - 4.0).abs() < f32::EPSILON);
     /// ```
+    ///
+    /// Multi-mut join — both elements mutable, distinct types:
+    ///
+    /// ```
+    /// use spark_ecs::{Query, World};
+    ///
+    /// struct Position { x: f32, y: f32 }
+    /// struct Velocity { x: f32, y: f32 }
+    ///
+    /// let mut world = World::new();
+    /// world.spawn()
+    ///     .insert(Position { x: 0.0, y: 0.0 })
+    ///     .insert(Velocity { x: 1.0, y: 0.5 });
+    ///
+    /// {
+    ///     let mut q = Query::<(&mut Position, &mut Velocity)>::from_world(&world);
+    ///     for (pos, vel) in q.iter_mut() {
+    ///         pos.x += vel.x;
+    ///         pos.y += vel.y;
+    ///         // Both sides mutable — apply drag on the way out.
+    ///         vel.x *= 0.9;
+    ///         vel.y *= 0.9;
+    ///     }
+    /// }
+    ///
+    /// let (vx, vy) = Query::<&Velocity>::from_world(&world)
+    ///     .iter()
+    ///     .map(|v| (v.x, v.y))
+    ///     .next()
+    ///     .unwrap();
+    /// assert!((vx - 0.9).abs() < 1e-6);
+    /// assert!((vy - 0.45).abs() < 1e-6);
+    /// ```
     pub fn iter_mut(&mut self) -> impl Iterator<Item = D::Item<'_>> + '_ {
         // Path B — strip the entity that the trait threads internally
         // for join logic. See module-level docs.
@@ -531,6 +901,24 @@ impl<'w, D: ReadOnlyQueryData + 'w> Query<'w, D> {
     ///     assert_eq!(pos.x + vel.x, 1.0);
     ///     assert_eq!(pos.y + vel.y, 0.0);
     /// }
+    /// ```
+    ///
+    /// `.iter()` is gated on [`ReadOnlyQueryData`]. A query containing
+    /// `&mut` does not implement that supertrait, so the call is a
+    /// **compile-time** error — not a runtime check:
+    ///
+    /// ```compile_fail
+    /// use spark_ecs::{Query, World};
+    ///
+    /// struct Position(f32, f32);
+    ///
+    /// let mut world = World::new();
+    /// world.spawn().insert(Position(0.0, 0.0));
+    /// let q = Query::<&mut Position>::from_world(&world);
+    /// // error[E0599]: the method `iter` exists for struct
+    /// // `Query<&mut Position>`, but its trait bounds were not
+    /// // satisfied: `&mut Position: ReadOnlyQueryData`.
+    /// for _ in q.iter() {}
     /// ```
     pub fn iter(&self) -> impl Iterator<Item = D::Item<'_>> + '_ {
         // Path B — see `Query::iter_mut` for the rationale.
@@ -745,6 +1133,8 @@ mod tests {
     struct C(i32);
     #[derive(Debug, PartialEq)]
     struct D(i32);
+    #[derive(Debug, PartialEq)]
+    struct E(i32);
 
     #[test]
     fn query_three_tuple_joins_three_storages() {
@@ -805,32 +1195,6 @@ mod tests {
     }
 
     #[test]
-    fn query_nested_tuple_works_via_recursive_two_tuple_impl() {
-        // `((&A, &B), (&C, &D))` exercises the 2-tuple `QueryData` /
-        // `ReadOnlyQueryData` impls *recursively*: each half is a
-        // 2-tuple, and the outer pair is another 2-tuple over those
-        // halves. The driver convention picks the left half to drive
-        // and the right half to per-entity-lookup; the right half then
-        // does its own 2-tuple lookup internally.
-        let mut world = World::new();
-        world
-            .spawn()
-            .insert(A(1))
-            .insert(B(2))
-            .insert(C(3))
-            .insert(D(4));
-        // Missing D — should be skipped because (C, D) lookup fails.
-        world.spawn().insert(A(10)).insert(B(20)).insert(C(30));
-
-        let q = Query::<((&A, &B), (&C, &D))>::from_world(&world);
-        let yielded: Vec<_> = q
-            .iter()
-            .map(|((a, b), (c, d))| (a.0, b.0, c.0, d.0))
-            .collect();
-        assert_eq!(yielded, vec![(1, 2, 3, 4)]);
-    }
-
-    #[test]
     fn query_three_tuple_with_mut_driver_writes_through() {
         let mut world = World::new();
         let e = world
@@ -878,6 +1242,486 @@ mod tests {
         assert_eq!(
             *world.get::<Position>(entities[2]).unwrap(),
             Position(22, 22)
+        );
+    }
+
+    // -------- Arity-2 multi-mut: (&mut A, &mut B) --------
+
+    #[test]
+    fn query_two_mut_tuple_writes_through_both_sides() {
+        let (world, entities) = world_with_three_movers();
+        {
+            let mut q = Query::<(&mut Position, &mut Velocity)>::from_world(&world);
+            for (pos, vel) in q.iter_mut() {
+                pos.0 += vel.0;
+                pos.1 += vel.1;
+                // Mutate B too — proves the second slot really is `&mut`.
+                vel.0 *= 2;
+                vel.1 *= 2;
+            }
+        }
+        assert_eq!(*world.get::<Position>(entities[0]).unwrap(), Position(1, 0));
+        assert_eq!(
+            *world.get::<Position>(entities[1]).unwrap(),
+            Position(10, 11)
+        );
+        assert_eq!(
+            *world.get::<Position>(entities[2]).unwrap(),
+            Position(21, 21)
+        );
+        assert_eq!(*world.get::<Velocity>(entities[0]).unwrap(), Velocity(2, 0));
+        assert_eq!(*world.get::<Velocity>(entities[1]).unwrap(), Velocity(0, 2));
+        assert_eq!(*world.get::<Velocity>(entities[2]).unwrap(), Velocity(2, 2));
+    }
+
+    #[test]
+    fn query_two_mut_tuple_skips_entity_missing_second_component() {
+        let mut world = World::new();
+        let e0 = world
+            .spawn()
+            .insert(Position(1, 1))
+            .insert(Velocity(2, 2))
+            .id();
+        let e1 = world.spawn().insert(Position(99, 99)).id();
+        {
+            let mut q = Query::<(&mut Position, &mut Velocity)>::from_world(&world);
+            for (pos, vel) in q.iter_mut() {
+                pos.0 += vel.0;
+                pos.1 += vel.1;
+                vel.0 = -1;
+                vel.1 = -1;
+            }
+        }
+        assert_eq!(*world.get::<Position>(e0).unwrap(), Position(3, 3));
+        assert_eq!(*world.get::<Velocity>(e0).unwrap(), Velocity(-1, -1));
+        assert_eq!(*world.get::<Position>(e1).unwrap(), Position(99, 99));
+        assert!(world.get::<Velocity>(e1).is_none());
+    }
+
+    #[test]
+    fn query_two_mut_tuple_empty_when_either_storage_absent() {
+        let mut world = World::new();
+        world.spawn().insert(Position(0, 0));
+        let mut q = Query::<(&mut Position, &mut Velocity)>::from_world(&world);
+        assert_eq!(q.iter_mut().count(), 0);
+    }
+
+    // -------- Self-conflict detection --------
+
+    #[test]
+    #[should_panic(expected = "conflicting access to component")]
+    fn query_two_mut_tuple_same_type_panics_with_named_component() {
+        let mut world = World::new();
+        world.spawn().insert(Position(0, 0));
+        let _q = Query::<(&mut Position, &mut Position)>::from_world(&world);
+    }
+
+    #[test]
+    #[should_panic(expected = "conflicting access to component")]
+    fn query_mut_plus_read_same_type_panics_with_named_component() {
+        let mut world = World::new();
+        world.spawn().insert(Position(0, 0));
+        let _q = Query::<(&mut Position, &Position)>::from_world(&world);
+    }
+
+    // Note: the reversed shape `(&Position, &mut Position)` isn't a
+    // supported query data shape (no `(&A, &mut B)` impl), so we can't
+    // exercise the read-write self-conflict path at the `Query` level.
+    // The symmetric check is tested directly in `access.rs` via
+    // `read_then_write_of_same_type_panics`.
+
+    #[test]
+    #[should_panic(expected = "conflicting access to component")]
+    fn query_arity_three_self_conflict_panics() {
+        // Arity-3 macro must propagate `collect_access` to every
+        // element. A silent miss would slip past the conflict check
+        // and double-borrow the driver storage cell.
+        let mut world = World::new();
+        world.spawn().insert(Position(0, 0)).insert(Velocity(0, 0));
+        let _q = Query::<(&mut Position, &Velocity, &Position)>::from_world(&world);
+    }
+
+    #[test]
+    fn query_self_conflict_panic_originates_before_refcell_borrow() {
+        // The conflict shapes must panic from
+        // `QueryAccess::assert_no_self_conflict`, not the `RefCell`
+        // borrow inside `init_state`. A future refactor that
+        // accidentally reordered the check to run after `init_state`
+        // would surface as "already borrowed" instead.
+        let mut world = World::new();
+        world.spawn().insert(Position(0, 0));
+
+        for kind in ["write_write", "write_read", "read_write"] {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match kind {
+                "write_write" => {
+                    let _q = Query::<(&mut Position, &mut Position)>::from_world(&world);
+                }
+                "write_read" => {
+                    let _q = Query::<(&mut Position, &Position)>::from_world(&world);
+                }
+                "read_write" => {
+                    let _q = Query::<(&Position, &mut Position)>::from_world(&world);
+                }
+                _ => unreachable!(),
+            }));
+            let payload = result.expect_err("expected panic");
+            let msg = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&'static str>().copied())
+                .unwrap_or("");
+            assert!(
+                msg.contains("conflicting access to component"),
+                "{kind}: wrong panic message: {msg}"
+            );
+            assert!(
+                !msg.contains("already borrowed"),
+                "{kind}: panic came from RefCell, not the self-conflict check: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn query_two_mut_tuple_collect_access_is_conflict_free() {
+        // Two writes of distinct types — no self-conflict.
+        let mut access = QueryAccess::default();
+        <(&mut Position, &mut Velocity) as QueryData>::collect_access(&mut access);
+        access.assert_no_self_conflict();
+    }
+
+    // -------- Wider multi-mut + mut-not-first (the unified macro) --------
+
+    #[test]
+    fn query_arity_three_multi_mut_writes_through_all_sides() {
+        // `(&mut A, &mut B, &mut C)` — three storages, all mutable.
+        // Driver A's safe `iter_mut`; B and C looked up per entity via
+        // their own `DenseMut` views. Each entity touched once by the
+        // driver, so each view's `get` is called at most once per
+        // entity.
+        let mut world = World::new();
+        let e = world
+            .spawn()
+            .insert(Position(1, 2))
+            .insert(Velocity(10, 20))
+            .insert(Marker)
+            .id();
+        {
+            let mut q = Query::<(&mut Position, &mut Velocity, &mut Marker)>::from_world(&world);
+            for (pos, vel, _marker) in q.iter_mut() {
+                pos.0 += vel.0;
+                pos.1 += vel.1;
+                vel.0 = -5;
+                vel.1 = -5;
+            }
+        }
+        assert_eq!(*world.get::<Position>(e).unwrap(), Position(11, 22));
+        assert_eq!(*world.get::<Velocity>(e).unwrap(), Velocity(-5, -5));
+    }
+
+    #[test]
+    fn query_arity_four_multi_mut_writes_through_all_sides() {
+        // Arity 4, all mutable. Same logic as arity 3.
+        let mut world = World::new();
+        let e = world
+            .spawn()
+            .insert(A(1))
+            .insert(B(2))
+            .insert(C(3))
+            .insert(D(4))
+            .id();
+        {
+            let mut q = Query::<(&mut A, &mut B, &mut C, &mut D)>::from_world(&world);
+            for (a, b, c, d) in q.iter_mut() {
+                a.0 += 100;
+                b.0 += 100;
+                c.0 += 100;
+                d.0 += 100;
+            }
+        }
+        assert_eq!(world.get::<A>(e).unwrap().0, 101);
+        assert_eq!(world.get::<B>(e).unwrap().0, 102);
+        assert_eq!(world.get::<C>(e).unwrap().0, 103);
+        assert_eq!(world.get::<D>(e).unwrap().0, 104);
+    }
+
+    #[test]
+    fn query_arity_five_mixed_writes_through_mut_positions() {
+        // Arity-5 smoke test: confirms `impl_all_tuple!(A, B, C, D, E)`
+        // expands cleanly and that a mixed combination at the new
+        // arity behaves like the lower arities (driver A is read,
+        // muts at B / D, reads at C / E).
+        let mut world = World::new();
+        let e = world
+            .spawn()
+            .insert(A(1))
+            .insert(B(2))
+            .insert(C(3))
+            .insert(D(4))
+            .insert(E(5))
+            .id();
+        {
+            let mut q = Query::<(&A, &mut B, &C, &mut D, &E)>::from_world(&world);
+            for (a, b, c, d, e_item) in q.iter_mut() {
+                b.0 = a.0 + c.0 + e_item.0; // 1 + 3 + 5 = 9
+                d.0 = a.0 + c.0 + e_item.0; // 9
+            }
+        }
+        assert_eq!(world.get::<A>(e).unwrap().0, 1); // unchanged
+        assert_eq!(world.get::<B>(e).unwrap().0, 9);
+        assert_eq!(world.get::<C>(e).unwrap().0, 3); // unchanged
+        assert_eq!(world.get::<D>(e).unwrap().0, 9);
+        assert_eq!(world.get::<E>(e).unwrap().0, 5); // unchanged
+    }
+
+    #[test]
+    fn query_read_driver_with_mut_non_driver_writes_through() {
+        // `(&A, &mut B)` — read driver, mut non-driver. Previously
+        // deferred ("write as `(&mut B, &A)` instead"); now ships.
+        // Driver A's safe `iter`; B looked up per entity via `DenseMut`.
+        let mut world = World::new();
+        let e = world
+            .spawn()
+            .insert(Position(7, 7))
+            .insert(Velocity(1, 2))
+            .id();
+        {
+            let mut q = Query::<(&Position, &mut Velocity)>::from_world(&world);
+            for (pos, vel) in q.iter_mut() {
+                vel.0 += pos.0;
+                vel.1 += pos.1;
+            }
+        }
+        assert_eq!(*world.get::<Velocity>(e).unwrap(), Velocity(8, 9));
+        // Position untouched.
+        assert_eq!(*world.get::<Position>(e).unwrap(), Position(7, 7));
+    }
+
+    #[test]
+    fn query_mixed_mut_arity_three_writes_only_through_mut_positions() {
+        // `(&A, &mut B, &C)` — only B is mutable. Driver A reads, C
+        // reads, B writes.
+        let mut world = World::new();
+        let e = world
+            .spawn()
+            .insert(Position(2, 3))
+            .insert(Velocity(10, 10))
+            .insert(Marker)
+            .id();
+        {
+            let mut q = Query::<(&Position, &mut Velocity, &Marker)>::from_world(&world);
+            for (pos, vel, _marker) in q.iter_mut() {
+                vel.0 += pos.0;
+                vel.1 += pos.1;
+            }
+        }
+        assert_eq!(*world.get::<Velocity>(e).unwrap(), Velocity(12, 13));
+        // Position, Marker untouched.
+        assert_eq!(*world.get::<Position>(e).unwrap(), Position(2, 3));
+    }
+
+    #[test]
+    #[should_panic(expected = "conflicting access to component")]
+    fn query_arity_three_multi_mut_self_conflict_panics() {
+        // `(&mut A, &mut A, &mut B)` — A written twice. Caught by the
+        // self-conflict check at `Query::from_world` time.
+        let mut world = World::new();
+        world.spawn().insert(Position(0, 0)).insert(Velocity(0, 0));
+        let _q = Query::<(&mut Position, &mut Position, &mut Velocity)>::from_world(&world);
+    }
+
+    #[test]
+    #[should_panic(expected = "conflicting access to component")]
+    fn query_mut_not_first_self_conflict_panics() {
+        // `(&A, &mut A)` — reversed-order conflict (read driver, mut
+        // non-driver, same component). Now reachable as a query shape
+        // since the unified macro covers it; previously the access-
+        // level test was the only coverage of the reversed direction.
+        let mut world = World::new();
+        world.spawn().insert(Position(0, 0));
+        let _q = Query::<(&Position, &mut Position)>::from_world(&world);
+    }
+
+    // -------- Coverage for previously-untested mixed shape combos --------
+
+    #[test]
+    fn query_arity_three_mixed_combinations_write_only_through_mut_positions() {
+        // Exercises the four arity-3 combinations not covered by the
+        // dedicated tests above: `(&A, &B, &mut C)`,
+        // `(&mut A, &mut B, &C)`, `(&mut A, &B, &mut C)`, and
+        // `(&A, &mut B, &mut C)`. Each block mutates only the `&mut`
+        // positions and verifies non-`&mut` positions stayed put.
+        let mut world = World::new();
+        let e = world.spawn().insert(A(1)).insert(B(2)).insert(C(3)).id();
+
+        // (&A, &B, &mut C): only C is mutable.
+        {
+            let mut q = Query::<(&A, &B, &mut C)>::from_world(&world);
+            for (a, b, c) in q.iter_mut() {
+                c.0 = a.0 + b.0;
+            }
+        }
+        assert_eq!(world.get::<A>(e).unwrap().0, 1);
+        assert_eq!(world.get::<B>(e).unwrap().0, 2);
+        assert_eq!(world.get::<C>(e).unwrap().0, 3); // 1 + 2
+
+        // (&mut A, &mut B, &C): A and B mutable, C read.
+        {
+            let mut q = Query::<(&mut A, &mut B, &C)>::from_world(&world);
+            for (a, b, c) in q.iter_mut() {
+                a.0 = c.0 * 10;
+                b.0 = c.0 * 20;
+            }
+        }
+        assert_eq!(world.get::<A>(e).unwrap().0, 30);
+        assert_eq!(world.get::<B>(e).unwrap().0, 60);
+        assert_eq!(world.get::<C>(e).unwrap().0, 3); // unchanged
+
+        // (&mut A, &B, &mut C): muts at outer positions.
+        {
+            let mut q = Query::<(&mut A, &B, &mut C)>::from_world(&world);
+            for (a, b, c) in q.iter_mut() {
+                a.0 = b.0 + 100;
+                c.0 = b.0 + 200;
+            }
+        }
+        assert_eq!(world.get::<A>(e).unwrap().0, 160);
+        assert_eq!(world.get::<B>(e).unwrap().0, 60); // unchanged
+        assert_eq!(world.get::<C>(e).unwrap().0, 260);
+
+        // (&A, &mut B, &mut C): read driver, two muts.
+        {
+            let mut q = Query::<(&A, &mut B, &mut C)>::from_world(&world);
+            for (a, b, c) in q.iter_mut() {
+                b.0 = a.0 + 1;
+                c.0 = a.0 + 2;
+            }
+        }
+        assert_eq!(world.get::<A>(e).unwrap().0, 160); // unchanged
+        assert_eq!(world.get::<B>(e).unwrap().0, 161);
+        assert_eq!(world.get::<C>(e).unwrap().0, 162);
+    }
+
+    #[test]
+    fn query_arity_four_mixed_combinations_write_only_through_mut_positions() {
+        // Four representative mixed combinations out of the 14
+        // arity-4 mixes not covered elsewhere. Each block mutates
+        // only the `&mut` positions and verifies non-`&mut` positions
+        // stayed put.
+        let mut world = World::new();
+        let e = world
+            .spawn()
+            .insert(A(1))
+            .insert(B(2))
+            .insert(C(3))
+            .insert(D(4))
+            .id();
+
+        // (&mut A, &mut B, &C, &D): muts at first two positions.
+        {
+            let mut q = Query::<(&mut A, &mut B, &C, &D)>::from_world(&world);
+            for (a, b, c, d) in q.iter_mut() {
+                a.0 = c.0 + d.0;
+                b.0 = c.0 * d.0;
+            }
+        }
+        assert_eq!(world.get::<A>(e).unwrap().0, 7);
+        assert_eq!(world.get::<B>(e).unwrap().0, 12);
+        assert_eq!(world.get::<C>(e).unwrap().0, 3);
+        assert_eq!(world.get::<D>(e).unwrap().0, 4);
+
+        // (&A, &mut B, &mut C, &mut D): read driver, three muts.
+        {
+            let mut q = Query::<(&A, &mut B, &mut C, &mut D)>::from_world(&world);
+            for (a, b, c, d) in q.iter_mut() {
+                b.0 = a.0 + 100;
+                c.0 = a.0 + 200;
+                d.0 = a.0 + 300;
+            }
+        }
+        assert_eq!(world.get::<A>(e).unwrap().0, 7); // unchanged
+        assert_eq!(world.get::<B>(e).unwrap().0, 107);
+        assert_eq!(world.get::<C>(e).unwrap().0, 207);
+        assert_eq!(world.get::<D>(e).unwrap().0, 307);
+
+        // (&mut A, &B, &mut C, &mut D): muts at positions 0, 2, 3.
+        {
+            let mut q = Query::<(&mut A, &B, &mut C, &mut D)>::from_world(&world);
+            for (a, b, c, d) in q.iter_mut() {
+                a.0 = b.0 + 1000;
+                c.0 = b.0 + 2000;
+                d.0 = b.0 + 3000;
+            }
+        }
+        assert_eq!(world.get::<A>(e).unwrap().0, 1107);
+        assert_eq!(world.get::<B>(e).unwrap().0, 107); // unchanged
+        assert_eq!(world.get::<C>(e).unwrap().0, 2107);
+        assert_eq!(world.get::<D>(e).unwrap().0, 3107);
+
+        // (&A, &mut B, &C, &mut D): alternating mut/read.
+        {
+            let mut q = Query::<(&A, &mut B, &C, &mut D)>::from_world(&world);
+            for (a, b, c, d) in q.iter_mut() {
+                b.0 = a.0 - c.0;
+                d.0 = a.0 - c.0;
+            }
+        }
+        assert_eq!(world.get::<A>(e).unwrap().0, 1107); // unchanged
+        assert_eq!(world.get::<B>(e).unwrap().0, -1000);
+        assert_eq!(world.get::<C>(e).unwrap().0, 2107); // unchanged
+        assert_eq!(world.get::<D>(e).unwrap().0, -1000);
+    }
+
+    #[test]
+    #[should_panic(expected = "conflicting access to component")]
+    fn query_arity_four_self_conflict_panics() {
+        // Arity-4 macro propagates `collect_access` to every position.
+        // A regression that stopped emitting one of the access calls
+        // would let `(&mut A, &B, &C, &mut A)` slip past the check
+        // and double-borrow A's storage cell.
+        let mut world = World::new();
+        world
+            .spawn()
+            .insert(A(0))
+            .insert(B(0))
+            .insert(C(0))
+            .insert(D(0));
+        let _q = Query::<(&mut A, &B, &C, &mut A)>::from_world(&world);
+    }
+
+    // -------- DenseMut direct coverage --------
+
+    #[test]
+    #[allow(unsafe_code, reason = "exercises DenseMut::get's generation check")]
+    fn dense_mut_get_rejects_stale_handle_via_generation_check() {
+        // Through the `World` API the generation check never fires —
+        // despawn cascades clean every storage. The check is defense
+        // in depth for direct callers; exercise it here by
+        // constructing mismatched arrays by hand.
+        use crate::entity::EntityAllocator;
+        let mut alloc = EntityAllocator::new();
+        let live = alloc.allocate();
+        let mut dense = vec![Position(7, 7)];
+        let sparse = vec![Some(0_u32)];
+        let entity_index = vec![live];
+        let view = DenseMut::<Position>::new(&mut dense, &sparse, &entity_index);
+        // SAFETY: single call per entity — no aliasing.
+        let live_ref = unsafe { view.get(live) };
+        assert!(live_ref.is_some());
+
+        // Manufacture a stale handle: same `index`, different
+        // `generation`. Simulates the corruption a direct
+        // `ComponentStorage` user could produce by bypassing despawn.
+        alloc.destroy(live);
+        let fresh = alloc.allocate();
+        assert_eq!(live.index, fresh.index);
+        assert_ne!(live, fresh);
+        let view = DenseMut::<Position>::new(&mut dense, &sparse, &entity_index);
+        // SAFETY: distinct entity from the call above (different
+        // generation); single call.
+        let stale_ref = unsafe { view.get(fresh) };
+        assert!(
+            stale_ref.is_none(),
+            "generation check should reject the stale handle"
         );
     }
 }
