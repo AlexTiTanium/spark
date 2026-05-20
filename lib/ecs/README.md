@@ -91,10 +91,12 @@ and adds `Operational`. The entity didn't *become* a different class
 - **Entity** — 64 bits: `index: u32, generation: u32`. Nothing else.
   Generations let the engine reuse freed indices without confusing
   old handles for new tenants.
-- **Component** — any plain `'static` Rust struct (`Position`,
-  `Velocity`, `Plant`, `PlayerControlled`). Marker components
-  (zero-sized like `Operational`) are fine. Components live in
-  per-type storages inside the `World`.
+- **Component** — any data struct that opts in with
+  `#[derive(Component)]` (`Position`, `Velocity`, `Plant`,
+  `PlayerControlled`). Marker components (zero-sized like
+  `Operational`) are fine. Components live in per-type storages inside
+  the `World`; the derive's `Send + Sync + 'static` bound is what lets
+  the scheduler iterate them in parallel.
 - **System** — a plain Rust function whose parameters describe what
   it reads and writes. Today: `Res<T>`, `ResMut<T>`, `Query<D>` (for
   `D = &T`, `&mut T`, or a tuple of those), and `Commands` for
@@ -106,10 +108,13 @@ and adds `Operational`. The entity didn't *become* a different class
 // `spark-time` resource — the real one arrives with the frame-loop
 // PR. Everything else (`Res`, `Query`, the tuple join, `iter_mut`)
 // is real spark-ecs API.
-use spark_ecs::{IntoSystem, Query, Res, World};
+use spark_ecs::{Component, IntoSystem, Query, Res, Resource, World};
 
+#[derive(Resource)]
 struct Time { delta: f32 }
+#[derive(Component)]
 struct Position(f32, f32);
+#[derive(Component)]
 struct Velocity(f32, f32);
 
 fn integrate(time: Res<Time>, mut q: Query<(&mut Position, &Velocity)>) {
@@ -235,9 +240,11 @@ A resource is one value of one type. A second `add_resource::<T>`
 overwrites the first.
 
 ```rust
-use spark_ecs::World;
+use spark_ecs::{Resource, World};
 
+#[derive(Resource)]
 struct GameTime { dt: f32, elapsed: f32 }
+#[derive(Resource)]
 struct Score(u32);
 
 let mut world = World::new();
@@ -262,9 +269,11 @@ check). The M4 parallel scheduler will catch the same-type conflict
 at registration time and turn it into a compile-friendlier error.
 
 ```rust
-use spark_ecs::World;
+use spark_ecs::{Resource, World};
 
+#[derive(Resource)]
 struct Time { dt: f32 }
+#[derive(Resource)]
 struct Score(u32);
 
 let mut world = World::new();
@@ -290,10 +299,13 @@ Spawning an entity returns a chainable [`EntityMut`] builder. Call
 don't.
 
 ```rust
-use spark_ecs::World;
+use spark_ecs::{Component, World};
 
+#[derive(Component)]
 struct Position { x: f32, y: f32 }
+#[derive(Component)]
 struct Velocity { x: f32, y: f32 }
+#[derive(Component)]
 struct PlayerControlled;
 
 let mut world = World::new();
@@ -324,8 +336,9 @@ panics. `despawn` returns `false` for the same case. The single
 explicit liveness check is `is_alive`.
 
 ```rust
-use spark_ecs::World;
+use spark_ecs::{Component, World};
 
+#[derive(Component)]
 struct Tag;
 
 let mut world = World::new();
@@ -372,8 +385,9 @@ false. The slot's index is recycled; its *identity* is not.
 Live demonstration via the public API:
 
 ```rust
-use spark_ecs::World;
+use spark_ecs::{Component, World};
 
+#[derive(Component)]
 struct Tag;
 
 let mut world = World::new();
@@ -422,21 +436,28 @@ assert_eq!(alloc.len(), 2);         // live count
 
 ## Components
 
-A component is any `'static` Rust struct. There's no
-`#[derive(Component)]` yet (that lands with the macros PR); for now
-just write a struct:
+A component is any data struct that opts in with
+`#[derive(Component)]`. The derive emits an empty marker impl; the
+trait's `Send + Sync + 'static` bound means a struct holding an `Rc`
+or `RefCell` won't compile — move that into a `Resource` instead:
 
 ```rust
+use spark_ecs::Component;
+
+#[derive(Component)]
 struct Position { x: f32, y: f32 }
+#[derive(Component)]
 struct Velocity { x: f32, y: f32 }
+#[derive(Component)]
 struct Operational;          // marker component (zero-sized)
 ```
 
 Inserting, reading, mutating, removing — all through `World`:
 
 ```rust
-use spark_ecs::World;
+use spark_ecs::{Component, World};
 
+#[derive(Component)]
 struct Health(u32);
 
 let mut world = World::new();
@@ -536,8 +557,9 @@ ergonomic surface — but the type is public so tests and low-level
 code can poke at it:
 
 ```rust
-use spark_ecs::{ComponentStorage, EntityAllocator};
+use spark_ecs::{Component, ComponentStorage, EntityAllocator};
 
+#[derive(Component)]
 struct Health(u32);
 
 let mut alloc = EntityAllocator::new();
@@ -715,10 +737,10 @@ cost of type-erasure. So `despawn` walks **every** storage and tells
 each one "remove this entity if you have it":
 
 ```rust
-use spark_ecs::World;
+use spark_ecs::{Component, World};
 
-#[derive(Debug)] struct Position { x: f32, y: f32 }
-#[derive(Debug)] struct Velocity { x: f32, y: f32 }
+#[derive(Debug, Component)] struct Position { x: f32, y: f32 }
+#[derive(Debug, Component)] struct Velocity { x: f32, y: f32 }
 
 let mut world = World::new();
 let e = world.spawn()
@@ -773,8 +795,9 @@ floating around in user code is now provably stale. The check is the
 public `is_alive`:
 
 ```rust
-use spark_ecs::World;
+use spark_ecs::{Component, World};
 
+#[derive(Component)]
 struct Tag;
 
 let mut world = World::new();
@@ -849,9 +872,11 @@ A system is a plain Rust function. Its parameter types declare what
 it reads and writes; the engine wires up the access.
 
 ```rust
-use spark_ecs::{IntoSystem, Res, ResMut, World};
+use spark_ecs::{IntoSystem, Res, ResMut, Resource, World};
 
+#[derive(Resource)]
 struct GameTime { dt: f32 }
+#[derive(Resource)]
 struct Score(u32);
 
 fn tick_score(time: Res<GameTime>, mut score: ResMut<Score>) {
@@ -888,9 +913,11 @@ will catch same-type conflicts at registration time and turn them
 into a compile-friendlier error.
 
 ```rust
-use spark_ecs::{IntoSystem, ResMut, World};
+use spark_ecs::{IntoSystem, ResMut, Resource, World};
 
+#[derive(Resource)]
 struct A(u32);
+#[derive(Resource)]
 struct B(&'static str);
 
 // Two ResMut on different types — fine, disjoint cells.
@@ -925,8 +952,9 @@ becomes available later via the planned `Query<(Entity, &T)>` shape.
 `Health` component:
 
 ```rust
-use spark_ecs::{Query, World};
+use spark_ecs::{Component, Query, World};
 
+#[derive(Component)]
 struct Health(u32);
 
 let mut world = World::new();
@@ -945,9 +973,11 @@ first storage and sparse-looks-up the second. Entities missing either
 component are skipped:
 
 ```rust
-use spark_ecs::{Query, World};
+use spark_ecs::{Component, Query, World};
 
+#[derive(Component)]
 struct Position { x: f32, y: f32 }
+#[derive(Component)]
 struct Velocity { x: f32, y: f32 }
 
 let mut world = World::new();
@@ -981,13 +1011,16 @@ the runner threads the query in for you, the same way it does
 crate lands):
 
 ```rust
-use spark_ecs::{IntoSystem, Query, Res, World};
+use spark_ecs::{Component, IntoSystem, Query, Res, Resource, World};
 
 // Stand-in for the future `Time` resource — same shape, no engine
 // integration. Real per-frame `delta` arrives with the frame-loop PR.
+#[derive(Resource)]
 struct Time { delta: f32 }
 
+#[derive(Component)]
 struct Position { x: f32, y: f32 }
+#[derive(Component)]
 struct Velocity { x: f32, y: f32 }
 
 fn integrate(time: Res<Time>, mut q: Query<(&mut Position, &Velocity)>) {
@@ -1030,9 +1063,11 @@ needs to be both read and mutated alongside another (e.g. apply drag to
 `Velocity` while integrating it into `Position`):
 
 ```rust
-use spark_ecs::{Query, World};
+use spark_ecs::{Component, Query, World};
 
+#[derive(Component)]
 struct Position { x: f32, y: f32 }
+#[derive(Component)]
 struct Velocity { x: f32, y: f32 }
 
 let mut world = World::new();
@@ -1070,8 +1105,9 @@ runs inside `Query::from_world` **before** any storage is borrowed and
 turns the would-be `(&mut A, &A)` aliasing case into a precise panic:
 
 ```rust,should_panic
-use spark_ecs::{Query, World};
+use spark_ecs::{Component, Query, World};
 
+#[derive(Component)]
 struct Position(f32, f32);
 
 let mut world = World::new();
@@ -1145,9 +1181,11 @@ landed.
 
 ```rust
 // ✅ Compiles and runs today.
-use spark_ecs::{Query, World};
+use spark_ecs::{Component, Query, World};
 
+#[derive(Component)]
 struct Position(f32, f32);
+#[derive(Component)]
 struct Velocity(f32, f32);
 
 let mut world = World::new();
@@ -1164,10 +1202,13 @@ for (pos, vel) in q.iter_mut() {
 // ✅ Runs today with a local `Time` stand-in. The real `spark-time`
 // `Time` resource lands with the frame-loop PR; the shape stays
 // identical.
-use spark_ecs::{IntoSystem, Query, Res, World};
+use spark_ecs::{Component, IntoSystem, Query, Res, Resource, World};
 
+#[derive(Resource)]
 struct Time { delta: f32 }
+#[derive(Component)]
 struct Position(f32, f32);
+#[derive(Component)]
 struct Velocity(f32, f32);
 
 fn integrate(time: Res<Time>, mut q: Query<(&mut Position, &Velocity)>) {
@@ -1340,9 +1381,11 @@ parallel execution.
 
 ```rust
 // ✅ Compiles and runs today.
-use spark_ecs::{Commands, IntoSystem, Query, World};
+use spark_ecs::{Commands, Component, IntoSystem, Query, World};
 
+#[derive(Component)]
 struct Position { x: f32, y: f32 }
+#[derive(Component)]
 struct Velocity { x: f32, y: f32 }
 
 fn spawn_pair(mut commands: Commands) {
@@ -1373,8 +1416,9 @@ e.g. to despawn it on the same frame for a quick round-trip.
 
 ```rust
 // ✅ Compiles and runs today.
-use spark_ecs::{Commands, IntoSystem, Query, World};
+use spark_ecs::{Commands, Component, IntoSystem, Query, World};
 
+#[derive(Component)]
 struct Tag;
 
 fn round_trip(mut commands: Commands) {
@@ -1426,8 +1470,9 @@ collision.
 
 ```rust
 // ✅ Compiles and runs today. Commands + Query<&mut T> in one signature.
-use spark_ecs::{Commands, IntoSystem, Query, World};
+use spark_ecs::{Commands, Component, IntoSystem, Query, World};
 
+#[derive(Component)]
 struct Position { x: f32, y: f32 }
 
 fn mirror_each(q: Query<&Position>, mut commands: Commands) {
@@ -1541,16 +1586,29 @@ sequential and deterministic — commands flush, events propagate.
 
 ## Derive macros
 
-`#[derive(Component)]`, `#[derive(Resource)]`, `#[derive(Event)]`,
-and `#[derive(WorkloadLabel)]` will land in a nested
-`spark-ecs-macros` crate at `lib/ecs/macros/`. Consumers depend only
-on `spark-ecs`, which re-exports the derives.
+`#[derive(Component)]` and `#[derive(Resource)]` ship today, from a
+nested `spark-ecs-macros` crate at `lib/ecs/macros/`. Consumers depend
+only on `spark-ecs`, which re-exports the derives — so one
+`use spark_ecs::Component;` brings in both the trait and its derive.
+`#[derive(Event)]` and `#[derive(WorkloadLabel)]` join them in later
+PRs.
 
-At the same time, the `Component` / `Resource` traits gain a
-`Send + Sync + 'static` bound — the safety proof the M4 parallel
-executor needs. Until then, any plain `'static` type works.
+The derive makes ECS membership explicit: a type is a component only
+if it `#[derive(Component)]`s, a resource only if it
+`#[derive(Resource)]`s. There's no blanket impl, so the two can't be
+mistaken for one another — a resource no longer silently satisfies
+`Query`. `Component` carries a `Send + Sync + 'static` bound (the
+safety proof the M4 parallel executor needs to iterate component
+storages across threads); a non-thread-safe struct fails to derive.
+`Resource` carries only `'static`, because resources are the home for
+inherently non-`Send` singletons (a `wgpu` surface, an OS handle) —
+parallel-safety for those is the scheduler's job (keep the touching
+system on the main thread), not a bound enforced at the type level.
 
 ```rust,ignore
+// `ignore`: forward-looking spec — uses `Vec2` (not in spark-ecs yet) and
+// `#[derive(Event)]` (⏳ not shipped). The Component/Resource derives are
+// real today; the rest shows the shape coming next.
 #[derive(Component, Debug, Clone, Copy)]
 pub struct Position(pub Vec2);
 
@@ -1564,7 +1622,7 @@ pub struct PowerNetwork {
     pub ratio: f32,
 }
 
-#[derive(Event)]
+#[derive(Event)]                 // ⏳ derive not yet shipped
 pub struct CityTierUp { pub city: Entity, pub new_tier: u32 }
 ```
 

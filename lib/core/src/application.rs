@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use spark_ecs::{IntoSystem, World};
+use spark_ecs::{IntoSystem, Resource, World};
 
 use crate::error::EngineError;
 use crate::plugin::Plugin;
@@ -99,7 +99,9 @@ impl Application {
     ///
     /// ```
     /// use spark_core::Application;
+    /// use spark_ecs::Resource;
     ///
+    /// #[derive(Resource)]
     /// struct GameTime { dt: f32 }
     ///
     /// Application::new()
@@ -107,7 +109,7 @@ impl Application {
     ///     .run()
     ///     .unwrap();
     /// ```
-    pub fn add_resource<T: 'static>(&mut self, value: T) -> &mut Self {
+    pub fn add_resource<T: Resource>(&mut self, value: T) -> &mut Self {
         self.world.add_resource(value);
         self
     }
@@ -128,8 +130,11 @@ impl Application {
     ///
     /// ```
     /// use spark_core::{Application, Plugin};
+    /// use spark_ecs::Component;
     ///
+    /// #[derive(Component)]
     /// struct Tile { x: i32, y: i32 }
+    /// #[derive(Component)]
     /// struct Walkable;
     ///
     /// struct LevelPlugin;
@@ -162,8 +167,9 @@ impl Application {
     ///
     /// ```
     /// use spark_core::{stages, Application};
-    /// use spark_ecs::ResMut;
+    /// use spark_ecs::{ResMut, Resource};
     ///
+    /// #[derive(Resource)]
     /// struct Counter(u32);
     ///
     /// let mut app = Application::new();
@@ -220,8 +226,9 @@ impl Application {
     ///
     /// ```
     /// use spark_core::{stages, Application};
-    /// use spark_ecs::ResMut;
+    /// use spark_ecs::{ResMut, Resource};
     ///
+    /// #[derive(Resource)]
     /// struct Counter(u32);
     ///
     /// fn tick(mut c: ResMut<Counter>) {
@@ -264,8 +271,9 @@ impl Application {
     ///
     /// ```
     /// use spark_core::{stages, Application};
-    /// use spark_ecs::ResMut;
+    /// use spark_ecs::{ResMut, Resource};
     ///
+    /// #[derive(Resource)]
     /// struct Counter(u32);
     ///
     /// fn tick(mut c: ResMut<Counter>) {
@@ -361,8 +369,9 @@ impl Application {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use spark_ecs::ResMut;
+    use spark_ecs::{ResMut, Resource};
 
+    #[derive(Resource)]
     struct Counter(u32);
 
     fn bump(mut c: ResMut<Counter>) {

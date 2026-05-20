@@ -1,0 +1,31 @@
+# Derive crate for `spark-ecs`. A `proc-macro = true` crate can export
+# *only* proc macros, so the `#[derive(Component)]` / `#[derive(Resource)]`
+# machinery is forced into its own crate — but it is a build-time artefact
+# of `spark-ecs`, not a separate architectural concern, so it nests at
+# `lib/ecs/macros/` and `spark-ecs` re-exports its derives. Consumers
+# depend on and import `spark-ecs` only; they never name this crate.
+
+[package]
+name = "spark-ecs-macros"
+version = "0.1.0"
+readme = "README.md"
+
+# Inherited from [workspace.package] in the root manifest.
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+proc-macro = true
+
+# A marker derive parses a `DeriveInput` and emits one empty `impl`, so
+# syn's default features (derive + parsing + printing) are enough — no
+# `full`. quote builds the generated tokens; proc-macro2 is the token
+# type both share. Pinned exact (project convention — never caret ranges).
+[dependencies]
+syn.workspace = true
+quote.workspace = true
+proc-macro2.workspace = true

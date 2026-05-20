@@ -33,7 +33,7 @@
 use std::cell::{Ref, RefMut};
 use std::ops::{Deref, DerefMut};
 
-use crate::World;
+use crate::{Resource, World};
 
 /// Trait teaching [`World`] how to fetch a single system parameter.
 ///
@@ -48,8 +48,9 @@ use crate::World;
 /// # Examples
 ///
 /// ```
-/// use spark_ecs::{Res, SystemParam, World};
+/// use spark_ecs::{Res, Resource, SystemParam, World};
 ///
+/// #[derive(Resource)]
 /// struct Score(u32);
 ///
 /// let mut world = World::new();
@@ -85,8 +86,9 @@ pub trait SystemParam {
 /// # Examples
 ///
 /// ```
-/// use spark_ecs::{Res, World};
+/// use spark_ecs::{Res, Resource, World};
 ///
+/// #[derive(Resource)]
 /// struct EngineVersion(&'static str);
 ///
 /// let mut world = World::new();
@@ -94,9 +96,9 @@ pub trait SystemParam {
 /// let v: Res<'_, EngineVersion> = Res::from_world(&world);
 /// assert_eq!(v.0, "0.1.0");
 /// ```
-pub struct Res<'w, T: 'static>(Ref<'w, T>);
+pub struct Res<'w, T: Resource>(Ref<'w, T>);
 
-impl<'w, T: 'static> Res<'w, T> {
+impl<'w, T: Resource> Res<'w, T> {
     /// Fetches a `Res<T>` directly from a [`World`]. Convenience for
     /// tests and doc examples; system fns receive their `Res<T>` from
     /// the runner.
@@ -109,8 +111,9 @@ impl<'w, T: 'static> Res<'w, T> {
     /// # Examples
     ///
     /// ```
-    /// use spark_ecs::{Res, World};
+    /// use spark_ecs::{Res, Resource, World};
     ///
+    /// #[derive(Resource)]
     /// struct A(u32);
     ///
     /// let mut world = World::new();
@@ -123,14 +126,14 @@ impl<'w, T: 'static> Res<'w, T> {
     }
 }
 
-impl<T: 'static> Deref for Res<'_, T> {
+impl<T: Resource> Deref for Res<'_, T> {
     type Target = T;
     fn deref(&self) -> &T {
         &self.0
     }
 }
 
-impl<'a, T: 'static> SystemParam for Res<'a, T> {
+impl<'a, T: Resource> SystemParam for Res<'a, T> {
     type Item<'w>
         = Res<'w, T>
     where
@@ -149,8 +152,9 @@ impl<'a, T: 'static> SystemParam for Res<'a, T> {
 /// # Examples
 ///
 /// ```
-/// use spark_ecs::{ResMut, World};
+/// use spark_ecs::{ResMut, Resource, World};
 ///
+/// #[derive(Resource)]
 /// struct GameTime { frame: u64 }
 ///
 /// let mut world = World::new();
@@ -161,9 +165,9 @@ impl<'a, T: 'static> SystemParam for Res<'a, T> {
 /// }
 /// assert_eq!(world.resource::<GameTime>().frame, 5);
 /// ```
-pub struct ResMut<'w, T: 'static>(RefMut<'w, T>);
+pub struct ResMut<'w, T: Resource>(RefMut<'w, T>);
 
-impl<'w, T: 'static> ResMut<'w, T> {
+impl<'w, T: Resource> ResMut<'w, T> {
     /// Fetches a `ResMut<T>` directly from a [`World`]. Convenience for
     /// tests and doc examples; system fns receive their `ResMut<T>`
     /// from the runner.
@@ -176,8 +180,9 @@ impl<'w, T: 'static> ResMut<'w, T> {
     /// # Examples
     ///
     /// ```
-    /// use spark_ecs::{ResMut, World};
+    /// use spark_ecs::{ResMut, Resource, World};
     ///
+    /// #[derive(Resource)]
     /// struct A(u32);
     ///
     /// let mut world = World::new();
@@ -191,20 +196,20 @@ impl<'w, T: 'static> ResMut<'w, T> {
     }
 }
 
-impl<T: 'static> Deref for ResMut<'_, T> {
+impl<T: Resource> Deref for ResMut<'_, T> {
     type Target = T;
     fn deref(&self) -> &T {
         &self.0
     }
 }
 
-impl<T: 'static> DerefMut for ResMut<'_, T> {
+impl<T: Resource> DerefMut for ResMut<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
         &mut self.0
     }
 }
 
-impl<'a, T: 'static> SystemParam for ResMut<'a, T> {
+impl<'a, T: Resource> SystemParam for ResMut<'a, T> {
     type Item<'w>
         = ResMut<'w, T>
     where
@@ -229,8 +234,9 @@ impl<'a, T: 'static> SystemParam for ResMut<'a, T> {
 /// # Examples
 ///
 /// ```
-/// use spark_ecs::{IntoSystem, ResMut, World};
+/// use spark_ecs::{IntoSystem, ResMut, Resource, World};
 ///
+/// #[derive(Resource)]
 /// struct Counter(u32);
 ///
 /// fn tick(mut c: ResMut<Counter>) {
@@ -303,11 +309,14 @@ mod tests {
     // tests) don't see the inner field and can use tuple structs
     // freely; we just have to be tidy here.
     use super::*;
+    use crate::Resource;
     use std::rc::Rc;
 
+    #[derive(Resource)]
     struct A {
         n: u32,
     }
+    #[derive(Resource)]
     struct B {
         s: &'static str,
     }

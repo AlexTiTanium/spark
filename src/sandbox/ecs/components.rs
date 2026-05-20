@@ -12,12 +12,14 @@
 //! Fields are `pub(super)` so the sibling [`super::systems`] module
 //! can read / write them without going through accessors.
 
+use spark_ecs::Component;
+
 /// 2D acceleration in units / tick². Drives
 /// [`super::systems::physics_step`], which integrates both velocity
 /// (from acceleration) and position (from velocity) in a single
 /// `Query<(&mut Position, &mut Velocity, &Acceleration)>` walk — the
 /// arity-3 multi-mut shape that ships with the multi-mut PR.
-#[derive(Debug)]
+#[derive(Debug, Component)]
 pub(super) struct Acceleration {
     pub(super) x: f32,
     pub(super) y: f32,
@@ -27,4 +29,5 @@ pub(super) struct Acceleration {
 /// gate joins like `Query<(&Position, &Player)>` (log-the-player) and
 /// `Query<(&Player, &mut Health)>` (player-only regen, demonstrating
 /// the mut-not-first arity-2 shape that ships with the multi-mut PR).
+#[derive(Component)]
 pub(super) struct Player;

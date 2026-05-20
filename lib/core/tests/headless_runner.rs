@@ -10,12 +10,12 @@
 //! ships with for CI; it never opens a window.
 
 use spark_core::{Application, EngineError, Plugin, stages};
-use spark_ecs::{Commands, Query};
+use spark_ecs::{Commands, Component, Query};
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Component)]
 struct Position(i32, i32);
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Component)]
 struct Velocity(i32, i32);
 
 /// Seeds two entities via `Commands` in STARTUP; the flush at the

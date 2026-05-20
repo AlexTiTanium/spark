@@ -11,9 +11,9 @@
 //! Each map slot is wrapped in a [`RefCell`] so accessors take `&self`
 //! — two `ResMut<T>` (or `&mut Position`) over *different* `T` can
 //! coexist in one system without either holding `&mut World`. Single
-//! threaded today; the `Send + Sync` bound that the parallel
-//! scheduler will need lands with the upcoming `#[derive(Component)]`
-//! / `#[derive(Resource)]` macros.
+//! threaded today; the `Send + Sync` bound the parallel scheduler will
+//! need is enforced at the derive site by `#[derive(Component)]` (the
+//! `Resource` derive stays `'static`-only — see the type docs).
 
 use std::any::{Any, TypeId};
 use std::cell::{Ref, RefCell, RefMut};
@@ -21,7 +21,8 @@ use std::collections::HashMap;
 
 use crate::commands::CommandQueue;
 use crate::entity::{Entity, EntityAllocator};
-use crate::storage::{AnyStorage, Component, ComponentStorage};
+use crate::storage::{AnyStorage, ComponentStorage};
+use crate::{Component, Resource};
 
 /// Type-erased container that owns the engine's long-lived state.
 ///
@@ -33,31 +34,34 @@ use crate::storage::{AnyStorage, Component, ComponentStorage};
 /// - `components` — one [`ComponentStorage<T>`] per component type,
 ///   each behind its own [`RefCell`] so `&self` lookups can succeed.
 ///
-/// # Why only `'static` today, `Send + Sync` later
+/// # The trait bounds the two maps enforce
 ///
-/// `add_resource` / `insert` take any `T: 'static` — the minimum bound
-/// to drop a value into a `Box<dyn Any>` map. That isn't the bound
-/// real resources or components will ship with. Spark targets a heavy
-/// simulation and parallel system execution is a committed M4
-/// requirement, not an optional extra. The agreed direction: the
-/// `Resource` and `Component` traits — introduced with the derive PR
-/// — carry `Send + Sync + 'static`, [`SystemParam`](crate::SystemParam)
-/// impls thread that bound through, and the M4 scheduler uses it as
-/// the safety proof for lockless parallel execution.
+/// `insert` / `get` / `storage` take `T: Component`
+/// (`Send + Sync + 'static`); `add_resource` / `resource` take
+/// `T: Resource` (`'static`). Both bounds come from explicit derives, so
+/// a type lands in exactly one region — a [`Component`] can't be added
+/// as a resource, a [`Resource`] can't be inserted onto an entity.
 ///
-/// This PR doesn't introduce that trait yet, so there's genuinely no
-/// bound to add to the storage maps today — the permissive `'static`
-/// defers the choice to the trait, where it belongs. `World` itself
-/// is `!Send + !Sync` by construction, matching the single-threaded
-/// scheduler that ships with this PR.
+/// The asymmetry is deliberate. Components are the parallel-iteration
+/// surface, so they must be `Send + Sync`: the M4 scheduler hands their
+/// storages to worker threads and leans on that bound as its safety
+/// proof. Resources hold the engine's non-thread-safe singletons (a
+/// `wgpu` surface, an OS handle), so they stay `'static`-only;
+/// parallel-safety for a resource is the scheduler's job — keep the
+/// system that touches it on the main thread — not the type system's.
+/// `World` itself is `!Send + !Sync` by construction, matching the
+/// single-threaded scheduler that ships today.
 ///
 /// # Examples
 ///
 /// ```
-/// use spark_ecs::World;
+/// use spark_ecs::{Component, Resource, World};
 ///
+/// #[derive(Component)]
 /// struct Position { x: f32, y: f32 }
+/// #[derive(Component)]
 /// struct Velocity { x: f32, y: f32 }
+/// #[derive(Resource)]
 /// struct GameTime { dt: f32 }
 ///
 /// let mut world = World::new();
@@ -111,15 +115,16 @@ impl World {
     /// # Examples
     ///
     /// ```
-    /// use spark_ecs::World;
+    /// use spark_ecs::{Resource, World};
     ///
+    /// #[derive(Resource)]
     /// struct FrameRate(u32);
     ///
     /// let mut world = World::new();
     /// world.add_resource(FrameRate(60));
     /// world.add_resource(FrameRate(120)); // replaces the previous value
     /// ```
-    pub fn add_resource<T: 'static>(&mut self, value: T) {
+    pub fn add_resource<T: Resource>(&mut self, value: T) {
         self.resources
             .insert(TypeId::of::<T>(), RefCell::new(Box::new(value)));
     }
@@ -141,8 +146,9 @@ impl World {
     /// # Examples
     ///
     /// ```
-    /// use spark_ecs::World;
+    /// use spark_ecs::{Resource, World};
     ///
+    /// #[derive(Resource)]
     /// struct Score(u32);
     ///
     /// let mut world = World::new();
@@ -151,7 +157,7 @@ impl World {
     /// assert_eq!(world.get_resource::<Score>().unwrap().0, 7);
     /// ```
     #[must_use]
-    pub fn get_resource<T: 'static>(&self) -> Option<Ref<'_, T>> {
+    pub fn get_resource<T: Resource>(&self) -> Option<Ref<'_, T>> {
         let cell = self.resources.get(&TypeId::of::<T>())?;
         Some(Ref::map(cell.borrow(), |b| {
             b.downcast_ref::<T>()
@@ -175,8 +181,9 @@ impl World {
     /// # Examples
     ///
     /// ```
-    /// use spark_ecs::World;
+    /// use spark_ecs::{Resource, World};
     ///
+    /// #[derive(Resource)]
     /// struct Score(u32);
     ///
     /// let mut world = World::new();
@@ -185,7 +192,7 @@ impl World {
     /// assert_eq!(world.get_resource::<Score>().unwrap().0, 1);
     /// ```
     #[must_use]
-    pub fn get_resource_mut<T: 'static>(&self) -> Option<RefMut<'_, T>> {
+    pub fn get_resource_mut<T: Resource>(&self) -> Option<RefMut<'_, T>> {
         let cell = self.resources.get(&TypeId::of::<T>())?;
         Some(RefMut::map(cell.borrow_mut(), |b| {
             b.downcast_mut::<T>()
@@ -209,8 +216,9 @@ impl World {
     /// # Examples
     ///
     /// ```
-    /// use spark_ecs::World;
+    /// use spark_ecs::{Resource, World};
     ///
+    /// #[derive(Resource)]
     /// struct Score(u32);
     ///
     /// let mut world = World::new();
@@ -218,7 +226,7 @@ impl World {
     /// assert_eq!(world.resource::<Score>().0, 9);
     /// ```
     #[must_use]
-    pub fn resource<T: 'static>(&self) -> Ref<'_, T> {
+    pub fn resource<T: Resource>(&self) -> Ref<'_, T> {
         self.get_resource::<T>().unwrap_or_else(|| {
             panic!(
                 "resource of type `{}` has not been inserted",
@@ -243,8 +251,9 @@ impl World {
     /// # Examples
     ///
     /// ```
-    /// use spark_ecs::World;
+    /// use spark_ecs::{Resource, World};
     ///
+    /// #[derive(Resource)]
     /// struct Score(u32);
     ///
     /// let mut world = World::new();
@@ -253,7 +262,7 @@ impl World {
     /// assert_eq!(world.resource::<Score>().0, 100);
     /// ```
     #[must_use]
-    pub fn resource_mut<T: 'static>(&self) -> RefMut<'_, T> {
+    pub fn resource_mut<T: Resource>(&self) -> RefMut<'_, T> {
         self.get_resource_mut::<T>().unwrap_or_else(|| {
             panic!(
                 "resource of type `{}` has not been inserted",
@@ -273,9 +282,11 @@ impl World {
     /// # Examples
     ///
     /// ```
-    /// use spark_ecs::World;
+    /// use spark_ecs::{Component, World};
     ///
+    /// #[derive(Component)]
     /// struct Position(f32, f32);
+    /// #[derive(Component)]
     /// struct Velocity(f32, f32);
     ///
     /// let mut world = World::new();
@@ -307,9 +318,11 @@ impl World {
     /// # Examples
     ///
     /// ```
-    /// use spark_ecs::World;
+    /// use spark_ecs::{Component, World};
     ///
+    /// #[derive(Component)]
     /// struct Position(f32, f32);
+    /// #[derive(Component)]
     /// struct Velocity(f32, f32);
     ///
     /// let mut world = World::new();
@@ -369,8 +382,9 @@ impl World {
     /// # Examples
     ///
     /// ```
-    /// use spark_ecs::World;
+    /// use spark_ecs::{Component, World};
     ///
+    /// #[derive(Component)]
     /// struct Position(f32, f32);
     ///
     /// let mut world = World::new();
@@ -406,8 +420,9 @@ impl World {
     /// # Examples
     ///
     /// ```
-    /// use spark_ecs::World;
+    /// use spark_ecs::{Component, World};
     ///
+    /// #[derive(Component)]
     /// struct Position(f32, f32);
     ///
     /// let mut world = World::new();
@@ -443,8 +458,9 @@ impl World {
     /// # Examples
     ///
     /// ```
-    /// use spark_ecs::World;
+    /// use spark_ecs::{Component, World};
     ///
+    /// #[derive(Component)]
     /// struct Health(u32);
     ///
     /// let mut world = World::new();
@@ -479,8 +495,9 @@ impl World {
     /// # Examples
     ///
     /// ```
-    /// use spark_ecs::World;
+    /// use spark_ecs::{Component, World};
     ///
+    /// #[derive(Component)]
     /// struct Health(u32);
     ///
     /// let mut world = World::new();
@@ -518,8 +535,9 @@ impl World {
     /// # Examples
     ///
     /// ```
-    /// use spark_ecs::{Commands, IntoSystem, Query, World};
+    /// use spark_ecs::{Commands, Component, IntoSystem, Query, World};
     ///
+    /// #[derive(Component)]
     /// struct Tag;
     ///
     /// let mut world = World::new();
@@ -632,8 +650,9 @@ impl World {
 /// # Examples
 ///
 /// ```
-/// use spark_ecs::World;
+/// use spark_ecs::{Component, World};
 ///
+/// #[derive(Component)]
 /// struct Tag;
 ///
 /// let mut world = World::new();
@@ -655,9 +674,11 @@ impl EntityMut<'_> {
     /// # Examples
     ///
     /// ```
-    /// use spark_ecs::World;
+    /// use spark_ecs::{Component, World};
     ///
+    /// #[derive(Component)]
     /// struct Position(f32, f32);
+    /// #[derive(Component)]
     /// struct Velocity(f32, f32);
     ///
     /// let mut world = World::new();
@@ -699,22 +720,25 @@ impl EntityMut<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Component, Resource};
     use std::cell::Cell;
     use std::rc::Rc;
 
+    #[derive(Resource)]
     struct A(u32);
+    #[derive(Resource)]
     struct B(&'static str);
 
     // Integer fields — keeps the unit tests free of `clippy::float_cmp`
     // assertions. Doc tests (which clippy doesn't lint) stay with the
     // canonical `f32` flavour to read like real engine code.
-    #[derive(Debug, PartialEq)]
+    #[derive(Debug, PartialEq, Component)]
     struct Position(i32, i32);
 
-    #[derive(Debug, PartialEq)]
+    #[derive(Debug, PartialEq, Component)]
     struct Velocity(i32, i32);
 
-    #[derive(Debug, PartialEq)]
+    #[derive(Debug, PartialEq, Component)]
     struct Walkable;
 
     // -------- resources (regression: pre-existing behaviour) --------
@@ -750,16 +774,21 @@ mod tests {
     }
 
     #[test]
-    fn non_send_resource_compiles() {
-        // `Rc<Cell<_>>` is `!Send + !Sync`. While there's no `Resource`
-        // trait yet, the storage map's bare `'static` bound has to
-        // accept it. Once the trait lands with `Send + Sync + 'static`
-        // (committed M4 direction), this test goes away in favour of a
-        // compile-fail check that `!Send` types can't be stored.
-        let counter = Rc::new(Cell::new(0_u32));
+    fn non_send_resource_is_allowed() {
+        // `Rc<Cell<_>>` is `!Send + !Sync`. The `Resource` trait carries
+        // only a `'static` bound — deliberately *not* `Send + Sync` — so
+        // a resource wrapping non-thread-safe state is still storable.
+        // The M4 scheduler keeps systems that touch such a resource on
+        // the main thread rather than rejecting it at the type level.
+        // (Components, by contrast, are `Send + Sync` and a non-`Send`
+        // one fails to derive — see the `compile_fail` doctest on the
+        // `Component` trait.)
+        #[derive(Resource)]
+        struct NonSendCounter(Rc<Cell<u32>>);
+
         let mut world = World::new();
-        world.add_resource(counter);
-        assert_eq!(world.resource::<Rc<Cell<u32>>>().get(), 0);
+        world.add_resource(NonSendCounter(Rc::new(Cell::new(0))));
+        assert_eq!(world.resource::<NonSendCounter>().0.get(), 0);
     }
 
     #[test]

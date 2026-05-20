@@ -1,8 +1,9 @@
 # ECS crate. Deepest foundation crate in the engine dependency graph —
-# every other engine crate (including `spark-core`) sits on top. Pure
-# stdlib, no engine deps, no external deps. The single primitive today
-# is `World` + `add_resource`; entities, components, queries, systems,
-# and schedulers land in M3–M4 (see docs/ECS_DESIGN.md).
+# every other engine crate (including `spark-core`) sits on top. The
+# runtime crate is stdlib-only; its single dependency is the nested
+# `spark-ecs-macros` derive crate (a build-time artefact). `World`,
+# entities, components, queries, systems, and `Commands` ship today;
+# the parallel scheduler lands in M4 (see docs/ECS_DESIGN.md).
 
 [package]
 name = "spark-ecs"
@@ -17,7 +18,10 @@ license.workspace = true
 [lints]
 workspace = true
 
-# No dependencies on purpose — the bottom of the dep graph stays
-# stdlib-only so every crate above can pull `World` in without fear of
-# cycles or transitive surprises.
+# The only dependency is the sibling derive crate nested at
+# `lib/ecs/macros/` — a build-time artefact, not an external runtime dep.
+# `spark-ecs` re-exports its `Component` / `Resource` derives so consumers
+# import only `spark-ecs`. The dep graph stays cycle-free: macros never
+# depends back on `spark-ecs` (the generated path resolves at the use site).
 [dependencies]
+spark-ecs-macros = { path = "macros" }
