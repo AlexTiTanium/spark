@@ -90,6 +90,22 @@
 //!     borrowed. `(&mut A, &A)` (in either element order) and
 //!     `(&mut A, &mut A)` panic with a precise diagnostic instead of
 //!     the `RefCell`'s "already borrowed".
+//!
+//! # Filters
+//!
+//! [`Query`] takes a second generic `F: QueryFilter`, defaulting to `()`
+//! (always true), so `Query<D>` is shorthand for `Query<D, ()>`. A
+//! filter narrows *which* entities iterate without touching the yielded
+//! item: `Query<&Position, With<Powered>>` still yields `&Position`,
+//! just for fewer entities. Iteration wraps the data driver in a
+//! `.filter(…)` that calls [`QueryFilter::matches`] per candidate, and
+//! [`Query::from_world`] folds [`QueryFilter::collect_access`] into the
+//! same self-conflict check the data shape runs. See the [`filter`]
+//! module for the filter set and the access-reporting rules.
+//!
+//! [`filter`]: crate::filter
+//! [`QueryFilter::matches`]: crate::QueryFilter::matches
+//! [`QueryFilter::collect_access`]: crate::QueryFilter::collect_access
 
 use std::cell::{Ref, RefMut};
 use std::marker::PhantomData;
@@ -97,6 +113,7 @@ use std::marker::PhantomData;
 use crate::Component;
 use crate::access::QueryAccess;
 use crate::entity::Entity;
+use crate::filter::QueryFilter;
 use crate::storage::ComponentStorage;
 use crate::system::SystemParam;
 use crate::world::World;
@@ -695,6 +712,14 @@ impl_all_tuple!(A, B, C, D, E);
 /// explicitly via the (forthcoming) `Query<(Entity, &T)>` shape. See
 /// the module-level docs for the *path A* vs *path B* design note.
 ///
+/// # Filters
+///
+/// The second generic `F: QueryFilter` defaults to `()` (always true),
+/// so `Query<D>` means `Query<D, ()>` and every existing call site is
+/// unchanged. A non-default `F` narrows which entities iterate without
+/// changing the yielded item: `Query<&Position, With<Powered>>` still
+/// yields `&Position`. See the [`filter`](crate::filter) module.
+///
 /// # Examples
 ///
 /// Single-component read — yields `&Position`, not `(Entity, &Position)`:
@@ -752,29 +777,37 @@ impl_all_tuple!(A, B, C, D, E);
 /// assert!(xs.contains(&1.0));
 /// assert!(xs.contains(&99.0));
 /// ```
-pub struct Query<'w, D: QueryData + 'w> {
+pub struct Query<'w, D: QueryData + 'w, F: QueryFilter = ()> {
+    /// Retained for the per-entity filter check during iteration — see
+    /// [`QueryFilter::matches`]. Shared, so it coexists with the
+    /// `Ref`/`RefMut` storage guards in `state`.
+    world: &'w World,
     state: D::State<'w>,
+    _filter: PhantomData<F>,
 }
 
-impl<'w, D: QueryData + 'w> Query<'w, D> {
+impl<'w, D: QueryData + 'w, F: QueryFilter> Query<'w, D, F> {
     /// Fetches a `Query` directly from a [`World`]. Convenience for
     /// tests and doc examples; system fns receive their `Query` from
     /// the runner via [`SystemParam::fetch`].
     ///
-    /// Runs [`QueryAccess::assert_no_self_conflict`] on the data
-    /// shape's access set *before* touching any storage, so shapes like
-    /// `(&mut A, &A)` or `(&mut A, &mut A)` panic with a precise
-    /// message naming the offending component instead of the
-    /// [`RefCell`]'s "already borrowed".
+    /// Runs [`QueryAccess::assert_no_self_conflict`] on the combined
+    /// data-shape *and* filter access set *before* touching any storage,
+    /// so shapes like `(&mut A, &A)` or `(&mut A, &mut A)` panic with a
+    /// precise message naming the offending component instead of the
+    /// [`RefCell`]'s "already borrowed". Filters fold their access in via
+    /// [`QueryFilter::collect_access`] — notably `With<A>` reports a read
+    /// of `A`, so `Query<&mut A, With<A>>` is itself a self-conflict.
     ///
     /// [`RefCell`]: std::cell::RefCell
     ///
     /// # Panics
     ///
-    /// - Panics if the data shape names the same component twice with
-    ///   at least one `&mut` (`(&mut A, &A)`, `(&mut A, &mut A)`, or
-    ///   the reversed `(&A, &mut A)`). The panic originates from
-    ///   [`QueryAccess::assert_no_self_conflict`].
+    /// - Panics if the combined access names the same component twice
+    ///   with at least one `&mut` — within the data shape
+    ///   (`(&mut A, &A)`, `(&mut A, &mut A)`, the reversed `(&A, &mut A)`)
+    ///   or across data and filter (`&mut A` data + `With<A>`). The panic
+    ///   originates from [`QueryAccess::assert_no_self_conflict`].
     /// - Panics when `D` contains a `&mut T` and that storage is already
     ///   borrowed (shared or exclusive) — the `RefCell` rule, fired
     ///   from a second concurrent query over the same storage in a
@@ -804,9 +837,12 @@ impl<'w, D: QueryData + 'w> Query<'w, D> {
         // diagnostic.
         let mut access = QueryAccess::default();
         D::collect_access(&mut access);
+        F::collect_access(&mut access);
         access.assert_no_self_conflict();
         Self {
+            world,
             state: D::init_state(world),
+            _filter: PhantomData,
         }
     }
 
@@ -881,13 +917,18 @@ impl<'w, D: QueryData + 'w> Query<'w, D> {
     /// assert!((vy - 0.45).abs() < 1e-6);
     /// ```
     pub fn iter_mut(&mut self) -> impl Iterator<Item = D::Item<'_>> + '_ {
+        // Copy the shared world handle out before borrowing `state`
+        // mutably — disjoint fields, so this doesn't fight the `&mut`.
+        let world = self.world;
         // Path B — strip the entity that the trait threads internally
-        // for join logic. See module-level docs.
-        D::iter(&mut self.state).map(|(_entity, item)| item)
+        // for join logic; the filter consumes it first. See module docs.
+        D::iter(&mut self.state)
+            .filter(move |(entity, _)| F::matches(*entity, world))
+            .map(|(_entity, item)| item)
     }
 }
 
-impl<'w, D: ReadOnlyQueryData + 'w> Query<'w, D> {
+impl<'w, D: ReadOnlyQueryData + 'w, F: QueryFilter> Query<'w, D, F> {
     /// Shared iteration. Available only for `D: ReadOnlyQueryData`
     /// (no `&mut T` anywhere in the shape).
     ///
@@ -939,13 +980,16 @@ impl<'w, D: ReadOnlyQueryData + 'w> Query<'w, D> {
     /// ```
     pub fn iter(&self) -> impl Iterator<Item = D::Item<'_>> + '_ {
         // Path B — see `Query::iter_mut` for the rationale.
-        D::iter_ref(&self.state).map(|(_entity, item)| item)
+        let world = self.world;
+        D::iter_ref(&self.state)
+            .filter(move |(entity, _)| F::matches(*entity, world))
+            .map(|(_entity, item)| item)
     }
 }
 
-impl<D: QueryData> SystemParam for Query<'_, D> {
+impl<D: QueryData, F: QueryFilter> SystemParam for Query<'_, D, F> {
     type Item<'w>
-        = Query<'w, D>
+        = Query<'w, D, F>
     where
         Self: 'w;
     fn fetch<'w>(world: &'w World) -> Self::Item<'w>
@@ -966,6 +1010,7 @@ impl<D: QueryData> SystemParam for Query<'_, D> {
 mod tests {
     use super::*;
     use crate::Component;
+    use crate::filter::{And, Or, With, Without};
     use crate::system::IntoSystem;
 
     // Integer fields keep unit tests free of `clippy::float_cmp`
@@ -1741,5 +1786,171 @@ mod tests {
             stale_ref.is_none(),
             "generation check should reject the stale handle"
         );
+    }
+
+    // -------- Query filters: Query<D, F> --------
+
+    #[test]
+    fn query_with_filter_yields_only_entities_having_the_marker() {
+        let mut world = World::new();
+        world.spawn().insert(Position(1, 1)).insert(Marker);
+        world.spawn().insert(Position(2, 2)); // no Marker
+        world.spawn().insert(Position(3, 3)).insert(Marker);
+
+        let q = Query::<&Position, With<Marker>>::from_world(&world);
+        let xs: Vec<i32> = q.iter().map(|p| p.0).collect();
+        assert_eq!(xs.len(), 2);
+        assert!(xs.contains(&1));
+        assert!(xs.contains(&3));
+        assert!(!xs.contains(&2));
+    }
+
+    #[test]
+    fn query_without_filter_excludes_entities_having_the_marker() {
+        let mut world = World::new();
+        world.spawn().insert(Position(1, 1)).insert(Marker);
+        world.spawn().insert(Position(2, 2)); // no Marker
+        let q = Query::<&Position, Without<Marker>>::from_world(&world);
+        let xs: Vec<i32> = q.iter().map(|p| p.0).collect();
+        assert_eq!(xs, vec![2]);
+    }
+
+    #[test]
+    fn query_and_filter_requires_all_branches() {
+        let mut world = World::new();
+        // Velocity present, Marker absent — matches.
+        world.spawn().insert(Position(1, 1)).insert(Velocity(0, 0));
+        // Velocity present but Marker present — excluded by Without.
+        world
+            .spawn()
+            .insert(Position(2, 2))
+            .insert(Velocity(0, 0))
+            .insert(Marker);
+        // Velocity absent — excluded by With.
+        world.spawn().insert(Position(3, 3));
+
+        let q = Query::<&Position, And<(With<Velocity>, Without<Marker>)>>::from_world(&world);
+        let xs: Vec<i32> = q.iter().map(|p| p.0).collect();
+        assert_eq!(xs, vec![1]);
+    }
+
+    #[test]
+    fn query_or_filter_matches_any_branch() {
+        let mut world = World::new();
+        world.spawn().insert(Position(1, 1)).insert(Velocity(0, 0)); // Velocity
+        world.spawn().insert(Position(2, 2)).insert(Marker); // Marker
+        world.spawn().insert(Position(3, 3)); // neither — excluded
+
+        let q = Query::<&Position, Or<(With<Velocity>, With<Marker>)>>::from_world(&world);
+        let xs: Vec<i32> = q.iter().map(|p| p.0).collect();
+        assert_eq!(xs.len(), 2);
+        assert!(xs.contains(&1));
+        assert!(xs.contains(&2));
+    }
+
+    #[test]
+    fn query_nested_and_of_or_filter_composes() {
+        // Filter: With<Velocity> AND (With<Marker> OR With<A>).
+        let mut world = World::new();
+        // Velocity + Marker — matches.
+        world
+            .spawn()
+            .insert(Position(1, 1))
+            .insert(Velocity(0, 0))
+            .insert(Marker);
+        // Velocity + A — matches the Or via its other branch.
+        world
+            .spawn()
+            .insert(Position(2, 2))
+            .insert(Velocity(0, 0))
+            .insert(A(0));
+        // Velocity only — neither Or branch matches.
+        world.spawn().insert(Position(3, 3)).insert(Velocity(0, 0));
+        // Marker only, no Velocity — fails the outer And.
+        world.spawn().insert(Position(4, 4)).insert(Marker);
+
+        let q = Query::<&Position, And<(With<Velocity>, Or<(With<Marker>, With<A>)>)>>::from_world(
+            &world,
+        );
+        let xs: Vec<i32> = q.iter().map(|p| p.0).collect();
+        assert_eq!(xs.len(), 2);
+        assert!(xs.contains(&1));
+        assert!(xs.contains(&2));
+    }
+
+    #[test]
+    fn query_filter_applies_to_iter_mut() {
+        let mut world = World::new();
+        let marked = world.spawn().insert(Position(1, 1)).insert(Marker).id();
+        let plain = world.spawn().insert(Position(2, 2)).id();
+        {
+            let mut q = Query::<&mut Position, With<Marker>>::from_world(&world);
+            for p in q.iter_mut() {
+                p.0 += 100;
+            }
+        }
+        assert_eq!(world.get::<Position>(marked).unwrap().0, 101);
+        assert_eq!(world.get::<Position>(plain).unwrap().0, 2); // untouched
+    }
+
+    #[test]
+    #[should_panic(expected = "conflicting access to component")]
+    fn query_mut_data_with_same_component_filter_panics() {
+        // `With<Position>` reports a read of Position; combined with the
+        // `&mut Position` data shape that's a write+read self-conflict,
+        // caught at `from_world` before any borrow.
+        let mut world = World::new();
+        world.spawn().insert(Position(0, 0));
+        let _q = Query::<&mut Position, With<Position>>::from_world(&world);
+    }
+
+    #[test]
+    fn query_mut_data_without_same_component_does_not_conflict() {
+        // `Without<Position>` reports no access, so `&mut Position` data
+        // + `Without<Position>` passes the self-conflict check. With no
+        // Position entities the driver is empty and `matches` is never
+        // called — it iterates cleanly to zero rather than panicking.
+        let mut world = World::new();
+        world.spawn().insert(Velocity(0, 0));
+        let mut q = Query::<&mut Position, Without<Position>>::from_world(&world);
+        assert_eq!(q.iter_mut().count(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "already mutably borrowed")]
+    fn query_mut_data_without_same_component_panics_mid_iteration() {
+        // The flip side of the test above. When `Position`'s storage is
+        // *non-empty*, the `&mut Position` data shape holds a live
+        // `RefMut` on its cell while `Without<Position>::matches`
+        // re-borrows that same cell (shared) per entity — the documented
+        // `RefCell` "already mutably borrowed" panic. The query is nonsensical
+        // (it could never yield anything), but the failure mode is
+        // exactly what `Without`'s no-access decision implies.
+        let mut world = World::new();
+        world.spawn().insert(Position(1, 1));
+        let mut q = Query::<&mut Position, Without<Position>>::from_world(&world);
+        let _ = q.iter_mut().count();
+    }
+
+    #[test]
+    fn filtered_query_wires_up_as_system_param() {
+        // The `F` generic threads through `IntoSystem` like any other
+        // part of the query type — the runner builds it via `fetch`.
+        let mut world = World::new();
+        world.spawn().insert(Position(1, 1)).insert(Marker);
+        world.spawn().insert(Position(2, 2));
+        fn bump_marked(mut q: Query<&mut Position, With<Marker>>) {
+            for p in q.iter_mut() {
+                p.0 += 10;
+            }
+        }
+        let mut sys = IntoSystem::into_system(bump_marked);
+        sys(&world);
+        let xs: Vec<i32> = Query::<&Position>::from_world(&world)
+            .iter()
+            .map(|p| p.0)
+            .collect();
+        assert!(xs.contains(&11)); // marked entity moved
+        assert!(xs.contains(&2)); // unmarked entity untouched
     }
 }
