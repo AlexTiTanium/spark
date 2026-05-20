@@ -87,7 +87,9 @@ doesn't do real work inside `build`.
 
 ```rust
 use spark_core::{Application, Plugin};
+use spark_ecs::Resource;
 
+#[derive(Resource)]
 struct ClearColor((f32, f32, f32));
 
 struct GraphicsPlugin {
@@ -127,8 +129,11 @@ insert of the same type replaces the first.
 
 ```rust
 use spark_core::Application;
+use spark_ecs::Resource;
 
+#[derive(Resource)]
 struct GameTime { elapsed: f32, dt: f32 }
+#[derive(Resource)]
 struct Score(u32);
 
 let _app = Application::new()
@@ -155,8 +160,11 @@ plain `&mut World`:
 
 ```rust
 use spark_core::{Application, Plugin};
+use spark_ecs::Component;
 
+#[derive(Component)]
 struct Tile { x: i32, y: i32 }
+#[derive(Component)]
 struct Walkable;
 
 struct LevelPlugin;
@@ -187,9 +195,11 @@ engine what to inject when it's called:
 
 ```rust
 use spark_core::{Application, stages};
-use spark_ecs::{Res, ResMut};
+use spark_ecs::{Res, ResMut, Resource};
 
+#[derive(Resource)]
 struct GameTime { elapsed: f32, dt: f32 }
+#[derive(Resource)]
 struct Score(u32);
 
 // `Res<T>` borrows the resource immutably, `ResMut<T>` mutably.
@@ -264,10 +274,11 @@ registry, no enum, no central list to update:
 
 ```rust
 use spark_core::Application;
-use spark_ecs::ResMut;
+use spark_ecs::{ResMut, Resource};
 
 const FIXED_UPDATE: &str = "fixed_update";
 
+#[derive(Resource)]
 struct Tick(u32);
 
 fn bump(mut t: ResMut<Tick>) {
@@ -308,8 +319,9 @@ cleanly:
 
 ```rust
 use spark_core::{Application, stages};
-use spark_ecs::ResMut;
+use spark_ecs::{ResMut, Resource};
 
+#[derive(Resource)]
 struct Counter(u32);
 
 fn bump(mut c: ResMut<Counter>) {

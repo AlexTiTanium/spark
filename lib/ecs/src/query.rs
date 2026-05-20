@@ -94,9 +94,10 @@
 use std::cell::{Ref, RefMut};
 use std::marker::PhantomData;
 
+use crate::Component;
 use crate::access::QueryAccess;
 use crate::entity::Entity;
-use crate::storage::{Component, ComponentStorage};
+use crate::storage::ComponentStorage;
 use crate::system::SystemParam;
 use crate::world::World;
 
@@ -115,9 +116,10 @@ use crate::world::World;
 /// when writing generic helpers; here we just confirm the impl exists:
 ///
 /// ```
-/// use spark_ecs::QueryData;
+/// use spark_ecs::{Component, QueryData};
 ///
 /// fn _accepts<D: QueryData>() {}
+/// #[derive(Component)]
 /// struct Position { x: f32, y: f32 }
 /// _accepts::<&Position>();
 /// _accepts::<&mut Position>();
@@ -170,10 +172,12 @@ pub trait QueryData {
 /// # Examples
 ///
 /// ```
-/// use spark_ecs::ReadOnlyQueryData;
+/// use spark_ecs::{Component, ReadOnlyQueryData};
 ///
 /// fn _accepts<D: ReadOnlyQueryData>() {}
+/// #[derive(Component)]
 /// struct Position { x: f32, y: f32 }
+/// #[derive(Component)]
 /// struct Velocity { x: f32, y: f32 }
 /// _accepts::<&Position>();
 /// _accepts::<(&Position, &Velocity)>();
@@ -696,8 +700,9 @@ impl_all_tuple!(A, B, C, D, E);
 /// Single-component read — yields `&Position`, not `(Entity, &Position)`:
 ///
 /// ```
-/// use spark_ecs::{Query, World};
+/// use spark_ecs::{Component, Query, World};
 ///
+/// #[derive(Component)]
 /// struct Position { x: f32, y: f32 }
 ///
 /// let mut world = World::new();
@@ -714,9 +719,11 @@ impl_all_tuple!(A, B, C, D, E);
 /// Two-component join — yields `(&mut Position, &Velocity)`:
 ///
 /// ```
-/// use spark_ecs::{Query, World};
+/// use spark_ecs::{Component, Query, World};
 ///
+/// #[derive(Component)]
 /// struct Position { x: f32, y: f32 }
+/// #[derive(Component)]
 /// struct Velocity { x: f32, y: f32 }
 ///
 /// let mut world = World::new();
@@ -776,8 +783,9 @@ impl<'w, D: QueryData + 'w> Query<'w, D> {
     /// # Examples
     ///
     /// ```
-    /// use spark_ecs::{Query, World};
+    /// use spark_ecs::{Component, Query, World};
     ///
+    /// #[derive(Component)]
     /// struct Health(u32);
     ///
     /// let mut world = World::new();
@@ -811,8 +819,9 @@ impl<'w, D: QueryData + 'w> Query<'w, D> {
     /// # Examples
     ///
     /// ```
-    /// use spark_ecs::{Query, World};
+    /// use spark_ecs::{Component, Query, World};
     ///
+    /// #[derive(Component)]
     /// struct Velocity { x: f32, y: f32 }
     ///
     /// let mut world = World::new();
@@ -840,9 +849,11 @@ impl<'w, D: QueryData + 'w> Query<'w, D> {
     /// Multi-mut join — both elements mutable, distinct types:
     ///
     /// ```
-    /// use spark_ecs::{Query, World};
+    /// use spark_ecs::{Component, Query, World};
     ///
+    /// #[derive(Component)]
     /// struct Position { x: f32, y: f32 }
+    /// #[derive(Component)]
     /// struct Velocity { x: f32, y: f32 }
     ///
     /// let mut world = World::new();
@@ -886,9 +897,11 @@ impl<'w, D: ReadOnlyQueryData + 'w> Query<'w, D> {
     /// # Examples
     ///
     /// ```
-    /// use spark_ecs::{Query, World};
+    /// use spark_ecs::{Component, Query, World};
     ///
+    /// #[derive(Component)]
     /// struct Position { x: f32, y: f32 }
+    /// #[derive(Component)]
     /// struct Velocity { x: f32, y: f32 }
     ///
     /// let mut world = World::new();
@@ -908,8 +921,12 @@ impl<'w, D: ReadOnlyQueryData + 'w> Query<'w, D> {
     /// **compile-time** error — not a runtime check:
     ///
     /// ```compile_fail
-    /// use spark_ecs::{Query, World};
+    /// use spark_ecs::{Component, Query, World};
     ///
+    /// // `Position` *is* a component here — so `insert` compiles and the
+    /// // failure lands squarely on `q.iter()` below (the bound this
+    /// // example is about), not on an undecorated-component error.
+    /// #[derive(Component)]
     /// struct Position(f32, f32);
     ///
     /// let mut world = World::new();
@@ -948,18 +965,19 @@ impl<D: QueryData> SystemParam for Query<'_, D> {
 )]
 mod tests {
     use super::*;
+    use crate::Component;
     use crate::system::IntoSystem;
 
     // Integer fields keep unit tests free of `clippy::float_cmp`
     // assertions. Doc tests stay with the canonical `f32` flavour to
     // read like real engine code.
-    #[derive(Debug, PartialEq)]
+    #[derive(Debug, PartialEq, Component)]
     struct Position(i32, i32);
 
-    #[derive(Debug, PartialEq)]
+    #[derive(Debug, PartialEq, Component)]
     struct Velocity(i32, i32);
 
-    #[derive(Debug, PartialEq)]
+    #[derive(Debug, PartialEq, Component)]
     struct Marker;
 
     fn world_with_three_movers() -> (World, [Entity; 3]) {
@@ -1125,15 +1143,15 @@ mod tests {
     //
     // These are independent test fixtures — *not* related to the
     // `$D1, $D, ...` macro variables in `impl_query_data_tuple!`.
-    #[derive(Debug, PartialEq)]
+    #[derive(Debug, PartialEq, Component)]
     struct A(i32);
-    #[derive(Debug, PartialEq)]
+    #[derive(Debug, PartialEq, Component)]
     struct B(i32);
-    #[derive(Debug, PartialEq)]
+    #[derive(Debug, PartialEq, Component)]
     struct C(i32);
-    #[derive(Debug, PartialEq)]
+    #[derive(Debug, PartialEq, Component)]
     struct D(i32);
-    #[derive(Debug, PartialEq)]
+    #[derive(Debug, PartialEq, Component)]
     struct E(i32);
 
     #[test]

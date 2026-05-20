@@ -5,15 +5,15 @@
 //! to even-indexed ones, despawn half, assert the storage stays packed
 //! and the cascade through `dyn AnyStorage` cleared every component.
 
-use spark_ecs::{Entity, World};
+use spark_ecs::{Component, Entity, World};
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Component)]
 struct Position {
     x: i32,
     y: i32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Component)]
 struct Walkable;
 
 #[test]

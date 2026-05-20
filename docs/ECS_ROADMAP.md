@@ -62,13 +62,18 @@ do not refile it. Originally filed as #25 and closed as stale.
   introduced here is the primitive the scheduler (item 3) extends to
   `SystemParam` level — design it to be reused, not rewritten.
 
-**2. derive(Component/Resource) + `Send+Sync` + drop prelude — ⬜ not filed.** Draft below (Draft 2).
-- *Decisions:* explicit derive over blanket impl; traits become
-  `Send + Sync + 'static`; no `prelude` module; the proc-macro crate is
+**2. derive(Component/Resource) + `Send+Sync` + drop prelude — ✅ shipped with #29.** Draft below (Draft 2).
+- *Decisions:* explicit derive over blanket impl; the proc-macro crate is
   **nested inside the ECS crate** at `lib/ecs/macros/`, not a top-level
-  workspace sibling.
-- *Warnings:* breaking-ish refactor, touches every component/resource in
-  demos+tests — do it now while they are few.
+  workspace sibling. `Component` carries `Send + Sync + 'static`;
+  **`Resource` carries only `'static`** — a deliberate divergence from the
+  original draft (rationale in the Draft 2 callout below). There was no
+  `prelude` module to drop — the crate already used flat re-exports, so
+  that sub-goal was a no-op.
+- *Shipped:* `spark-ecs-macros` (`#[derive(Component)]` /
+  `#[derive(Resource)]`), blanket impl removed, resource APIs
+  (`add_resource` / `Res` / `ResMut`) gated on `Resource`, every demo and
+  test migrated to the derives.
 
 **3. Scheduler / workload — ⬜ not filed.**
 - *Work:* `Access` declaration on every `SystemParam` (aggregating the
@@ -407,15 +412,29 @@ optimisation (follow-up).
 
 ## Draft 2 — spark-ecs: derive(Component/Resource) + `Send+Sync` bound + drop prelude
 
-> ⬜ **Not yet filed.** Body is paste-ready when item 2 above is filed.
+> ✅ **Shipped with #29.** Kept as the design record. One decision changed
+> during implementation — see the divergence callout below.
+
+> ⚠️ **Divergence from this draft (decided during #29).** Only `Component`
+> became `Send + Sync + 'static`. **`Resource` carries only `'static`** — not
+> `Send + Sync`. Resources are the home for inherently non-thread-safe
+> singletons (a `wgpu` surface, an OS handle, an `Rc`-based cache); forcing
+> `Send + Sync` would lock those out of the `World` with no escape hatch.
+> Parallel-safety for resources is deferred to the M4 scheduler, which will
+> (Bevy-style: `Resource` vs `NonSend`) keep a system that touches a
+> non-`Send` resource on the main thread rather than rejecting it at the type
+> level. The explicit-derive *membership* goal is still met for both traits.
+> Also: there was no `prelude` module to remove — the crate already used flat
+> re-exports.
 
 ### Context
 
 Fixed design decision: component and resource membership is **explicit via a
 derive**, not a blanket impl. The blanket impl is a coherence dead-end and a
 footgun — a resource type silently satisfies `Query`. The same refactor moves
-the traits to `Send + Sync + 'static` ahead of the M4 parallel scheduler, and
-removes the `prelude` module in favour of explicit imports.
+`Component` to `Send + Sync + 'static` ahead of the M4 parallel scheduler
+(`Resource` stays `'static`; see the divergence callout above), and the
+crate uses flat re-exports rather than a `prelude` module.
 
 ### Goals & non-goals
 
@@ -423,9 +442,9 @@ removes the `prelude` module in favour of explicit imports.
 
 - New proc-macro crate `spark-ecs-macros` (Rust import path: `spark_ecs_macros`).
 - `#[derive(Component)]` and `#[derive(Resource)]`.
-- `Component` / `Resource` traits become `Send + Sync + 'static`; the blanket
-  impl is removed.
-- `prelude` module removed; flat `pub use` re-exports at the crate root.
+- `Component` becomes `Send + Sync + 'static`; `Resource` becomes `'static`
+  (see divergence callout); the blanket `Component` impl is removed.
+- Flat `pub use` re-exports at the crate root (no `prelude` module existed).
 - Every existing component/resource in demos and tests updated.
 
 **Non-goals**
@@ -549,12 +568,12 @@ Cargo.toml               (modified — "lib/ecs/macros" added to workspace membe
 
 ### Acceptance criteria
 
-- [ ] `spark-ecs-macros` crate exists with `proc-macro = true`, nested at `lib/ecs/macros/`.
-- [ ] `#[derive(Component)]` / `#[derive(Resource)]` generate the marker impls.
-- [ ] `Component` / `Resource` are `Send + Sync + 'static`; blanket impl gone.
-- [ ] `prelude` removed; imports are explicit throughout demos and tests.
-- [ ] Workspace builds; clippy clean; all demos updated and run.
-- [ ] A component holding a non-`Send` field fails to derive (compile-fail test, optional).
+- [x] `spark-ecs-macros` crate exists with `proc-macro = true`, nested at `lib/ecs/macros/`.
+- [x] `#[derive(Component)]` / `#[derive(Resource)]` generate the marker impls.
+- [x] `Component` is `Send + Sync + 'static`; `Resource` is `'static`; blanket impl gone.
+- [x] No `prelude` (none existed); imports are explicit throughout demos and tests.
+- [x] Workspace builds; clippy clean; all demos updated and run.
+- [x] A component holding a non-`Send` field fails to derive (`compile_fail` doctest on the `Component` trait).
 
 ### Verification plan
 

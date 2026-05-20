@@ -11,19 +11,22 @@
 //! sub-sandbox imports short. The cost of broader visibility is
 //! negligible — none of this leaves the binary.
 //!
-//! All four are plain `'static` types — no `#[derive(Component)]`
-//! yet; `lib/ecs/src/storage.rs` carries the blanket
-//! `impl<T: 'static> Component for T` until the derive PR lands.
+//! Each opts into the ECS with `#[derive(Component)]` — the explicit
+//! marker that lets `World::insert` and `Query` accept it. The trait's
+//! `Send + Sync + 'static` bound is satisfied trivially by these plain
+//! data structs.
+
+use spark_ecs::Component;
 
 /// 2D position. Named-field struct so log output reads naturally.
-#[derive(Debug)]
+#[derive(Debug, Component)]
 pub(crate) struct Position {
     pub(crate) x: f32,
     pub(crate) y: f32,
 }
 
 /// 2D velocity in units / tick.
-#[derive(Debug)]
+#[derive(Debug, Component)]
 pub(crate) struct Velocity {
     pub(crate) x: f32,
     pub(crate) y: f32,
@@ -31,5 +34,5 @@ pub(crate) struct Velocity {
 
 /// Hit points. `saturating_sub` / `saturating_add` are used at decay
 /// and regen sites so the value never wraps past zero or overflows.
-#[derive(Debug)]
+#[derive(Debug, Component)]
 pub(crate) struct Health(pub(crate) u32);

@@ -10,26 +10,8 @@
 
 use std::any::Any;
 
+use crate::Component;
 use crate::entity::Entity;
-
-/// Marker trait for anything that can live in a [`ComponentStorage`].
-///
-/// Blanket-implemented over `T: 'static`. The `Send + Sync` bound that
-/// the parallel scheduler will need lands in a follow-up PR with the
-/// `#[derive(Component)]` macro; today the storage layer accepts any
-/// `'static` type so we can prove out the sparse-set machinery first.
-///
-/// # Examples
-///
-/// ```
-/// use spark_ecs::Component;
-///
-/// fn _accepts<T: Component>() {}
-/// struct Position { x: f32, y: f32 }
-/// _accepts::<Position>();
-/// ```
-pub trait Component: 'static {}
-impl<T: 'static> Component for T {}
 
 /// Sparse-set storage for one component type.
 ///
@@ -100,8 +82,9 @@ impl<T: 'static> Component for T {}
 /// # Examples
 ///
 /// ```
-/// use spark_ecs::World;
+/// use spark_ecs::{Component, World};
 ///
+/// #[derive(Component)]
 /// struct Position { x: f32, y: f32 }
 ///
 /// let mut world = World::new();
@@ -122,8 +105,9 @@ impl<T: Component> ComponentStorage<T> {
     /// # Examples
     ///
     /// ```
-    /// use spark_ecs::ComponentStorage;
+    /// use spark_ecs::{Component, ComponentStorage};
     ///
+    /// #[derive(Component)]
     /// struct Position(f32, f32);
     /// let storage: ComponentStorage<Position> = ComponentStorage::new();
     /// assert!(storage.is_empty());
@@ -162,8 +146,9 @@ impl<T: Component> ComponentStorage<T> {
     /// # Examples
     ///
     /// ```
-    /// use spark_ecs::{ComponentStorage, EntityAllocator};
+    /// use spark_ecs::{Component, ComponentStorage, EntityAllocator};
     ///
+    /// #[derive(Component)]
     /// struct Position(f32, f32);
     ///
     /// let mut alloc = EntityAllocator::new();
@@ -243,8 +228,9 @@ impl<T: Component> ComponentStorage<T> {
     /// # Examples
     ///
     /// ```
-    /// use spark_ecs::{ComponentStorage, EntityAllocator};
+    /// use spark_ecs::{Component, ComponentStorage, EntityAllocator};
     ///
+    /// #[derive(Component)]
     /// struct Tag;
     ///
     /// let mut alloc = EntityAllocator::new();
@@ -287,8 +273,9 @@ impl<T: Component> ComponentStorage<T> {
     /// # Examples
     ///
     /// ```
-    /// use spark_ecs::World;
+    /// use spark_ecs::{Component, World};
     ///
+    /// #[derive(Component)]
     /// struct Health(u32);
     ///
     /// let mut world = World::new();
@@ -306,8 +293,9 @@ impl<T: Component> ComponentStorage<T> {
     /// # Examples
     ///
     /// ```
-    /// use spark_ecs::World;
+    /// use spark_ecs::{Component, World};
     ///
+    /// #[derive(Component)]
     /// struct Health(u32);
     ///
     /// let mut world = World::new();
@@ -330,8 +318,9 @@ impl<T: Component> ComponentStorage<T> {
     /// # Examples
     ///
     /// ```
-    /// use spark_ecs::{ComponentStorage, EntityAllocator};
+    /// use spark_ecs::{Component, ComponentStorage, EntityAllocator};
     ///
+    /// #[derive(Component)]
     /// struct Level(u32);
     ///
     /// let mut alloc = EntityAllocator::new();
@@ -352,8 +341,9 @@ impl<T: Component> ComponentStorage<T> {
     /// # Examples
     ///
     /// ```
-    /// use spark_ecs::{ComponentStorage, EntityAllocator};
+    /// use spark_ecs::{Component, ComponentStorage, EntityAllocator};
     ///
+    /// #[derive(Component)]
     /// struct Health(u32);
     ///
     /// let mut alloc = EntityAllocator::new();
@@ -374,8 +364,9 @@ impl<T: Component> ComponentStorage<T> {
     /// # Examples
     ///
     /// ```
-    /// use spark_ecs::ComponentStorage;
+    /// use spark_ecs::{Component, ComponentStorage};
     ///
+    /// #[derive(Component)]
     /// struct Tag;
     /// let storage = ComponentStorage::<Tag>::new();
     /// assert_eq!(storage.len(), 0);
@@ -390,8 +381,9 @@ impl<T: Component> ComponentStorage<T> {
     /// # Examples
     ///
     /// ```
-    /// use spark_ecs::ComponentStorage;
+    /// use spark_ecs::{Component, ComponentStorage};
     ///
+    /// #[derive(Component)]
     /// struct Tag;
     /// let storage = ComponentStorage::<Tag>::new();
     /// assert!(storage.is_empty());
@@ -409,8 +401,9 @@ impl<T: Component> ComponentStorage<T> {
     /// # Examples
     ///
     /// ```
-    /// use spark_ecs::World;
+    /// use spark_ecs::{Component, World};
     ///
+    /// #[derive(Component)]
     /// struct Tag;
     ///
     /// let mut world = World::new();
@@ -475,9 +468,11 @@ impl<T: Component> Default for ComponentStorage<T> {
 /// # Examples
 ///
 /// ```
-/// use spark_ecs::World;
+/// use spark_ecs::{Component, World};
 ///
+/// #[derive(Component)]
 /// struct Position(f32, f32);
+/// #[derive(Component)]
 /// struct Velocity(f32, f32);
 ///
 /// let mut world = World::new();
@@ -517,9 +512,10 @@ impl<T: Component> AnyStorage for ComponentStorage<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Component;
     use crate::entity::EntityAllocator;
 
-    #[derive(Debug, PartialEq)]
+    #[derive(Debug, PartialEq, Component)]
     struct Pos(i32, i32);
 
     fn alloc_n(n: usize) -> (EntityAllocator, Vec<Entity>) {

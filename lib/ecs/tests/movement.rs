@@ -10,17 +10,15 @@
 //! exercises the crate the way a downstream consumer (and, eventually,
 //! the `spark` binary) will.
 
-use spark_ecs::{Entity, Query, World};
+use spark_ecs::{Component, Entity, Query, World};
 
-// `Component` is a blanket-impl marker today (any `T: 'static` is a
-// component). The `spark-ecs-macros` PR will switch it to an explicit
-// `#[derive(Component)]` + `Send + Sync + 'static` bound — at which
-// point these structs need that derive. Mentioned so a future reader
-// copy-pasting this test as a template knows what to expect.
-#[derive(Debug, PartialEq)]
+// Components opt in explicitly with `#[derive(Component)]`. The trait
+// carries `Send + Sync + 'static`, which these plain integer structs
+// satisfy trivially.
+#[derive(Debug, PartialEq, Component)]
 struct Position(i64, i64);
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Component)]
 struct Velocity(i64, i64);
 
 /// Spawns `n` movers (with both `Position` and `Velocity`) and `n / 4`

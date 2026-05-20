@@ -9,7 +9,10 @@
 # explicitly documents intent.
 resolver = "3"
 
-members = ["lib/*", "src"]
+# `lib/*` is one level deep, so the nested proc-macro crate at
+# `lib/ecs/macros/` needs its own explicit entry — a workspace requires
+# every package to be a listed member, and the glob won't reach it.
+members = ["lib/*", "lib/ecs/macros", "src"]
 
 [workspace.package]
 edition = "2024"
@@ -31,6 +34,15 @@ thiserror = "2.0.18"
 # Erased error type used at every Plugin → Application seam. Re-exported
 # by `spark-core` as `EngineError`.
 anyhow = "1.0.102"
+
+# Proc-macro toolchain for the `spark-ecs-macros` derive crate. syn
+# parses the annotated `#[derive(…)]` item, quote builds the generated
+# `impl`, and proc-macro2 is the token type they share. syn's default
+# features cover a marker derive (derive + parsing + printing); `full`
+# is not needed.
+syn = "2.0.117"
+quote = "1.0.45"
+proc-macro2 = "1.0.106"
 
 [workspace.lints.rust]
 

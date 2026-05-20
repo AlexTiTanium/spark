@@ -31,8 +31,8 @@
 
 use std::cell::RefCell;
 
+use crate::Component;
 use crate::entity::{Entity, EntityAllocator};
-use crate::storage::Component;
 use crate::system::SystemParam;
 use crate::world::World;
 
@@ -55,8 +55,9 @@ pub(crate) type DeferredOp = Box<dyn FnOnce(&mut World) + 'static>;
 /// # Examples
 ///
 /// ```
-/// use spark_ecs::{CommandQueue, World};
+/// use spark_ecs::{CommandQueue, Component, World};
 ///
+/// #[derive(Component)]
 /// struct Tag;
 ///
 /// let mut world = World::new();
@@ -126,8 +127,9 @@ impl CommandQueue {
     /// # Examples
     ///
     /// ```
-    /// use spark_ecs::{CommandQueue, World};
+    /// use spark_ecs::{CommandQueue, Component, World};
     ///
+    /// #[derive(Component)]
     /// struct Position(i32, i32);
     ///
     /// let mut world = World::new();
@@ -177,9 +179,11 @@ impl CommandQueue {
 /// # Examples
 ///
 /// ```
-/// use spark_ecs::{Commands, IntoSystem, Query, World};
+/// use spark_ecs::{Commands, Component, IntoSystem, Query, World};
 ///
+/// #[derive(Component)]
 /// struct Position { x: f32, y: f32 }
+/// #[derive(Component)]
 /// struct Velocity { x: f32, y: f32 }
 ///
 /// fn spawn_two(mut commands: Commands) {
@@ -217,8 +221,9 @@ impl Commands<'_> {
     /// # Examples
     ///
     /// ```
-    /// use spark_ecs::{Commands, IntoSystem, World};
+    /// use spark_ecs::{Commands, Component, IntoSystem, World};
     ///
+    /// #[derive(Component)]
     /// struct Position(f32, f32);
     ///
     /// fn build_chain(mut commands: Commands) {
@@ -252,8 +257,9 @@ impl Commands<'_> {
     /// # Examples
     ///
     /// ```
-    /// use spark_ecs::{Commands, IntoSystem, World};
+    /// use spark_ecs::{Commands, Component, IntoSystem, World};
     ///
+    /// #[derive(Component)]
     /// struct Position(f32, f32);
     ///
     /// let mut world = World::new();
@@ -286,9 +292,11 @@ impl Commands<'_> {
 /// # Examples
 ///
 /// ```
-/// use spark_ecs::{Commands, IntoSystem, World};
+/// use spark_ecs::{Commands, Component, IntoSystem, World};
 ///
+/// #[derive(Component)]
 /// struct Position(f32, f32);
+/// #[derive(Component)]
 /// struct Velocity(f32, f32);
 ///
 /// fn spawn_one(mut commands: Commands) {
@@ -313,8 +321,9 @@ impl EntityCommands<'_> {
     /// # Examples
     ///
     /// ```
-    /// use spark_ecs::{Commands, IntoSystem, Query, World};
+    /// use spark_ecs::{Commands, Component, IntoSystem, Query, World};
     ///
+    /// #[derive(Component)]
     /// struct Position(f32, f32);
     ///
     /// fn spawn_one(mut commands: Commands) {
@@ -389,12 +398,13 @@ impl<'a> SystemParam for Commands<'a> {
 )]
 mod tests {
     use super::*;
+    use crate::Component;
     use crate::system::IntoSystem;
 
-    #[derive(Debug, PartialEq)]
+    #[derive(Debug, PartialEq, Component)]
     struct Position(i32, i32);
 
-    #[derive(Debug, PartialEq)]
+    #[derive(Debug, PartialEq, Component)]
     struct Velocity(i32, i32);
 
     #[test]
