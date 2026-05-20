@@ -171,7 +171,7 @@ Game UI is built on vanilla `egui` through M7–M13; the custom stack is compose
 
 ### M1–M3 — `spark_core::Application` boot harness (no ECS yet)
 
-Without ECS there are no Resources or Schedules for a `Plugin` trait to register with, so the "plugin" idea is collapsed into a small boot harness — `spark_core::Application`. It owns config + boot order (tracing init, root error type, window startup):
+Without ECS there are no Resources or Stages for a `Plugin` trait to register with, so the "plugin" idea is collapsed into a small boot harness — `spark_core::Application`. It owns config + boot order (tracing init, root error type, window startup):
 
 ```rust
 // /src/main.rs (M1)
@@ -254,7 +254,7 @@ The migration is additive on the engine side — `Application` and its helpers s
 
 #### M4 — ECS feature-complete
 - Build `ecs` crate steps 7–11:
-  Resources, Systems, Schedule, App+Plugin, FixedUpdate, Events
+  Resources, Systems, Stage, App+Plugin, FixedUpdate, Events
 - Introduce the `Resource` and `Component` traits, both
   `Send + Sync + 'static`. `SystemParam` impls thread the bound
   through. This is the committed contract — Spark targets a heavy
@@ -265,7 +265,7 @@ The migration is additive on the engine side — `Application` and its helpers s
   the safety proof for lockless execution. Conflicts are caught at
   registration time (no `RefCell` runtime-panic safety net).
 - Migrate `window` and `input` plugins to ECS-style (state in Resources)
-- App main loop runs the schedule each frame
+- App main loop runs the stages each frame
 
 #### M5 — Sprites via ECS
 - Add `assets` crate with texture loading

@@ -82,17 +82,23 @@ do not refile it. Originally filed as #25 and closed as stale.
   **sequential** but the DAG/batch structure is built now.
 - *Stage-shape migration:* replace the M1–M3 stand-in
   (`pub mod stages { pub const STARTUP: &str = "startup"; … }` in
-  `spark-core`) with the canonical `pub enum Schedule { Startup, First,
+  `spark-core`) with the canonical, **closed** `pub enum Stage { Startup, First,
   PreUpdate, FixedUpdate, Update, PostUpdate, Render, Last }` from
   ECS_DESIGN.md. `add_system(stages::FOO, …)` becomes
-  `add_systems(Schedule::Foo, …)`. The enum gives compile-time
+  `add_systems(Stage::Foo, …)`. The enum gives compile-time
   exhaustiveness for the editor's stage view and removes the
-  stringly-typed footgun. Existing callers (#9, #12) are updated in the
-  same PR.
-- *Workload labels:* introduce `#[derive(WorkloadLabel)]` (proc-macro in
-  `spark-ecs-macros`) and `app.add_workload(label, Schedule::Foo, |w| {…})`
+  stringly-typed footgun. `Stage` is **closed**: one frame timeline means
+  one shared phase set, so a subsystem extends the frame via *workloads*,
+  not new stages. A genuinely new global phase is a deferred,
+  non-breaking upgrade — widen to `impl StageLabel`, and existing
+  `Stage::Foo` calls still compile. Existing callers (#9, #12) are
+  updated in the same PR.
+- *Workload labels:* introduce a `WorkloadLabel` trait + `#[derive(WorkloadLabel)]`
+  (proc-macro in `spark-ecs-macros`), applied to a *per-subsystem enum* — the
+  derive matches over its variants to generate per-variant identity + name —
+  and `app.add_workload(label, Stage::Foo, |w| {…})`
   per ECS_DESIGN.md. Workloads are how plugins group related systems
-  under a name; they sit *inside* a `Schedule` and are the granularity
+  under a name; they sit *inside* a `Stage` and are the granularity
   the scheduler topo-sorts and batches.
 - *Decisions:* **B2** (explicit ordering + topo-sort, not registration order);
   **C1** (`Access` + DAG now, parallel executor committed for M4).
