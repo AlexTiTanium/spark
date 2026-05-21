@@ -22,7 +22,7 @@ Guiding rule: **build the engine the game needs, not a general-purpose engine.**
 
 - **ECS-centric.** Everything that lives in the world is either an Entity (many, dynamic) or a Resource (one, unique). No global state outside the ECS.
 - **Modular by Cargo crate.** Each engine module is a separate `lib/*` crate with its own dependencies; the game binary in `src/` sits on top. A new crate is justified by a distinct architectural layer (windowing, rendering, input, ECS, audio) — engine-wide infrastructure (logging, errors, math, time, ids) lives as modules inside `spark-core`, not as standalone crates.
-- **Boot harness, then plugins.** Pre-ECS (M1–M3) the binary uses `spark_core::Application` — a small builder owning config and the boot sequence (logging init, window startup, top-level error type). Post-ECS (M4+) `Application` gains `add_plugin`, `world`, and the schedule driver; engine and game crates expose `Plugin`s that register their Resources and Systems. The API grows additively; nothing gets ripped out.
+- **Plugin-driven from day one.** The binary uses `spark_core::Application` — an ordered list of `Plugin`s plus the boot sequence (logging init, window startup, top-level error type). `add_plugin`, `world`, and `add_resource` are there from M1; what M4+ adds is the ECS read-side — `Res`/`ResMut` system params, the `Workload` machinery, and the schedule driver — so each `Plugin` can register Systems, not just Resources. The API grows additively; nothing gets ripped out.
 - **Separation of concerns.** Process-wide state (`tracing` subscriber, panic hook, root `EngineError`) lives in `spark-core`. Per-layer events and errors live in their layer crate (`WindowError` in `spark-window`, etc.). Libraries never install global state — that's the boot harness's job.
 - **Two clocks.** Fixed-timestep simulation (60 Hz) for game logic; variable-rate render for display.
 - **Deterministic simulation.** No `HashMap` iteration in sim systems — keeps the door open for save/replay/multiplayer later.
@@ -169,26 +169,27 @@ Game UI is built on vanilla `egui` through M7–M13; the custom stack is compose
 
 ## Plugin pattern
 
-### M1–M3 — `spark_core::Application` boot harness (no ECS yet)
+### M1–M3 — `spark_core::Application`, plugin-driven from day one
 
-Without ECS there are no Resources or Stages for a `Plugin` trait to register with, so the "plugin" idea is collapsed into a small boot harness — `spark_core::Application`. It owns config + boot order (tracing init, root error type, window startup):
+There's no ECS read-side yet (no `Res`/`ResMut` system params, no schedule driver), but the binary is **already plugin-driven**: `spark_core::Application` owns an ordered list of `Plugin`s plus the boot order (tracing init, root error type, window startup). Every subsystem is a `Plugin` — there are no `.with_window` / `.with_log`-style builder methods.
 
 ```rust
-// /src/main.rs (M1)
+// /src/main.rs (M1–M3)
 fn main() -> Result<(), spark_core::EngineError> {
     spark_core::Application::new()
-        .with_window(
-            WindowConfig::default()
+        .add_plugin(LogPlugin)
+        .add_plugin(WindowPlugin {
+            config: WindowConfig::default()
                 .with_title("Spark")
                 .with_size(1280, 720),
-        )
+        })
         .run()
 }
 ```
 
-The builder grows additively as M1→M3 progresses: M1 adds `.with_window`; the input PR adds `.with_input`; M2 adds `.with_render`. Earlier methods stay valid through every later milestone.
+The set of plugins grows additively as milestones land — the log PR adds `LogPlugin`, the window PR adds `WindowPlugin`, an input PR adds `InputPlugin` — but the shape (`new().add_plugin(...).run()`) is fixed from M1.
 
-### M4 onward — formal `App` + `Plugin` (with ECS)
+### M4 onward — Systems + the schedule driver (the ECS read-side)
 
 `spark-ecs` already exposes the `World` + `add_resource` value-verb that `Application` embeds today; `Plugin`/`add_plugin` are wired in `spark-core`. What still lands in M4 is the read side — `Res<T>` / `ResMut<T>` system params, the `Workload` machinery, and the schedule driver (ECS_DESIGN.md stage 14). At that point each engine crate exposes a `Plugin` that registers its Resources and Systems:
 

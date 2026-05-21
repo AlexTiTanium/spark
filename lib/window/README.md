@@ -139,7 +139,8 @@ gives us a uniform Rust interface:
 
 The loop is built once inside [`run`], then handed to winit via
 `run_app(&mut runner)`. The runner owns the [`Application`] that was
-handed to it from the [`set_runner`](`Application::set_runner`)
+handed to it from the
+[`set_runner`](../spark_core/struct.Application.html#method.set_runner)
 closure. On every `WindowEvent::RedrawRequested`, the runner ticks
 the per-frame stages, then asks winit for the next redraw:
 
@@ -324,3 +325,6 @@ Both variants wrap the underlying `winit` error via `#[from]`, so the
 full error chain is preserved through `std::error::Error::source`.
 
 [`WindowError`]: enum.WindowError.html
+[`Application`]: ../spark_core/struct.Application.html
+[`spark_ecs::Commands`]: ../spark_ecs/struct.Commands.html
+[`spark_ecs::World`]: ../spark_ecs/struct.World.html
