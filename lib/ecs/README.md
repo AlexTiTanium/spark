@@ -19,11 +19,12 @@ other engine crate (including `spark-core`) sits on top.
 > `cargo test --doc -p spark-ecs`. Code blocks tagged ` ```rust,ignore `
 > show types that don't exist yet (`Commands`, `Workload`, `Event`);
 > they're the spec of what's coming, not what's runnable. `Query`
-> exists today for `&T` / `&mut T` and every `&` / `&mut` combination
+> exists today for `&T` / `&mut T`, every `&` / `&mut` combination
 > of 2-/3-/4-/5-tuples (including multi-mut at any arity, e.g.
-> `(&mut A, &mut B, &mut C)`); the spec-frozen extensions (filters,
-> `Option<&T>`, `Entity`-as-data) are marked inline as ⏳ in the
-> *What's next* section. The forward-looking
+> `(&mut A, &mut B, &mut C)`), and the filter generic `Query<D, F>`
+> (`With` / `Without` / `And` / `Or`); the remaining spec-frozen
+> extensions (`Option<&T>`, `Entity`-as-data) are marked inline as ⏳
+> in the *What's next* section. The forward-looking
 > design is settled — see [`docs/ECS_DESIGN.md`](../../docs/ECS_DESIGN.md)
 > for the full engineering reference and [`docs/PLAN.md`](../../docs/PLAN.md)
 > for the milestone plan.
@@ -901,7 +902,7 @@ Three parameter types ship today:
 |-|-|
 | `Res<T>` | Immutable borrow of resource `T`. Derefs to `&T`. |
 | `ResMut<T>` | Mutable borrow of resource `T`. Derefs to `&mut T`. |
-| `Query<D>` | Walks every entity matching the data shape `D` (a single `&T`/`&mut T` or a 2-/3-/4-tuple of those). See *Walking entities with `Query<D>`* below. |
+| `Query<D, F>` | Walks every entity matching the data shape `D` (a single `&T`/`&mut T` or a tuple of those), optionally narrowed by a filter `F` (`With`/`Without`/`And`/`Or`; defaults to no filter). See *Walking entities with `Query<D>`* below. |
 
 The wrapper supports arities 0..=4. Adding a fifth would mean adding
 one more line to the `impl_into_system!` macro list.
@@ -1054,9 +1055,10 @@ Tuples scale flat to arity 4 (`(&A, &B, &C)`, `(&A, &B, &C, &D)`, with
 the same mut-driver and multi-mut variants as arity 2). Tuples do
 **not** nest: `Query<((&A, &B), &C)>` and `Query<(&A, (&B, &C))>` are
 not supported shapes — flatten to `Query<(&A, &B, &C)>` instead.
-See *`Query<D, F>`: finding entities* under *What's next* below for
-the full table of data shapes, plus the filters and `Entity`-as-data
-shapes coming in follow-up PRs.
+See *Narrowing with filters* just below for `With`/`Without`/`And`/`Or`,
+and *`Query<D, F>`: finding entities* under *What's next* for the full
+data-shape table plus the `Entity`-as-data and `Option<&T>` shapes still
+coming in follow-up PRs.
 
 **Two-mut join — both elements mutable.** Useful when one component
 needs to be both read and mutated alongside another (e.g. apply drag to
@@ -1128,6 +1130,74 @@ with a message naming the offending component. The M4 scheduler will
 hoist same-type conflicts *across* systems to registration-time
 errors.
 
+### Narrowing with filters: `Query<D, F>`
+
+A second generic narrows *which* entities iterate without changing what
+each yields. `Query<&Plant, With<Operational>>` reads `Plant` and still
+yields `&Plant` — just for the operational ones. `F` defaults to `()`
+(match everything), so a plain `Query<D>` *is* `Query<D, ()>`.
+
+Four filters ship today:
+
+| Filter | Keeps entities that… |
+|-|-|
+| `With<T>` | have a `T` (without fetching it) |
+| `Without<T>` | lack a `T` |
+| `And<(F1, F2, …)>` | match **every** inner filter |
+| `Or<(F1, F2, …)>` | match **any** inner filter |
+
+`And` is spelled out explicitly rather than as a bare tuple, so it stays
+symmetric with `Or` and unambiguous when the two nest
+(`And<(With<Online>, Or<(With<Powered>, With<Backup>)>)>`). That's a
+deliberate divergence from Bevy's implicit tuple-AND.
+
+```rust
+// ✅ Compiles and runs today.
+use spark_ecs::{And, Component, Or, Query, With, Without, World};
+
+#[derive(Component)]
+struct Plant { output_mw: f32 }
+#[derive(Component)]
+struct Operational;          // marker — zero-sized
+#[derive(Component)]
+struct UnderMaintenance;
+#[derive(Component)]
+struct Backup;
+
+let mut world = World::new();
+world.spawn().insert(Plant { output_mw: 4.0 }).insert(Operational);
+world.spawn()
+    .insert(Plant { output_mw: 9.0 })
+    .insert(Operational)
+    .insert(UnderMaintenance);
+world.spawn().insert(Plant { output_mw: 2.0 }).insert(Backup);
+
+// With: operational plants (online or not).
+let operational = Query::<&Plant, With<Operational>>::from_world(&world)
+    .iter()
+    .count();
+assert_eq!(operational, 2);
+
+// And: operational AND not under maintenance.
+type Healthy = And<(With<Operational>, Without<UnderMaintenance>)>;
+let healthy: f32 = Query::<&Plant, Healthy>::from_world(&world)
+    .iter()
+    .map(|p| p.output_mw)
+    .sum();
+assert_eq!(healthy, 4.0);
+
+// Or: has grid power *or* a backup source.
+type Supplied = Or<(With<Operational>, With<Backup>)>;
+let supplied = Query::<&Plant, Supplied>::from_world(&world).iter().count();
+assert_eq!(supplied, 3);
+```
+
+`With<T>` reports a **read** of `T` to the access model, so
+`Query<&mut T, With<T>>` is a self-conflict and panics at `from_world`,
+exactly like `Query<(&mut T, &T)>`. `Without<T>` reports no access — it
+is a pure exclusion. Either way filters ride on top of the safe
+iteration path and add no `unsafe`.
+
 # What's next
 
 The types below are **spec-frozen**. Some ship today (✅) and some
@@ -1144,10 +1214,10 @@ says how to narrow the set.
 > **Status at a glance.** Data shapes for `&T`, `&mut T`, and every
 > `&` / `&mut` combination of flat 2-/3-/4-/5-tuples (including
 > multi-mut at any arity) are ✅ shipping today via
-> [`Query<D>`](struct.Query.html). Filters (`With`/`Without`),
-> `Option<&T>`, and `Entity`-as-data are ⏳ follow-up PRs. Each
-> subsection below calls out which bits are runnable now and which
-> are spec-frozen.
+> [`Query<D>`](struct.Query.html), as is the filter generic
+> `Query<D, F>` (`With` / `Without` / `And` / `Or`). `Option<&T>` and
+> `Entity`-as-data remain ⏳ follow-up PRs. Each subsection below calls
+> out which bits are runnable now and which are spec-frozen.
 
 ### Data shapes
 
@@ -1230,8 +1300,9 @@ assert!((x - 1.0).abs() < f32::EPSILON);
 
 ### Filters
 
-⏳ **Coming next.** Add a second type parameter to narrow further.
-Filters don't *fetch* the component, they only *gate* the iteration:
+✅ **Ships today.** A second type parameter narrows the entity set
+without fetching anything — filters only *gate* the iteration. See
+*Narrowing with filters* above for runnable examples; the shapes:
 
 ```rust,ignore
 // Operational plants only (Operational is a marker — zero-sized).
@@ -1240,12 +1311,15 @@ Query<&Plant, With<Operational>>
 // Workers that don't currently have a job.
 Query<&Worker, Without<CurrentJob>>
 
-// Multiple filters as a tuple = AND.
-Query<&Plant, (With<Operational>, Without<UnderMaintenance>)>
+// And<(…)> = every inner filter must match. Spelled explicitly (not a
+// bare tuple) so it stays symmetric with Or.
+Query<&Plant, And<(With<Operational>, Without<UnderMaintenance>)>>
 
-// Or<(F1, F2)> = either filter matches.
-// (Deferred — ships after the initial With/Without pair lands.)
-Query<&Plant, Or<(With<Operational>, With<UnderMaintenance>)>>
+// Or<(…)> = any inner filter matches.
+Query<&Plant, Or<(With<Operational>, With<Backup>)>>
+
+// And / Or nest freely — each is itself a filter.
+Query<&Plant, And<(With<Online>, Or<(With<Powered>, With<Backup>)>)>>
 ```
 
 ### All variants at a glance
@@ -1266,18 +1340,18 @@ Query<(&A, &B, &C, &D, &E)>                  // ✅ arity 5: all 32 combos
 Query<(&mut A, &mut B, &mut C, &mut D, &mut E)>  // ✅ (incl. fully mutable)
 Query<Entity>                                // ⏳ just the ID, no component
 Query<(Entity, &Position, &mut Velocity)>    // ⏳ ID + multiple components
-Query<&Position, ()>                         // ⏳ explicit empty filter
+Query<&Position, ()>                         // ✅ explicit empty filter (the default)
 
-// — FILTERS (initial set) —          ⏳ filters PR
+// — FILTERS —                        ✅ filters PR
 With<T>            // entity must have T (but don't fetch T)
 Without<T>         // entity must NOT have T
-(F1, F2, F3)       // AND of filters
+And<(F1, F2, …)>   // AND of filters (explicit, not a bare tuple)
+Or<(F1, F2, …)>    // OR of filters — nests with And
 
-// — OPTIONAL DATA —                  ⏳ optional-fetch PR
+// — OPTIONAL DATA —                  ⏳ optional-fetch PR (added when needed)
 Option<&T>         // fetch T if present, give None otherwise
 
 // — DEFERRED —                       ⏳ later follow-ups
-Or<(F1, F2)>       // OR of filters — after With/Without
 Changed<T>         // only entities whose T was mutated this frame
 Added<T>           // only entities that gained T this frame
 
@@ -1308,7 +1382,8 @@ cities-with-names runs in 50 iterations, not 50 × 200.
 | `Query<(&A, &B)>` | O(min(\|A\|, \|B\|)) — driver picks smaller |
 | `Query<&A, With<B>>` | O(\|A\|) + one sparse lookup per item |
 | `Query<&A, Without<B>>` | O(\|A\|) + one sparse lookup per item |
-| `Query<Option<&T>>` | O(over the rest of the query) — Option doesn't gate |
+| `Query<&A, And<(With<B>, With<C>)>>` | O(\|A\|) + one sparse lookup per filter term per item |
+| `Query<(&A, Option<&T>)>` | O(over the rest of the query) — Option doesn't gate (⏳) |
 
 Filters are essentially free: `With<T>`/`Without<T>` are a single
 sparse lookup per candidate entity, no component fetch.
@@ -1741,13 +1816,13 @@ End of frame. Back to Step 1 for frame 43.
 | `Query<(&A, &B)>` | Entities with both `A` and `B` | `(&A, &B)` |
 | `Query<(&mut A, &B)>` | Entities with both | `(&mut A, &B)` |
 | `Query<(&A, &B, &C)>` | Entities with all three | `(&A, &B, &C)` |
-| `Query<Entity>` | Every alive entity | `Entity` |
-| `Query<(Entity, &T)>` | Entities with `T`, including ID | `(Entity, &T)` |
-| `Query<(&T, Option<&U>)>` | Entities with `T`, `U` if present | `(&T, Option<&U>)` |
+| `Query<Entity>` ⏳ | Every alive entity | `Entity` |
+| `Query<(Entity, &T)>` ⏳ | Entities with `T`, including ID | `(Entity, &T)` |
+| `Query<(&T, Option<&U>)>` ⏳ | Entities with `T`, `U` if present | `(&T, Option<&U>)` |
 | `Query<&T, With<U>>` | Entities with both `T` and `U`, only fetch `T` | `&T` |
 | `Query<&T, Without<U>>` | Entities with `T` but not `U` | `&T` |
-| `Query<&T, (With<U>, Without<V>)>` | AND of filters | `&T` |
-| `Query<&T, Or<(With<U>, With<V>)>>` | OR of filters (*deferred*) | `&T` |
+| `Query<&T, And<(With<U>, Without<V>)>>` | AND of filters | `&T` |
+| `Query<&T, Or<(With<U>, With<V>)>>` | OR of filters | `&T` |
 
 Iteration methods on every `Query`:
 

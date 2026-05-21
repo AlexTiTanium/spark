@@ -167,10 +167,11 @@ pub(super) fn player_regen(mut q: Query<(&Player, &mut Health)>) {
 }
 
 /// **`Query<(&Position, &Player)>`** — shared two-tuple join that
-/// uses a zero-sized marker as a "filter via tuple element". Only
-/// the player-tagged entity yields. (Real `With<T>` filters arrive
-/// in a follow-up PR; today the marker-in-tuple pattern fills the
-/// gap.)
+/// uses a zero-sized marker as a tuple element. Only the player-tagged
+/// entity yields. This pattern *fetches* `Player` (you get `&Player` in
+/// the item and ignore it); when you only need to *narrow* the set
+/// without reading the marker, prefer the `With<Player>` filter — see
+/// the [`super::filters`] demo for `With` / `Without` / `And` / `Or`.
 pub(super) fn report_player_position(q: Query<(&Position, &Player)>) {
     for (pos, _player) in q.iter() {
         debug!(
