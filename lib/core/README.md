@@ -11,9 +11,9 @@ one. Brings four things together:
   plugin is a *registrar*: it tells the `Application` what resources
   to insert, what systems to run, and (optionally) what runner to
   use.
-- **[`stages`]** — named slots in the schedule (`STARTUP`,
-  `PRE_UPDATE`, `UPDATE`, `POST_UPDATE`, plus any custom names you
-  introduce). `run_stage` flushes pending
+- **[`Stage`]** — the closed enum of per-frame phases (`Startup`,
+  `PreUpdate`, `Update`, `PostUpdate`, …) in a fixed execution order.
+  `run_stage` flushes pending
   [`Commands`](../spark_ecs/struct.Commands.html) at every stage
   boundary.
 - **[`EngineError`]** — the erased error type that flows through every
@@ -33,7 +33,7 @@ writes systems adds `spark-ecs` to its `Cargo.toml` alongside
 
 [`Application`]: struct.Application.html
 [`Plugin`]: trait.Plugin.html
-[`stages`]: stages/index.html
+[`Stage`]: enum.Stage.html
 [`EngineError`]: type.EngineError.html
 [`World`]: ../spark_ecs/struct.World.html
 
@@ -194,7 +194,7 @@ A **system** is a regular Rust function. Its parameters tell the
 engine what to inject when it's called:
 
 ```rust
-use spark_core::{Application, stages};
+use spark_core::{Application, Stage};
 use spark_ecs::{Res, ResMut, Resource};
 
 #[derive(Resource)]
@@ -216,8 +216,8 @@ fn high_score_alarm(time: Res<GameTime>, score: Res<Score>) {
 let mut app = Application::new();
 app.add_resource(GameTime { elapsed: 0.0, dt: 0.016 })
    .add_resource(Score(42))
-   .add_system(stages::UPDATE, integrate_time)
-   .add_system(stages::UPDATE, high_score_alarm);
+   .add_system(Stage::Update, integrate_time)
+   .add_system(Stage::Update, high_score_alarm);
 ```
 
 The engine figures out which resources each system needs from its
@@ -230,14 +230,14 @@ Today, systems accept 0 to 4 [`SystemParam`] arguments of types
 an ECS) land later as additional parameter types — same signature
 mechanism.
 
-> **`add_startup_system` vs `add_system(stages::STARTUP, …)`.** Both
+> **`add_startup_system` vs `add_system(Stage::Startup, …)`.** Both
 > fire during the startup phase of `run()`, but they're not the same:
 >
 > - `add_startup_system(|| Ok(()))` — a fallible *closure* with no
->   parameters, runs *before* STARTUP-stage systems. Use it for
+>   parameters, runs *before* Startup-stage systems. Use it for
 >   world-independent setup that can fail: installing a global
 >   subscriber, opening a file, parsing a config.
-> - `add_system(stages::STARTUP, my_fn)` — a regular system with
+> - `add_system(Stage::Startup, my_fn)` — a regular system with
 >   `Res`/`ResMut` params, runs *after* the closures. Use it for
 >   initialising state that lives in the `World`.
 
@@ -245,38 +245,38 @@ mechanism.
 
 ## Stages: when systems run
 
-A **stage** is a named slot in the schedule — just a `&'static str`.
-Spark ships four:
+A **stage** is one phase of the frame. The stages are the variants of a
+single closed enum, [`Stage`], and the engine runs them in a fixed
+order. Spark defines eight; four are driven automatically today:
 
-- `stages::STARTUP` — fires once during `Application::run`, after
-  every `add_startup_system` closure has finished.
-- `stages::PRE_UPDATE` — first per-frame stage. Convention: input
-  gather, time tick, anything that prepares state the rest of the
-  frame consumes.
-- `stages::UPDATE` — main per-frame stage. The bulk of game logic
+- `Stage::Startup` — fires once during `Application::run`, after every
+  `add_startup_system` closure has finished.
+- `Stage::First` — the very first per-frame stage. *(Reserved — defined
+  now, nothing drives it yet.)*
+- `Stage::PreUpdate` — input gather, time tick, anything that prepares
+  state the rest of the frame consumes.
+- `Stage::FixedUpdate` — fixed-timestep simulation, meant to run N
+  times per frame off an accumulator. *(Reserved — not yet auto-driven.)*
+- `Stage::Update` — main per-frame stage. The bulk of game logic
   (movement, AI, spawning, despawning) lives here.
-- `stages::POST_UPDATE` — last per-frame stage. Convention: cleanup
-  and bookkeeping that should run after `UPDATE`'s commands have
-  flushed and the world has settled.
+- `Stage::PostUpdate` — cleanup and bookkeeping that should run after
+  `Update`'s commands have flushed and the world has settled.
+- `Stage::Render` — build draw lists, submit GPU work. *(Reserved — not
+  yet auto-driven.)*
+- `Stage::Last` — the very last per-frame stage. *(Reserved — not yet
+  auto-driven.)*
 
-`WindowPlugin`'s runner ticks the three per-frame stages on every
-`RedrawRequested`. With no window driver, you can tick them yourself
-with `app.run_stage(name)` — useful for headless tests.
-
-Each `run_stage` call **runs every system in registration order,
-then flushes pending [`Commands`](../spark_ecs/struct.Commands.html)
-into the world**. A `commands.spawn().insert(…)` queued in `UPDATE`
-becomes visible to `POST_UPDATE` of the same frame, and to every
-system in every later frame.
-
-You can introduce your own stages by writing a string constant. No
-registry, no enum, no central list to update:
+`WindowPlugin`'s runner ticks `PreUpdate → Update → PostUpdate` on every
+`RedrawRequested`; `Startup` runs once inside `run()`. The reserved
+stages are defined so call sites (and the editor's future stage view)
+can name them — their automatic drivers land with the scheduler. With no
+window driver you can tick any stage yourself with `app.run_stage(...)`
+— useful for headless tests, and the only way the reserved stages run
+today:
 
 ```rust
-use spark_core::Application;
+use spark_core::{Application, Stage};
 use spark_ecs::{ResMut, Resource};
-
-const FIXED_UPDATE: &str = "fixed_update";
 
 #[derive(Resource)]
 struct Tick(u32);
@@ -287,17 +287,28 @@ fn bump(mut t: ResMut<Tick>) {
 
 let mut app = Application::new();
 app.add_resource(Tick(0))
-   .add_system(FIXED_UPDATE, bump);
+   .add_system(Stage::FixedUpdate, bump);
 
-app.run_stage(FIXED_UPDATE);            // Tick = 1
-app.run_stage(FIXED_UPDATE);            // Tick = 2
+app.run_stage(Stage::FixedUpdate);      // Tick = 1
+app.run_stage(Stage::FixedUpdate);      // Tick = 2
 ```
 
-Systems on `STARTUP` fire automatically inside `run()`; systems on
-the per-frame stages run automatically inside `WindowPlugin`'s
-runner. Custom stages need a caller to invoke `run_stage(name)` to
-drive them (M3 ships an accumulator-driven `FIXED_UPDATE` driver as
-a follow-up).
+Each `run_stage` call **runs every system in registration order, then
+flushes pending [`Commands`](../spark_ecs/struct.Commands.html) into the
+world**. A `commands.spawn().insert(…)` queued in `Update` becomes
+visible to `PostUpdate` of the same frame, and to every system in every
+later frame.
+
+> **Why a closed enum, not string labels?** There is exactly one frame
+> timeline, so there is one shared set of phases. A closed enum makes a
+> `match` over stages exhaustive and turns a misspelled stage into a
+> *compile error* — rather than a system silently registered to a slot
+> nothing ever runs, which is what a `&'static str` label allowed. (The
+> variants are *listed* in run order for readability; the order itself
+> comes from the `run_stage` call sequence, not from the enum.) A subsystem that needs
+> its own internal ordering will group related systems into a *workload*
+> inside a stage (a later scheduler feature), not by inventing a new
+> global stage.
 
 ## The `run()` lifecycle
 
@@ -306,7 +317,7 @@ a follow-up).
 ```text
    1. drain `add_startup_system` closures, in registration order
       └─ first Err short-circuits — `run` returns the error
-   2. run every system on `stages::STARTUP` once, in registration
+   2. run every system on `Stage::Startup` once, in registration
       order (these are infallible — `fn(&World) -> ()`)
    3. if a runner is installed, hand the `Application` to it
       └─ runner blocks until exit (typically winit's event loop)
@@ -318,7 +329,7 @@ With no runner installed, `run` returns `Ok(())` right after step 2
 cleanly:
 
 ```rust
-use spark_core::{Application, stages};
+use spark_core::{Application, Stage};
 use spark_ecs::{ResMut, Resource};
 
 #[derive(Resource)]
@@ -330,11 +341,11 @@ fn bump(mut c: ResMut<Counter>) {
 
 let mut app = Application::new();
 app.add_resource(Counter(0))
-   .add_system(stages::STARTUP, bump);
+   .add_system(Stage::Startup, bump);
 
 app.run().unwrap();
-// Counter is now 1. No runner ran — `run` returned right after
-// STARTUP because nothing called `set_runner`.
+// Counter is now 1. No runner ran — `run` returned right after the
+// Startup stage because nothing called `set_runner`.
 ```
 
 ## Runners: taking over the main thread
@@ -348,18 +359,18 @@ until done" call.
 Install one with `Application::set_runner`:
 
 ```rust
-use spark_core::{Application, EngineError, stages};
+use spark_core::{Application, EngineError, Stage};
 
 Application::new()
     .set_runner(|mut app: Application| -> Result<(), EngineError> {
         // …drive the application here. For a windowed game this is
         // where `winit::EventLoop::run_app(&mut handler)` goes, and
-        // the handler calls `app.run_stage(stages::UPDATE)` on every
+        // the handler calls `app.run_stage(Stage::Update)` on every
         // RedrawRequested. For tests, a tick-N loop suffices:
         for _ in 0..3 {
-            app.run_stage(stages::PRE_UPDATE);
-            app.run_stage(stages::UPDATE);
-            app.run_stage(stages::POST_UPDATE);
+            app.run_stage(Stage::PreUpdate);
+            app.run_stage(Stage::Update);
+            app.run_stage(Stage::PostUpdate);
         }
         Ok(())
     })
@@ -381,7 +392,7 @@ Two things to know:
 
 The closure's signature — `FnOnce(Application) -> Result<(), EngineError>` —
 is stable: M3's `WindowPlugin` uses it to own the `Application` and
-tick `PRE_UPDATE → UPDATE → POST_UPDATE` on every winit redraw.
+tick `PreUpdate → Update → PostUpdate` on every winit redraw.
 
 ## Errors
 

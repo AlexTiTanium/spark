@@ -8,7 +8,7 @@ use spark_ecs::{IntoSystem, Resource, World};
 
 use crate::error::EngineError;
 use crate::plugin::Plugin;
-use crate::stage::stages;
+use crate::stage::Stage;
 
 type StartupSystem = Box<dyn FnOnce() -> Result<(), EngineError>>;
 type StageSystem = Box<dyn FnMut(&World) + 'static>;
@@ -23,7 +23,7 @@ type Runner = Box<dyn FnOnce(Application) -> Result<(), EngineError>>;
 ///    systems, and/or installs a runner).
 /// 2. Startup closures are *drained* in registration order with `?`
 ///    short-circuiting on the first error.
-/// 3. `stages::STARTUP` systems run once, in registration order, with
+/// 3. [`Stage::Startup`] systems run once, in registration order, with
 ///    access to the populated [`World`].
 /// 4. The runner — if any — receives an [`Application`] and blocks.
 ///
@@ -51,7 +51,7 @@ type Runner = Box<dyn FnOnce(Application) -> Result<(), EngineError>>;
 pub struct Application {
     world: World,
     startup: Vec<StartupSystem>,
-    stages: HashMap<&'static str, Vec<StageSystem>>,
+    stages: HashMap<Stage, Vec<StageSystem>>,
     runner: Option<Runner>,
 }
 
@@ -166,7 +166,7 @@ impl Application {
     /// # Examples
     ///
     /// ```
-    /// use spark_core::{stages, Application};
+    /// use spark_core::{Application, Stage};
     /// use spark_ecs::{ResMut, Resource};
     ///
     /// #[derive(Resource)]
@@ -174,9 +174,9 @@ impl Application {
     ///
     /// let mut app = Application::new();
     /// app.add_resource(Counter(0))
-    ///    .add_system(stages::UPDATE, |mut c: ResMut<Counter>| { c.0 += 1; });
-    /// app.run_stage(stages::UPDATE);
-    /// app.run_stage(stages::UPDATE);
+    ///    .add_system(Stage::Update, |mut c: ResMut<Counter>| { c.0 += 1; });
+    /// app.run_stage(Stage::Update);
+    /// app.run_stage(Stage::Update);
     /// assert_eq!(app.world().resource::<Counter>().0, 2);
     /// ```
     #[must_use]
@@ -215,17 +215,17 @@ impl Application {
     /// today, [`Res<T>`](spark_ecs::Res) and
     /// [`ResMut<T>`](spark_ecs::ResMut) — for arities 0..=4.
     ///
-    /// Systems registered on [`stages::STARTUP`](crate::stages::STARTUP)
-    /// run once during [`run`](Self::run); systems on other stages
-    /// (e.g. [`stages::UPDATE`](crate::stages::UPDATE)) run when a
-    /// caller invokes [`run_stage`](Self::run_stage) with that stage
-    /// name. The per-frame driver that ticks `UPDATE` automatically
-    /// lands with the next PR.
+    /// Systems registered on [`Stage::Startup`] run once during
+    /// [`run`](Self::run); systems on the per-frame stages — e.g.
+    /// [`Stage::Update`] — run when a caller invokes
+    /// [`run_stage`](Self::run_stage) with that stage, which
+    /// `WindowPlugin`'s runner does every frame for the
+    /// `PreUpdate → Update → PostUpdate` trio.
     ///
     /// # Examples
     ///
     /// ```
-    /// use spark_core::{stages, Application};
+    /// use spark_core::{Application, Stage};
     /// use spark_ecs::{ResMut, Resource};
     ///
     /// #[derive(Resource)]
@@ -237,11 +237,11 @@ impl Application {
     ///
     /// let mut app = Application::new();
     /// app.add_resource(Counter(0))
-    ///    .add_system(stages::STARTUP, tick);
+    ///    .add_system(Stage::Startup, tick);
     /// app.run().unwrap();
-    /// // The STARTUP system fired once during `run`.
+    /// // The Startup system fired once during `run`.
     /// ```
-    pub fn add_system<S, Marker>(&mut self, stage: &'static str, system: S) -> &mut Self
+    pub fn add_system<S, Marker>(&mut self, stage: Stage, system: S) -> &mut Self
     where
         S: IntoSystem<Marker>,
     {
@@ -258,10 +258,10 @@ impl Application {
     ///
     /// The flush is what makes [`Commands`](spark_ecs::Commands)
     /// usable across stages: a system that runs in
-    /// [`stages::STARTUP`] and queues a `spawn().insert(Position)` has
+    /// [`Stage::Startup`] and queues a `spawn().insert(Position)` has
     /// the resulting entity visible to systems in
-    /// [`stages::PRE_UPDATE`] (and every later stage) — but *not* to
-    /// later systems within the same `STARTUP` pass. One flush per
+    /// [`Stage::PreUpdate`] (and every later stage) — but *not* to
+    /// later systems within the same `Startup` pass. One flush per
     /// stage boundary.
     ///
     /// No-op for stages that have no registered systems (the flush
@@ -270,7 +270,7 @@ impl Application {
     /// # Examples
     ///
     /// ```
-    /// use spark_core::{stages, Application};
+    /// use spark_core::{Application, Stage};
     /// use spark_ecs::{ResMut, Resource};
     ///
     /// #[derive(Resource)]
@@ -282,13 +282,13 @@ impl Application {
     ///
     /// let mut app = Application::new();
     /// app.add_resource(Counter(0))
-    ///    .add_system(stages::UPDATE, tick);
-    /// app.run_stage(stages::UPDATE);
-    /// app.run_stage(stages::UPDATE);
+    ///    .add_system(Stage::Update, tick);
+    /// app.run_stage(Stage::Update);
+    /// app.run_stage(Stage::Update);
     /// assert_eq!(app.world().resource::<Counter>().0, 2);
     /// ```
-    pub fn run_stage(&mut self, stage: &str) {
-        if let Some(systems) = self.stages.get_mut(stage) {
+    pub fn run_stage(&mut self, stage: Stage) {
+        if let Some(systems) = self.stages.get_mut(&stage) {
             for system in systems {
                 system(&self.world);
             }
@@ -326,12 +326,11 @@ impl Application {
     /// 1. Drains every closure registered with
     ///    [`add_startup_system`](Self::add_startup_system) in
     ///    registration order, propagating the first error.
-    /// 2. Runs every system on
-    ///    [`stages::STARTUP`](crate::stages::STARTUP) once, in
+    /// 2. Runs every system on [`Stage::Startup`] once, in
     ///    registration order.
     /// 3. Hands an [`Application`] to the runner (typically the winit
     ///    event loop, which blocks until the window closes). With no
-    ///    runner, returns `Ok(())` right after STARTUP.
+    ///    runner, returns `Ok(())` right after the Startup stage.
     ///
     /// Takes `&mut self` so it can finish off a builder chain:
     /// `Application::new().add_plugin(_).run()`.
@@ -341,7 +340,7 @@ impl Application {
     /// Returns the first error any startup closure produced, or the
     /// runner's return value if startup succeeded. Closures convert
     /// their typed errors to [`EngineError`] via `?` before they reach
-    /// this function. STARTUP-stage *systems* are infallible
+    /// this function. Startup-stage *systems* are infallible
     /// (`FnMut(&World)`) — failures must be surfaced through a
     /// resource or a startup closure instead.
     ///
@@ -356,7 +355,7 @@ impl Application {
             system()?;
         }
 
-        self.run_stage(stages::STARTUP);
+        self.run_stage(Stage::Startup);
 
         if let Some(runner) = self.runner.take() {
             runner(std::mem::take(self))?;
@@ -382,7 +381,7 @@ mod tests {
     fn run_auto_executes_startup_stage_systems() {
         let mut app = Application::new();
         app.add_resource(Counter(0))
-            .add_system(stages::STARTUP, bump);
+            .add_system(Stage::Startup, bump);
         app.run().unwrap();
         assert_eq!(app.world.resource::<Counter>().0, 1);
     }
@@ -394,7 +393,7 @@ mod tests {
 
         // Closure runs first; sees Counter == 0, bumps to 10.
         app.add_startup_system(|| Ok(())); // unrelated, just exercise the path
-        app.add_system(stages::STARTUP, |mut c: ResMut<Counter>| {
+        app.add_system(Stage::Startup, |mut c: ResMut<Counter>| {
             // System runs after closures; sets to 10.
             c.0 = 10;
         });
@@ -406,29 +405,33 @@ mod tests {
     fn run_stage_update_runs_registered_systems_in_order() {
         let mut app = Application::new();
         app.add_resource(Counter(0))
-            .add_system(stages::UPDATE, bump)
-            .add_system(stages::UPDATE, bump);
-        app.run_stage(stages::UPDATE);
+            .add_system(Stage::Update, bump)
+            .add_system(Stage::Update, bump);
+        app.run_stage(Stage::Update);
         assert_eq!(app.world.resource::<Counter>().0, 2);
-        app.run_stage(stages::UPDATE);
+        app.run_stage(Stage::Update);
         assert_eq!(app.world.resource::<Counter>().0, 4);
     }
 
     #[test]
-    fn run_stage_unknown_is_noop() {
+    fn run_stage_with_no_registered_systems_is_noop() {
+        // A closed `Stage` can't be misspelled into a phantom bucket
+        // the way a `&str` label could, but running a stage that simply
+        // has no systems registered is still a harmless no-op: the
+        // command flush runs, nothing else does.
         let mut app = Application::new();
         app.add_resource(Counter(7));
-        app.run_stage("does-not-exist");
+        app.run_stage(Stage::Last);
         assert_eq!(app.world.resource::<Counter>().0, 7);
     }
 
     #[test]
     fn run_with_no_runner_returns_after_startup() {
         // Regression: `run` must not hang or return Err when no runner
-        // is installed, even after STARTUP systems fire.
+        // is installed, even after Startup systems fire.
         let mut app = Application::new();
         app.add_resource(Counter(0))
-            .add_system(stages::STARTUP, bump);
+            .add_system(Stage::Startup, bump);
         app.run().unwrap();
     }
 }

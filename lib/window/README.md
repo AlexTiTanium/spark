@@ -144,28 +144,28 @@ closure. On every `WindowEvent::RedrawRequested`, the runner ticks
 the per-frame stages, then asks winit for the next redraw:
 
 ```text
-   ┌────────────────────────────────────────────────┐
-   │  one frame (on RedrawRequested) — TODAY        │
-   │                                                │
-   │   1. app.run_stage(PRE_UPDATE)                 │  ◀── input / time
-   │      → flush queued commands                   │
-   │                                                │
-   │   2. app.run_stage(UPDATE)                     │  ◀── game logic
-   │      → flush queued commands                   │       (movement,
-   │                                                │        spawning)
-   │   3. app.run_stage(POST_UPDATE)                │  ◀── settled-state
-   │      → flush queued commands                   │       bookkeeping
-   │                                                │
-   │   4. window.request_redraw()                   │  ◀── queue next
-   │                                                │       frame
-   └────────────────────────────────────────────────┘
+   ┌──────────────────────────────────────────────────────┐
+   │  one frame (on RedrawRequested) — TODAY              │
+   │                                                      │
+   │   1. app.run_stage(Stage::PreUpdate)                 │  ◀── input / time
+   │      → flush queued commands                         │
+   │                                                      │
+   │   2. app.run_stage(Stage::Update)                    │  ◀── game logic
+   │      → flush queued commands                         │       (movement,
+   │                                                      │        spawning)
+   │   3. app.run_stage(Stage::PostUpdate)                │  ◀── settled-state
+   │      → flush queued commands                         │       bookkeeping
+   │                                                      │
+   │   4. window.request_redraw()                         │  ◀── queue next
+   │                                                      │       frame
+   └──────────────────────────────────────────────────────┘
 ```
 
 Each `run_stage(_)` call runs every system registered to that stage
 in registration order, then drains pending [`spark_ecs::Commands`]
 into the [`spark_ecs::World`]. So a system that calls
-`commands.spawn().insert(Position { … })` in `UPDATE` has its entity
-visible in `POST_UPDATE` of the same frame, and to every system in
+`commands.spawn().insert(Position { … })` in `Update` has its entity
+visible in `PostUpdate` of the same frame, and to every system in
 every later frame.
 
 The control-flow mode is `ControlFlow::Wait`: the OS thread sleeps
@@ -193,15 +193,15 @@ into distinct slots driven by two different winit hooks:
    │   1. drain queued WindowEvents into an            │  ◀── Input
    │      `InputState` resource                        │       collection
    │                                                   │
-   │   2. run FIXED_UPDATE schedule N times            │  ◀── Simulation
+   │   2. run the Stage::FixedUpdate stage N times     │  ◀── Simulation
    │      (60 Hz fixed timestep — deterministic)       │       (60 Hz)
    │                                                   │
-   │   3. run UPDATE schedule once                     │  ◀── Per-frame
+   │   3. run the Stage::Update stage once             │  ◀── Per-frame
    │      (variable rate — animations, ECS commands)   │       game logic
    │                                                   │
    │  RedrawRequested  ┐                               │
    │                   │                               │
-   │   4. run RENDER schedule                          │  ◀── Rendering
+   │   4. run the Stage::Render stage                  │  ◀── Rendering
    │      (push a frame to the GPU)                    │       (variable)
    │                                                   │
    └───────────────────────────────────────────────────┘
@@ -218,7 +218,7 @@ What's different from today:
   iteration; `RedrawRequested` only fires the render schedule. The
   swapchain (via `wgpu`) is what gates `RedrawRequested` cadence, so
   rendering paces against vsync without us doing anything special.
-- **A real `FIXED_UPDATE` stage** with an accumulator, so simulation
+- **A real `Stage::FixedUpdate` driver** with an accumulator, so simulation
   stays deterministic across hardware (a save/replay/multiplayer
   prerequisite).
 - **Per-frame `KeyboardInput` / `MouseInput` events** drain into an
@@ -230,14 +230,15 @@ Each piece grows into its own crate as the milestones land:
 | Capability | Where it'll live | Milestone |
 |-|-|-|
 | Input collection — drain `KeyboardInput` / `MouseInput` into an `InputState` resource | `spark-input` | M3 follow-up |
-| `FIXED_UPDATE` stage + accumulator (60 Hz, deterministic) | `spark-core` | M3 follow-up |
-| `ControlFlow::Wait → Poll` flip + `about_to_wait` driver | `spark-window` | lands with `FIXED_UPDATE` |
-| `RENDER` stage that pushes a frame to the GPU | `spark-render` (`wgpu` + WGSL) | M5 |
+| `Stage::FixedUpdate` driver + accumulator (60 Hz, deterministic) | `spark-core` | M3 follow-up |
+| `ControlFlow::Wait → Poll` flip + `about_to_wait` driver | `spark-window` | lands with `Stage::FixedUpdate` |
+| `Stage::Render` driver that pushes a frame to the GPU | `spark-render` (`wgpu` + WGSL) | M5 |
 | Multi-threaded scheduler | `spark-ecs` parallel executor | M4 |
 
 The per-stage pattern — *run every system, then flush pending
-`Commands`* — is settled and won't change. New stages slot in around
-the existing three; the body of `run_stage` stays the same.
+`Commands`* — is settled and won't change. The `Stage` enum is closed:
+the reserved phases (`FixedUpdate`, `Render`, …) gain *drivers* as the
+milestones land, but the enum and the body of `run_stage` stay the same.
 
 ## How `WindowPlugin` plugs into `Application`
 
@@ -280,7 +281,7 @@ Things worth knowing:
   registering two runner-installing plugins means the last one wins.
 - **The runner owns the `Application`.** The closure takes
   `Application` by value; the `EventLoopRunner` stores it as a field
-  and ticks `PRE_UPDATE → UPDATE → POST_UPDATE` on every redraw.
+  and ticks `PreUpdate → Update → PostUpdate` on every redraw.
 - **`set_runner` is what makes the plugin model windowed-game-
   friendly.** Without it, anyone wanting to use winit would have to
   bypass `Application` entirely. With it, windowed apps stay inside

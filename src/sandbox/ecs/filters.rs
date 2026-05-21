@@ -14,8 +14,8 @@
 //! `RUST_LOG=spark=info cargo run -p spark` to see the live matches —
 //! each log line carries `expected=` next to the actual `count=`.
 //!
-//! Every report is first-tick gated and runs in `PRE_UPDATE`, after the
-//! `STARTUP` seed flushes — the one-shot pattern from
+//! Every report is first-tick gated and runs in `PreUpdate`, after the
+//! `Startup` seed flushes — the one-shot pattern from
 //! [`super::systems::report_initial`].
 
 use spark_ecs::{And, Commands, Or, Query, Res, With, Without};
@@ -41,7 +41,7 @@ type AnyPower = Or<(With<Powered>, With<Backup>)>;
 type RunningAndSupplied = And<(With<Operational>, AnyPower)>;
 
 /// **`Commands`** — seeds the power-grid roster every filter system
-/// reads. Runs in `STARTUP`; flushes before `PRE_UPDATE` fires.
+/// reads. Runs in `Startup`; flushes before `PreUpdate` fires.
 ///
 /// After the flush, storage holds (entity → its components):
 ///

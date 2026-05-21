@@ -12,7 +12,7 @@ mod stage;
 pub use application::Application;
 pub use error::EngineError;
 pub use plugin::Plugin;
-pub use stage::stages;
+pub use stage::Stage;
 
 /// Semantic version of `spark-core` from `Cargo.toml`.
 ///

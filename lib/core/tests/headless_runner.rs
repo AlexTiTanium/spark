@@ -4,12 +4,12 @@
 //!
 //! Mirrors the `tick_n` pattern from issue #12: replace the
 //! window-driven runner with a closure that calls
-//! `run_stage(PRE_UPDATE) → run_stage(UPDATE) →
-//! run_stage(POST_UPDATE)` N times, then asserts post-tick state
+//! `run_stage(PreUpdate) → run_stage(Update) →
+//! run_stage(PostUpdate)` N times, then asserts post-tick state
 //! through `app.world()`. This is the testing pattern the engine
 //! ships with for CI; it never opens a window.
 
-use spark_core::{Application, EngineError, Plugin, stages};
+use spark_core::{Application, EngineError, Plugin, Stage};
 use spark_ecs::{Commands, Component, Query};
 
 #[derive(Debug, PartialEq, Component)]
@@ -18,7 +18,7 @@ struct Position(i32, i32);
 #[derive(Debug, PartialEq, Component)]
 struct Velocity(i32, i32);
 
-/// Seeds two entities via `Commands` in STARTUP; the flush at the
+/// Seeds two entities via `Commands` in Startup; the flush at the
 /// stage boundary makes them visible to the per-frame stages.
 fn spawn_two(mut commands: Commands) {
     commands
@@ -44,20 +44,20 @@ fn integrate(mut q: Query<(&mut Position, &Velocity)>) {
 struct DemoPlugin;
 impl Plugin for DemoPlugin {
     fn build(&self, app: &mut Application) {
-        app.add_system(stages::STARTUP, spawn_two)
-            .add_system(stages::UPDATE, integrate);
+        app.add_system(Stage::Startup, spawn_two)
+            .add_system(Stage::Update, integrate);
     }
 }
 
-/// Returns a runner that ticks `PRE_UPDATE → UPDATE → POST_UPDATE`
+/// Returns a runner that ticks `PreUpdate → Update → PostUpdate`
 /// exactly `n` times, then returns. Drop-in replacement for
 /// `WindowPlugin` in tests.
 fn tick_n(n: u32) -> impl FnOnce(Application) -> Result<(), EngineError> {
     move |mut app| {
         for _ in 0..n {
-            app.run_stage(stages::PRE_UPDATE);
-            app.run_stage(stages::UPDATE);
-            app.run_stage(stages::POST_UPDATE);
+            app.run_stage(Stage::PreUpdate);
+            app.run_stage(Stage::Update);
+            app.run_stage(Stage::PostUpdate);
         }
         Ok(())
     }
@@ -73,17 +73,17 @@ fn ten_ticks_advance_positions_by_velocity_times_ten() {
     let mut app = Application::new();
     app.add_plugin(DemoPlugin);
 
-    // Manual STARTUP — no `add_startup_system` closures here, so
+    // Manual Startup — no `add_startup_system` closures here, so
     // calling the stage directly suffices.
-    app.run_stage(stages::STARTUP);
+    app.run_stage(Stage::Startup);
 
     for _ in 0..TICKS {
-        app.run_stage(stages::PRE_UPDATE);
-        app.run_stage(stages::UPDATE);
-        app.run_stage(stages::POST_UPDATE);
+        app.run_stage(Stage::PreUpdate);
+        app.run_stage(Stage::Update);
+        app.run_stage(Stage::PostUpdate);
     }
 
-    // After STARTUP flush, two entities live; UPDATE ran TICKS times.
+    // After Startup flush, two entities live; Update ran TICKS times.
     // Entity 1: pos started (0,0), vel (1,0). After 10 ticks: (10, 0).
     // Entity 2: pos started (10,10), vel (0,2). After 10 ticks: (10, 30).
     let world = app.world();
@@ -102,15 +102,15 @@ fn ten_ticks_advance_positions_by_velocity_times_ten() {
 
 #[test]
 fn commands_spawn_in_startup_visible_in_first_frame() {
-    // First-frame visibility is the contract: STARTUP's flush happens
-    // *before* the runner's first tick, so PRE_UPDATE sees the
+    // First-frame visibility is the contract: Startup's flush happens
+    // *before* the runner's first tick, so PreUpdate sees the
     // entities `spawn_two` queued.
     let mut app = Application::new();
     app.add_plugin(DemoPlugin);
 
     let count_cell = std::rc::Rc::new(std::cell::Cell::new(0_usize));
     let count_cell_clone = count_cell.clone();
-    app.add_system(stages::PRE_UPDATE, move |q: Query<&Position>| {
+    app.add_system(Stage::PreUpdate, move |q: Query<&Position>| {
         count_cell_clone.set(q.iter().count());
     });
     app.set_runner(tick_n(1));
@@ -119,28 +119,28 @@ fn commands_spawn_in_startup_visible_in_first_frame() {
     assert_eq!(
         count_cell.get(),
         2,
-        "STARTUP entities must be visible in the first PRE_UPDATE"
+        "Startup entities must be visible in the first PreUpdate"
     );
 }
 
 #[test]
 fn commands_despawn_during_update_visible_in_post_update() {
-    // Despawn queued in UPDATE → flushed at UPDATE boundary →
-    // invisible by the time POST_UPDATE runs.
+    // Despawn queued in Update → flushed at Update boundary →
+    // invisible by the time PostUpdate runs.
     let mut app = Application::new();
     app.add_plugin(DemoPlugin);
 
-    // UPDATE: despawn everything. Need the entity ids; capture them
-    // via a STARTUP-then-frame side channel. Simpler: spawn one entity
-    // in STARTUP through a separate path, then despawn it in UPDATE.
+    // Update: despawn everything. Need the entity ids; capture them
+    // via a Startup-then-frame side channel. Simpler: spawn one entity
+    // in Startup through a separate path, then despawn it in Update.
     let id_cell = std::rc::Rc::new(std::cell::Cell::new(None));
     let id_cell_a = id_cell.clone();
-    app.add_system(stages::STARTUP, move |mut commands: Commands| {
+    app.add_system(Stage::Startup, move |mut commands: Commands| {
         let id = commands.spawn().insert(Position(99, 99)).id();
         id_cell_a.set(Some(id));
     });
     let id_cell_b = id_cell.clone();
-    app.add_system(stages::UPDATE, move |mut commands: Commands| {
+    app.add_system(Stage::Update, move |mut commands: Commands| {
         if let Some(id) = id_cell_b.get() {
             commands.despawn(id);
         }
@@ -148,8 +148,8 @@ fn commands_despawn_during_update_visible_in_post_update() {
 
     let post_count = std::rc::Rc::new(std::cell::Cell::new(0_usize));
     let post_count_clone = post_count.clone();
-    app.add_system(stages::POST_UPDATE, move |q: Query<&Position>| {
-        // After UPDATE's flush, the (99, 99) entity should be
+    app.add_system(Stage::PostUpdate, move |q: Query<&Position>| {
+        // After Update's flush, the (99, 99) entity should be
         // gone. The two demo entities from `spawn_two` survive.
         post_count_clone.set(q.iter().filter(|p| p.0 == 99 && p.1 == 99).count());
     });
@@ -159,6 +159,6 @@ fn commands_despawn_during_update_visible_in_post_update() {
     assert_eq!(
         post_count.get(),
         0,
-        "(99, 99) entity should have despawned before POST_UPDATE"
+        "(99, 99) entity should have despawned before PostUpdate"
     );
 }

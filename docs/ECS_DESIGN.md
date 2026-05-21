@@ -310,7 +310,7 @@ Why workloads on top of stages? Stages define the broad frame structure; workloa
 
 ```rust
 /// The fixed per-frame phases, in execution order. A closed, exhaustive
-/// enum: order is intrinsic (the discriminant), `match` is exhaustive,
+/// enum: order is intrinsic (declaration order), `match` is exhaustive,
 /// and a typo is a compile error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Stage {
@@ -331,9 +331,11 @@ Inside a stage, workloads run in the order their explicit `.after_workload()` co
 
 Commands flush between every workload. Events double-buffer between `Last` (frame N) and `First` (frame N+1).
 
-**Why a closed enum, and why `Stage` not `Schedule`.** There is exactly one frame timeline, so there is one shared set of phases. An enum makes that set typo-proof and exhaustively `match`-able, and encodes the order in the discriminant — no runtime ordering structure needed. The name `Stage` keeps `Schedule` free for a possible future runnable system-graph container, and avoids a four-way clash with the `Scheduler` / `StageData` machinery.
+**Why a closed enum, and why `Stage` not `Schedule`.** There is exactly one frame timeline, so there is one shared set of phases. An enum makes that set typo-proof and exhaustively `match`-able, and encodes the order in its variant declaration order — no runtime ordering structure needed. The name `Stage` keeps `Schedule` free for a possible future runnable system-graph container, and avoids a four-way clash with the `Scheduler` / `StageData` machinery.
 
-**How a subsystem extends it.** Not by adding a `Stage` variant — variants of different enums have no defined order, and the frame is a single timeline. A subsystem orders *its own* work with **workloads** (it defines its own `WorkloadLabel` enum, see above) that live inside the shared stages. The rare case of a genuinely new *global* phase is a deferred, **non-breaking** upgrade: widen `add_systems` / `add_workload` to take `impl StageLabel`, add `impl StageLabel for Stage {}`, and every existing `Stage::Update` call-site still compiles. `StageLabel` would then carry identity exactly like `WorkloadLabel` — a trait with `#[derive(StageLabel)]`.
+**How a subsystem extends it.** Not by adding a `Stage` variant — variants of different enums have no defined order, and the frame is a single timeline. A subsystem orders *its own* work with **workloads** (it defines its own `WorkloadLabel` enum, see above) that live inside the shared stages. The rare case of a genuinely new *global* phase is a deferred, **non-breaking** upgrade: widen `add_system` / `add_workload` to take `impl StageLabel`, add `impl StageLabel for Stage {}`, and every existing `Stage::Update` call-site still compiles. `StageLabel` would then carry identity exactly like `WorkloadLabel` — a trait with `#[derive(StageLabel)]`.
+
+**Where `Stage` lives.** In `spark-core`, not `spark-ecs` — the concrete frame phases belong to the *app/frame layer*, the same split Bevy draws between `bevy_app` (which owns the `Update` / `Startup` / `FixedUpdate` labels) and `bevy_ecs` (which owns the generic schedule machinery). `spark-core` already owns `Application` and `run_stage`, so the enum sits beside its only consumer. Because `spark-ecs` sits *below* `spark-core` in the dependency graph it can't name `Stage` directly; the future `spark-ecs` scheduler will accept it through the `StageLabel` trait above (`impl StageLabel for Stage`), which keeps the graph cycle-free. Shipped as `spark-core::Stage` in #32, with the call-site migration riding along.
 
 ### Plugin
 
@@ -657,7 +659,7 @@ lib/
     │   ├── system/
     │   │   ├── param.rs        # SystemParam trait, all impls
     │   │   └── function.rs     # IntoSystem, FunctionSystem
-    │   ├── stage.rs            # Stage enum, StageData
+    │   ├── stage.rs            # StageData + StageLabel trait (the concrete Stage enum lives in spark-core)
     │   ├── workload.rs         # Workload labels, WorkloadData, builder
     │   ├── scheduler.rs        # Scheduler — runs stages
     │   ├── commands.rs         # Commands, CommandQueue
@@ -785,7 +787,7 @@ Test: extract a query from a world via the param trait.
 Test: write a regular function with two params, register it, invoke via the system box.
 
 **Stage 11 — `Stage` enum + sequential scheduler** (1 day)
-`Stage::Startup`, `First`, `PreUpdate`, `FixedUpdate`, `Update`, `PostUpdate`, `Render`, `Last`. Scheduler walks them in order, runs systems sequentially within each. **Replaces the M1–M3 stand-in** in `spark-core` (`pub mod stages { pub const STARTUP: &str = "startup"; … }`) — `add_system(stages::FOO, …)` call-sites migrate to `add_systems(Stage::Foo, …)` in the same PR. See roadmap item 3.
+`Stage::Startup`, `First`, `PreUpdate`, `FixedUpdate`, `Update`, `PostUpdate`, `Render`, `Last`. Scheduler walks them in order, runs systems sequentially within each. The **`Stage` enum + call-site migration shipped with #32**: the enum lives in `spark-core` (replacing the M1–M3 `pub mod stages { pub const STARTUP: &str = "startup"; … }` stand-in), and `add_system(stages::FOO, …)` call-sites moved to `add_system(Stage::Foo, …)` — the method keeps its name (a plural `add_systems` is a separate, undecided API; see roadmap item 3). The sequential scheduler itself is still pending (scheduler epic children 2–6). See roadmap item 3.
 Test: three systems in three different stages run in correct order.
 
 **Stage 12 — `Workload` + builder** (2 days)
@@ -797,7 +799,7 @@ Test: ordering constraints respected; cycle detected at registration.
 Test: spawn inside a system → entity visible to next workload.
 
 **Stage 14 — `Events<T>` + readers/writers + `Plugin`/`App` + `FixedUpdate`** (2 days)
-`Events<T>` resource (double-buffered ring). `EventReader<T>` (cursor per system), `EventWriter<T>`. `Plugin` trait. `App::add_plugin`, `add_systems`, `add_workload`, `init_resource`, `add_event`, `run`. `FixedUpdate` accumulator.
+`Events<T>` resource (double-buffered ring). `EventReader<T>` (cursor per system), `EventWriter<T>`. `Plugin` trait. `App::add_plugin`, `add_system`, `add_workload`, `init_resource`, `add_event`, `run`. `FixedUpdate` accumulator.
 Test: end-to-end app with 1 plugin, 1 workload, 1 event round-trip; 100 ms simulated time = 6 fixed updates at 60 Hz.
 
 **After Phase 1: the ECS is feature-complete for shipping Spark.**
@@ -941,7 +943,7 @@ pub struct DemoPlugin;
 impl Plugin for DemoPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Camera>()
-           .add_systems(Stage::Startup, spawn_player)
+           .add_system(Stage::Startup, spawn_player)
            .add_workload(Workload::PlayerInput, Stage::PreUpdate, |w| {
                w.after_workload(Workload::Input);
                w.add(read_player_input);

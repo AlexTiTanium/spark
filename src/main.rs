@@ -8,11 +8,11 @@
 //!   plugin. It inserts the shared resources every sub-sandbox uses
 //!   (`TickCount`), then nests each sub-sandbox plugin via
 //!   `app.add_plugin(...)`. Today that's just `EcsSandboxPlugin`
-//!   (queues demo entities via `Commands` in STARTUP and registers
+//!   (queues demo entities via `Commands` in Startup and registers
 //!   `physics_step` / `decay_health` / `player_regen` / …); future
 //!   render or input sub-sandboxes plug in next to it.
 //! - `WindowPlugin` opens the OS window and installs the runner that
-//!   ticks `PRE_UPDATE → UPDATE → POST_UPDATE` on every winit
+//!   ticks `PreUpdate → Update → PostUpdate` on every winit
 //!   `RedrawRequested`.
 //!
 //! Run it: `cargo run -p spark`. Filter logs with `RUST_LOG=spark=info`
