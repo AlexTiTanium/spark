@@ -8,7 +8,7 @@ use crate::event_loop;
 
 /// Installs [`crate::run`] as the [`Application`]'s runner — the
 /// closure that owns the main thread once startup has finished and
-/// ticks `PRE_UPDATE → UPDATE → POST_UPDATE` on every winit
+/// ticks `PreUpdate → Update → PostUpdate` on every winit
 /// `RedrawRequested`.
 ///
 /// # Examples

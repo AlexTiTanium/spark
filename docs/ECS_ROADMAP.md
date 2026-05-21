@@ -77,24 +77,30 @@ do not refile it. Originally filed as #25 and closed as stale.
   (`add_resource` / `Res` / `ResMut`) gated on `Resource`, every demo and
   test migrated to the derives.
 
-**3. Scheduler / workload — ⬜ not filed.**
+**3. Scheduler / workload — ⬜ not filed (stage-shape migration ✅ shipped with #32).**
 - *Work:* `Access` declaration on every `SystemParam` (aggregating the
   `QueryAccess` primitive from issue 1b); conflict detection; explicit
   `.before()/.after()`; topo-sorted DAG; system batching. Executor is
   **sequential** but the DAG/batch structure is built now.
-- *Stage-shape migration:* replace the M1–M3 stand-in
-  (`pub mod stages { pub const STARTUP: &str = "startup"; … }` in
-  `spark-core`) with the canonical, **closed** `pub enum Stage { Startup, First,
-  PreUpdate, FixedUpdate, Update, PostUpdate, Render, Last }` from
-  ECS_DESIGN.md. `add_system(stages::FOO, …)` becomes
-  `add_systems(Stage::Foo, …)`. The enum gives compile-time
+- *Stage-shape migration:* **✅ shipped with #32.** Replaced the M1–M3
+  stand-in (`pub mod stages { pub const STARTUP: &str = "startup"; … }`)
+  with the canonical, **closed** `pub enum Stage { Startup, First,
+  PreUpdate, FixedUpdate, Update, PostUpdate, Render, Last }`. The enum
+  **lives in `spark-core`**, not `spark-ecs` — the concrete frame phases
+  are an app/frame-layer concern (the `bevy_app` vs `bevy_ecs` split), and
+  the future `spark-ecs` scheduler reaches it through a `StageLabel` trait
+  to stay cycle-free. `add_system(stages::FOO, …)` call-sites moved to
+  `add_system(Stage::Foo, …)`: **the method keeps its name** — a plural
+  `add_systems` (multi-system registration) is a *separate, undecided*
+  API, deferred until usage demands it (tracked in #41). The enum gives
+  compile-time
   exhaustiveness for the editor's stage view and removes the
   stringly-typed footgun. `Stage` is **closed**: one frame timeline means
   one shared phase set, so a subsystem extends the frame via *workloads*,
   not new stages. A genuinely new global phase is a deferred,
   non-breaking upgrade — widen to `impl StageLabel`, and existing
-  `Stage::Foo` calls still compile. Existing callers (#9, #12) are
-  updated in the same PR.
+  `Stage::Foo` calls still compile. Callers (#9, #12) migrated in the
+  same PR.
 - *Workload labels:* introduce a `WorkloadLabel` trait + `#[derive(WorkloadLabel)]`
   (proc-macro in `spark-ecs-macros`), applied to a *per-subsystem enum* — the
   derive matches over its variants to generate per-variant identity + name —
@@ -109,9 +115,10 @@ do not refile it. Originally filed as #25 and closed as stale.
   All storage access must funnel through one chokepoint so the M4
   `RefCell → UnsafeCell` swap stays local. `world_mut()` must remain
   unreachable from inside a system. Batches must exist even though the
-  executor walks them sequentially. The `stages::` constants migration is
-  cross-cutting — touches `spark-core`, `spark-window`'s `EventLoopRunner`,
-  the binary, and every doc test that calls `add_system`.
+  executor walks them sequentially. (The `stages::` constants migration —
+  cross-cutting across `spark-core`, `spark-window`'s `EventLoopRunner`,
+  the binary, and every doc test calling `add_system` — already shipped
+  with #32; the scheduler builds on the `Stage` enum it left behind.)
 
 **4. ~~Query filters — `With<T>` / `Without<T>`~~ — ✅ shipped (issue #31).**
 The four open questions were resolved in the 2026-05-20 design

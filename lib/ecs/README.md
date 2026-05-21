@@ -167,7 +167,7 @@ impl Plugin for ScorePlugin {
     fn build(&self, app: &mut Application) {
         app.add_resource(GameTime { dt: 0.016 })
             .add_resource(Score(0))
-            .add_system(spark_core::stages::STARTUP, tick);
+            .add_system(spark_core::Stage::Startup, tick);
     }
 }
 
@@ -1513,9 +1513,9 @@ assert_eq!(Query::<&Tag>::from_world(&world).iter().count(), 0);
 `Application::run_stage(stage)` runs every system in the stage in
 registration order, then calls `world.flush_commands()`. So:
 
-- A `spawn` in `STARTUP` is visible in every `PRE_UPDATE` /
-  `UPDATE` / `POST_UPDATE` system that follows.
-- A `spawn` in `UPDATE` is visible in `POST_UPDATE` of the same
+- A `spawn` in `Startup` is visible in every `PreUpdate` /
+  `Update` / `PostUpdate` system that follows.
+- A `spawn` in `Update` is visible in `PostUpdate` of the same
   frame.
 - Two systems both running in `UPDATE`: the second one does **not**
   see entities the first one queued. They flush together at the
@@ -1632,14 +1632,14 @@ A workload is a named bundle. Power-grid systems go together in
 Workloads can declare ordering between each other:
 
 ```rust,ignore
-app.add_workload(Workload::PowerGrid, Schedule::FixedUpdate, |w| {
+app.add_workload(Workload::PowerGrid, Stage::FixedUpdate, |w| {
     w.add(collect_supply);                        // disjoint access
     w.add(compute_demand);                        // run in parallel
     w.add(distribute_power).after_all_prior();    // joins after both
     w.add(emit_blackout_events).after(distribute_power);
 });
 
-app.add_workload(Workload::CityTick, Schedule::FixedUpdate, |w| {
+app.add_workload(Workload::CityTick, Stage::FixedUpdate, |w| {
     w.after_workload(Workload::PowerGrid);        // sequential between workloads
     w.add(city_growth);
 });
@@ -1650,14 +1650,15 @@ access set (from its parameter types) and runs non-conflicting
 systems in parallel via Rayon. Between workloads, everything is
 sequential and deterministic — commands flush, events propagate.
 
-> **Stage-shape migration.** Today the schedule slots are string
-> constants on `spark-core` (`stages::STARTUP = "startup"`,
-> `stages::UPDATE = "update"`) and you call
-> `app.add_system(stages::UPDATE, my_fn)`. The scheduler PR replaces
-> that stand-in with the canonical `Schedule` enum shown above
-> (`Schedule::Startup`, `Schedule::Update`, …) and the call becomes
-> `app.add_systems(Schedule::Update, my_fn)`. Same idea, compile-time
-> exhaustiveness, no more stringly-typed footguns.
+> **Where the `Stage` enum lives.** The per-frame phases are the closed
+> `Stage` enum (`Stage::Startup`, `Stage::Update`, …), and you register
+> a system with `app.add_system(Stage::Update, my_fn)`. `Stage` lives in
+> `spark-core` — the frame/app layer — not in `spark-ecs`, mirroring how
+> Bevy's `bevy_app` owns `Update` / `Startup` while `bevy_ecs` owns the
+> generic schedule machinery. The workload layer and parallel executor
+> shown above are still ahead; when the `spark-ecs` scheduler lands it
+> will accept `Stage` through a `StageLabel` trait, keeping the
+> dependency direction (`spark-ecs` *below* `spark-core`) cycle-free.
 
 ## Derive macros
 

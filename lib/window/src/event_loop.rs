@@ -5,13 +5,13 @@
 //! internal `EventLoopRunner` that implements
 //! [`ApplicationHandler`](winit::application::ApplicationHandler), and
 //! hands the loop to winit. On every `RedrawRequested`, the runner
-//! ticks the per-frame stages — `PRE_UPDATE → UPDATE → POST_UPDATE` —
+//! ticks the per-frame stages — `PreUpdate → Update → PostUpdate` —
 //! then asks winit for the next redraw. That's the entire per-frame
 //! loop the engine ships with M3.
 
 use std::num::NonZeroU32;
 
-use spark_core::{Application, stages};
+use spark_core::{Application, Stage};
 use tracing::{debug, info, trace};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -122,7 +122,7 @@ impl ApplicationHandler for EventLoopRunner {
     /// Routes each OS event to the right handler.
     ///
     /// - `CloseRequested`: exits the loop so [`run`] returns.
-    /// - `RedrawRequested`: ticks `PRE_UPDATE → UPDATE → POST_UPDATE`,
+    /// - `RedrawRequested`: ticks `PreUpdate → Update → PostUpdate`,
     ///   then requests the next redraw to keep the loop alive.
     /// - Lifecycle / input events: logged at appropriate `tracing`
     ///   levels (cursor at `trace`, input at `debug`, focus/resize at
@@ -142,9 +142,9 @@ impl ApplicationHandler for EventLoopRunner {
                 // Per-frame tick. Each stage flushes its pending
                 // commands at the end of its run via
                 // `Application::run_stage`.
-                self.app.run_stage(stages::PRE_UPDATE);
-                self.app.run_stage(stages::UPDATE);
-                self.app.run_stage(stages::POST_UPDATE);
+                self.app.run_stage(Stage::PreUpdate);
+                self.app.run_stage(Stage::Update);
+                self.app.run_stage(Stage::PostUpdate);
                 // Request the next frame. Under `ControlFlow::Wait`
                 // this is what wakes the loop for the next tick.
                 if let Some(window) = self.window.as_ref() {

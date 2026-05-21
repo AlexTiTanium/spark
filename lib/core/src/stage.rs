@@ -1,68 +1,87 @@
-//! Named lifecycle slots in the engine schedule.
+//! The engine's fixed frame timeline, as the closed [`Stage`] enum.
 //!
-//! Four stages exist today: [`stages::STARTUP`] — auto-run inside
-//! [`Application::run`](crate::Application::run) once after every
-//! `add_startup_system` closure has fired — and the per-frame trio
-//! [`stages::PRE_UPDATE`] → [`stages::UPDATE`] →
-//! [`stages::POST_UPDATE`], ticked every frame by
-//! [`WindowPlugin`](../../spark_window/struct.WindowPlugin.html)'s
-//! runner on each winit `RedrawRequested`. `FIRST` / `LAST` /
-//! `FIXED_UPDATE` / `RENDER` still wait — they earn their constants
-//! when their executors land.
+//! Every system is registered against one [`Stage`], and the engine
+//! runs the stages in a fixed per-frame order. The set is *closed* on
+//! purpose: there is exactly one frame timeline, so there is one shared
+//! phase set. That makes a misspelled stage a compile error instead of
+//! the silent no-op a `&'static str` label gave — register a system on
+//! a typo'd string and it simply never runs. A subsystem that needs its
+//! own ordering groups related systems into a *workload* inside a stage
+//! (a later scheduler feature), rather than inventing a new stage.
 
-/// Stage name constants. Stages are `&'static str` so callers can
-/// introduce their own without modifying core.
-pub mod stages {
-    /// The startup stage. Systems registered here via
-    /// [`add_system`](crate::Application::add_system) run exactly once,
-    /// in registration order, during
-    /// [`Application::run`](crate::Application::run) — *after* every
-    /// `add_startup_system` closure has fired and *before* the runner
-    /// takes the thread.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// assert_eq!(spark_core::stages::STARTUP, "startup");
-    /// ```
-    pub const STARTUP: &str = "startup";
-
-    /// First per-frame stage. Convention: input gather, time tick,
-    /// anything that prepares state the rest of the frame consumes.
-    /// Run by
-    /// [`WindowPlugin`](../../spark_window/struct.WindowPlugin.html)'s
-    /// runner ahead of [`UPDATE`].
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// assert_eq!(spark_core::stages::PRE_UPDATE, "pre_update");
-    /// ```
-    pub const PRE_UPDATE: &str = "pre_update";
-
-    /// Main per-frame stage. The bulk of game logic — movement, AI,
-    /// spawning, despawning — lives here. Run by
-    /// [`WindowPlugin`](../../spark_window/struct.WindowPlugin.html)'s
-    /// runner between [`PRE_UPDATE`] and [`POST_UPDATE`].
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// assert_eq!(spark_core::stages::UPDATE, "update");
-    /// ```
-    pub const UPDATE: &str = "update";
-
-    /// Last per-frame stage. Convention: bookkeeping that has to see
-    /// the *settled* world for the frame — cleanup, reporting,
-    /// off-screen culling, anything that should run after [`UPDATE`]'s
-    /// commands have flushed. Run by
-    /// [`WindowPlugin`](../../spark_window/struct.WindowPlugin.html)'s
-    /// runner after [`UPDATE`].
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// assert_eq!(spark_core::stages::POST_UPDATE, "post_update");
-    /// ```
-    pub const POST_UPDATE: &str = "post_update";
+/// The fixed per-frame phases, in execution order.
+///
+/// A **closed**, [`Copy`] enum. Being closed buys two things a
+/// `&'static str` label can't: every `match` over a `Stage` is
+/// exhaustive, and a typo'd stage is a *compile error* instead of a
+/// system silently registered to a slot nothing ever runs. The variants
+/// are listed in run order for readability, but the order is enforced by
+/// the sequence of [`run_stage`](crate::Application::run_stage) calls
+/// (see *When each stage runs* below) — nothing reads the discriminant.
+///
+/// # When each stage runs
+///
+/// [`Startup`](Self::Startup) fires once, inside
+/// [`Application::run`](crate::Application::run), after every
+/// `add_startup_system` closure. The per-frame trio
+/// [`PreUpdate`](Self::PreUpdate) → [`Update`](Self::Update) →
+/// [`PostUpdate`](Self::PostUpdate) is driven every frame by
+/// [`WindowPlugin`](../../spark_window/struct.WindowPlugin.html)'s
+/// runner. [`First`](Self::First), [`FixedUpdate`](Self::FixedUpdate),
+/// [`Render`](Self::Render), and [`Last`](Self::Last) are reserved
+/// labels — defined now so call sites (and the editor's future stage
+/// view) can name them, but not yet auto-driven; their executors land
+/// with the scheduler (see `docs/ECS_ROADMAP.md`).
+///
+/// Per-frame order:
+/// `First → PreUpdate → (FixedUpdate × N) → Update → PostUpdate → Render → Last`.
+///
+/// # Examples
+///
+/// ```
+/// use spark_core::Stage;
+///
+/// // `Copy` + `Eq`: cheap to pass by value and to compare.
+/// let stage = Stage::Update;
+/// assert_eq!(stage, Stage::Update);
+/// assert_ne!(Stage::Update, Stage::PreUpdate);
+///
+/// // Closed + exhaustive: this `match` must cover every variant, so a
+/// // caller can never silently forget a stage (and a typo'd variant
+/// // won't compile).
+/// let name = match stage {
+///     Stage::Startup => "startup",
+///     Stage::First => "first",
+///     Stage::PreUpdate => "pre_update",
+///     Stage::FixedUpdate => "fixed_update",
+///     Stage::Update => "update",
+///     Stage::PostUpdate => "post_update",
+///     Stage::Render => "render",
+///     Stage::Last => "last",
+/// };
+/// assert_eq!(name, "update");
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Stage {
+    /// Once, before the main loop begins — world seeding, resource
+    /// init. Auto-run by [`Application::run`](crate::Application::run)
+    /// after the `add_startup_system` closures.
+    Startup,
+    /// Very first thing each frame. Reserved label; not yet auto-driven.
+    First,
+    /// Input poll, time tick — prepares the state the rest of the frame
+    /// consumes.
+    PreUpdate,
+    /// Fixed-timestep simulation; runs N times per frame off an
+    /// accumulator (60 Hz). Reserved label; not yet auto-driven.
+    FixedUpdate,
+    /// Main game logic at display rate — movement, AI, spawn/despawn.
+    Update,
+    /// Cleanup and bookkeeping over the settled world for the frame.
+    PostUpdate,
+    /// Build draw lists, submit GPU work. Reserved label; not yet
+    /// auto-driven.
+    Render,
+    /// Very last thing each frame. Reserved label; not yet auto-driven.
+    Last,
 }

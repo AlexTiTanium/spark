@@ -4,10 +4,10 @@
 //! What each system shows:
 //!
 //! - [`spawn_demo`]: `Commands` — seeds the four demo entities from a
-//!   STARTUP system (deferred spawn pattern that lands with Issue C).
-//! - [`report_initial`]: `Res<T>` + `Query<&T>` — runs in `PRE_UPDATE`
-//!   so it sees the entities `spawn_demo` queued in STARTUP (those
-//!   flush at the STARTUP boundary before `PRE_UPDATE` fires).
+//!   Startup system (deferred spawn pattern that lands with Issue C).
+//! - [`report_initial`]: `Res<T>` + `Query<&T>` — runs in `PreUpdate`
+//!   so it sees the entities `spawn_demo` queued in Startup (those
+//!   flush at the Startup boundary before `PreUpdate` fires).
 //! - [`physics_step`]: `Query<(&mut P, &mut V, &A)>` — **arity-3
 //!   multi-mut**, new with the multi-mut PR. Symplectic Euler step.
 //! - [`decay_health`]: `ResMut<T>` + `Query<&mut T>` — bumps the tick
@@ -38,7 +38,7 @@ use crate::sandbox::resources::TickCount;
 use super::components::{Acceleration, Player};
 
 /// **`Commands`** — seeds the demo entities deferred-style. Runs in
-/// `STARTUP`; the entities are flushed in by the time `PRE_UPDATE`
+/// `Startup`; the entities are flushed in by the time `PreUpdate`
 /// fires for the first time.
 ///
 /// Entity roster (all movers carry `Acceleration` so `physics_step`
@@ -84,9 +84,9 @@ pub(super) fn spawn_demo(mut commands: Commands) {
 }
 
 /// **`Res<T>` + `Query<&T>`** — read a singleton resource and count
-/// entities matching a single-component shape. Runs in `PRE_UPDATE`
-/// so it sees the entities [`spawn_demo`] queued during `STARTUP`
-/// (they flush at the stage boundary before `PRE_UPDATE` fires).
+/// entities matching a single-component shape. Runs in `PreUpdate`
+/// so it sees the entities [`spawn_demo`] queued during `Startup`
+/// (they flush at the stage boundary before `PreUpdate` fires).
 pub(super) fn report_initial(tick: Res<TickCount>, q_pos: Query<&Position>) {
     // First-tick guard so this only logs once. (A `Local<T>` system
     // param would be tidier; lands in a follow-up.)
