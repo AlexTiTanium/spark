@@ -12,6 +12,10 @@
 
 use spark_core::{Application, Plugin, stages};
 
+use super::filters::{
+    and_filter, bump_powered_capacity, filtered_join, nested_filter, or_filter, spawn_filter_demo,
+    with_filter, without_filter,
+};
 use super::systems::{
     decay_health, physics_step, player_regen, report_initial, report_player_position,
     report_tick_summary, spawn_demo,
@@ -50,5 +54,22 @@ impl Plugin for EcsSandboxPlugin {
             .add_system(stages::UPDATE, player_regen)
             .add_system(stages::UPDATE, report_tick_summary)
             .add_system(stages::POST_UPDATE, report_player_position);
+
+        // ----- Filter demo (`Query<D, F>`) -----
+        //
+        // Seed the power-grid roster in STARTUP (flushes before
+        // PRE_UPDATE), then run one report per filter combination in
+        // PRE_UPDATE. Each is first-tick-gated, so the whole set logs
+        // its expected-vs-actual matches once. `filtered_join` (read)
+        // is registered before `bump_powered_capacity` (mut) so the
+        // join reports the original capacities before the bump applies.
+        app.add_system(stages::STARTUP, spawn_filter_demo)
+            .add_system(stages::PRE_UPDATE, with_filter)
+            .add_system(stages::PRE_UPDATE, without_filter)
+            .add_system(stages::PRE_UPDATE, and_filter)
+            .add_system(stages::PRE_UPDATE, or_filter)
+            .add_system(stages::PRE_UPDATE, nested_filter)
+            .add_system(stages::PRE_UPDATE, filtered_join)
+            .add_system(stages::PRE_UPDATE, bump_powered_capacity);
     }
 }

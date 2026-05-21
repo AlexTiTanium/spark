@@ -21,13 +21,15 @@ expanded into full drafts in the project's `#10–#12` format below.
   [`lib/ecs/src/query.rs`](../lib/ecs/src/query.rs).
 - **#12 → PR #24 — Commands + frame loop.** Deferred spawn/despawn,
   per-frame stages, `WindowPlugin` runner owns `Application`.
-
-### In flight
-
-- **#26 — Multi-mut query joins + self-conflict detection.** The
-  legitimate remainder of the original Draft-3 plan: `(&mut A, &mut B)` via
-  one localised `unsafe fn`, plus `QueryAccess` and
-  `assert_no_self_conflict`. Body in Draft 3 below.
+- **#26 → PR #28 — Multi-mut query joins + self-conflict detection.**
+  `(&mut A, &mut B)` (and wider mut tuples) via one localised
+  `unsafe fn`, plus `QueryAccess` and `assert_no_self_conflict`. The
+  unified `impl_all_tuple!` Cartesian macro (item 5) shipped here too.
+  Body in Draft 3 below.
+- **PR #29 — `derive(Component)` / `derive(Resource)`.** Explicit ECS
+  membership by derive; no blanket impls.
+- **#31 — Query filters.** `Query<'w, D, F = ()>` + a `QueryFilter`
+  trait (`With` / `Without` / `And<(…)>` / `Or<(…)>`); see item 4 below.
 
 ### To create — in order
 
@@ -39,7 +41,7 @@ The `QueryData` shared/exclusive split, `ReadOnlyQueryData` gate,
 `Query as SystemParam` work. Draft 1 below is preserved for archaeology;
 do not refile it. Originally filed as #25 and closed as stale.
 
-**1b. Multi-mut query joins + query self-conflict detection — 🟡 #26.**
+**1b. ~~Multi-mut query joins + query self-conflict detection~~ — ✅ DONE (PR #28).**
 - *Work:* `(&mut A, &mut B)` (and wider mut tuples) via a small, localised
   `unsafe` block; query-level access collection on `QueryData`; reject any
   query where one component `TypeId` appears twice with a `&mut`
@@ -111,23 +113,26 @@ do not refile it. Originally filed as #25 and closed as stale.
   cross-cutting — touches `spark-core`, `spark-window`'s `EventLoopRunner`,
   the binary, and every doc test that calls `add_system`.
 
-**4. Query filters — `With<T>` / `Without<T>` — ⬜ not filed.**
-> ⚠️ **Discuss before opening an implementation issue.** The design
-> sketch below (`Query<'w, D, F = ()>` with a separate `QueryFilter`
-> trait) is one option, not a final decision. Open questions: filter
-> composition (tuples vs explicit `And<…>`), where `Or` fits without
-> wedging the API, whether filters should be a *third* generic on
-> `Query` or fold into `D` (`Query<(&Plant, With<Operational>)>`),
-> how filter access interacts with the scheduler's per-system access
-> aggregation, and whether the syntax should mirror Bevy's exactly or
-> diverge for clarity. Resolve these in a design doc / draft issue
-> first; the implementation issue lands after.
-- *Work (tentative):* `QueryFilter` trait; `With`/`Without` impls;
-  `Query` gets a filter param.
-- *Decision (tentative):* **A2** — separate trait, second generic:
-  `Query<'w, D, F = ()>`.
-- *Warnings:* `With<U>` contributes a **read** of `U` to the `Access`
-  model — filters must report into `collect_access`. `Or` is deferred.
+**4. ~~Query filters — `With<T>` / `Without<T>`~~ — ✅ shipped (issue #31).**
+The four open questions were resolved in the 2026-05-20 design
+discussion and the filter generic landed:
+- *Placement:* a separate `QueryFilter` trait in the **second** generic
+  `Query<'w, D, F = ()>` — *not* folded into `D`. Filters never appear in
+  the yielded item; `Query<&Position, With<Powered>>` still yields
+  `&Position`.
+- *Composition:* **explicit `And<(…)>`**, not implicit tuple-AND — a
+  deliberate divergence from Bevy, symmetric with `Or<(…)>`. Both nest.
+- *`Or`:* shipped in the **same** PR, not deferred.
+- *Access:* `With<U>` reports a **read** of `U` into `QueryAccess`;
+  `Without<U>` reports **nothing** (pure exclusion — chosen over
+  symmetry so `Query<&mut X, Without<U>>` stays conflict-free). `And` /
+  `Or` report the conservative union of their children. Filters wrap the
+  existing safe driver, so no new `unsafe`.
+- *Deferred:* `Option<&T>` was a goal on the issue but **folded out —
+  added only when a real need appears**. It needs a third "optional"
+  flag on the tuple-Cartesian macro (`2·3^(N-1)` impls), not worth the
+  monomorphisation cost today. `Changed<T>` / `Added<T>` still wait on
+  the change-tick slot (item 7).
 
 **5. ~~Query tuple arity 3–4~~ — ✅ DONE (PR #22, extended by #26).**
 Read-only tuple arities 2/3/4 shipped alongside #11. **#26 then
