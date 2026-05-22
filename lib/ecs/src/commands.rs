@@ -32,6 +32,7 @@
 use std::cell::RefCell;
 
 use crate::Component;
+use crate::access::Access;
 use crate::entity::{Entity, EntityAllocator};
 use crate::system::SystemParam;
 use crate::world::World;
@@ -388,6 +389,15 @@ impl<'a> SystemParam for Commands<'a> {
             entities: world.entities_cell(),
             queue: world.pending_cell(),
         }
+    }
+    fn collect_access(_access: &mut Access) {
+        // Deliberately empty. `Commands` records *deferred* structural
+        // edits into a queue (and the entity allocator) that `World`
+        // applies at flush time — it never reads or writes component or
+        // resource storage directly. So it conflicts with no system and
+        // can share a batch with anything. The per-system command buffers
+        // that make this race-free under M4 parallelism are a later
+        // concern; the access model has nothing to record here.
     }
 }
 

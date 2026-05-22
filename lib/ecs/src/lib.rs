@@ -11,15 +11,17 @@ mod commands;
 mod entity;
 mod filter;
 mod query;
+mod scheduler;
 mod storage;
 mod system;
 mod world;
 
-pub use access::QueryAccess;
+pub use access::{Access, QueryAccess};
 pub use commands::{CommandQueue, Commands, EntityCommands};
 pub use entity::{Entity, EntityAllocator};
 pub use filter::{And, Or, QueryFilter, With, Without};
 pub use query::{Query, QueryData, ReadOnlyQueryData};
+pub use scheduler::{Schedule, SystemId};
 pub use storage::{AnyStorage, ComponentStorage};
 pub use system::{IntoSystem, Res, ResMut, SystemParam};
 pub use world::{EntityMut, World};

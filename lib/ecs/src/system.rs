@@ -33,15 +33,21 @@
 use std::cell::{Ref, RefMut};
 use std::ops::{Deref, DerefMut};
 
-use crate::{Resource, World};
+use crate::{Access, Resource, World};
 
 /// Trait teaching [`World`] how to fetch a single system parameter.
 ///
 /// Implementors define a [generic associated type][gat] `Item<'w>` —
 /// the concrete value passed to the user's fn, with its lifetime tied
-/// to the world borrow. [`Res<T>`] and [`ResMut<T>`] are the only
-/// `SystemParam`s in this PR; queries (`Query<T>`), events, and locals
-/// land in later milestones.
+/// to the world borrow. Today's implementors are [`Res<T>`] (shared
+/// resource borrow), [`ResMut<T>`] (exclusive resource borrow),
+/// [`Query`] (entity iteration), and [`Commands`] (deferred structural
+/// mutation); events and locals land in later milestones. Each also
+/// declares its reads and writes via [`collect_access`], which the
+/// scheduler folds into a per-system [`Access`].
+///
+/// [`Commands`]: crate::Commands
+/// [`collect_access`]: SystemParam::collect_access
 ///
 /// [gat]: https://blog.rust-lang.org/2022/10/28/gats-stabilization.html
 ///
@@ -78,6 +84,19 @@ pub trait SystemParam {
     fn fetch<'w>(world: &'w World) -> Self::Item<'w>
     where
         Self: 'w;
+
+    /// Folds this parameter's reads and writes into `access`.
+    ///
+    /// `Res<T>` adds a resource read, `ResMut<T>` a resource write, and
+    /// `Query<D, F>` adds component reads/writes; `Commands` adds nothing
+    /// because it mutates structure through a deferred queue, not
+    /// component or resource storage. There is **no default** on purpose:
+    /// every parameter must declare its access explicitly, since a
+    /// silently-empty set would let the scheduler batch a real conflict
+    /// onto parallel threads at M4 — an unsound foundation. A param with
+    /// genuinely no access (like `Commands`) writes an empty body and
+    /// says so in a comment.
+    fn collect_access(access: &mut Access);
 }
 
 /// Immutable borrow of a resource of type `T`. Created by the system
@@ -143,6 +162,9 @@ impl<'a, T: Resource> SystemParam for Res<'a, T> {
         'a: 'w,
     {
         Res(world.resource::<T>())
+    }
+    fn collect_access(access: &mut Access) {
+        access.add_resource_read::<T>();
     }
 }
 
@@ -220,6 +242,9 @@ impl<'a, T: Resource> SystemParam for ResMut<'a, T> {
     {
         ResMut(world.resource_mut::<T>())
     }
+    fn collect_access(access: &mut Access) {
+        access.add_resource_write::<T>();
+    }
 }
 
 /// Wraps a function whose parameters are all [`SystemParam`] into a
@@ -254,6 +279,15 @@ pub trait IntoSystem<Marker>: Sized {
     /// Boxes the system fn so it can be stored alongside others with
     /// different param signatures.
     fn into_system(self) -> Box<dyn FnMut(&World) + 'static>;
+
+    /// The aggregated read/write set of this system — the union of every
+    /// parameter's [`SystemParam::collect_access`].
+    ///
+    /// Takes no `self` because access is fixed by the parameter *types*,
+    /// not any runtime value: `fn(Res<Dt>, Query<&mut Pos>)` always reads
+    /// `Dt` and writes `Pos`. The scheduler calls this once at
+    /// registration to build each system's [`Access`], then never again.
+    fn access() -> Access;
 }
 
 /// Emits one `IntoSystem` impl per arity. The body fetches each param
@@ -282,6 +316,16 @@ macro_rules! impl_into_system {
                     $(let $P = <$P as SystemParam>::fetch(world);)*
                     (self)($($P),*);
                 })
+            }
+
+            // `mut` is unused at arity 0 (no params to fold in); allowed
+            // here for the same reason `into_system` allows its unused
+            // `world` at arity 0 — one macro body serves every arity.
+            #[allow(unused_mut, clippy::allow_attributes)]
+            fn access() -> Access {
+                let mut access = Access::new();
+                $(<$P as SystemParam>::collect_access(&mut access);)*
+                access
             }
         }
     };

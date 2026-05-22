@@ -111,7 +111,7 @@ use std::cell::{Ref, RefMut};
 use std::marker::PhantomData;
 
 use crate::Component;
-use crate::access::QueryAccess;
+use crate::access::{Access, QueryAccess};
 use crate::entity::Entity;
 use crate::filter::QueryFilter;
 use crate::storage::ComponentStorage;
@@ -998,6 +998,15 @@ impl<D: QueryData, F: QueryFilter> SystemParam for Query<'_, D, F> {
     {
         Query::from_world(world)
     }
+    fn collect_access(access: &mut Access) {
+        // Replay the data shape and filter through the *same*
+        // `collect_access` calls that `Query::from_world` uses for the
+        // per-query self-conflict check (`&T`→read, `&mut T`→write,
+        // `With<T>`→read, `Without<T>`→nothing) — but record them in the
+        // system's component set instead of a throwaway one.
+        D::collect_access(access.components_mut());
+        F::collect_access(access.components_mut());
+    }
 }
 
 #[cfg(test)]
@@ -1386,12 +1395,6 @@ mod tests {
         world.spawn().insert(Position(0, 0));
         let _q = Query::<(&mut Position, &Position)>::from_world(&world);
     }
-
-    // Note: the reversed shape `(&Position, &mut Position)` isn't a
-    // supported query data shape (no `(&A, &mut B)` impl), so we can't
-    // exercise the read-write self-conflict path at the `Query` level.
-    // The symmetric check is tested directly in `access.rs` via
-    // `read_then_write_of_same_type_panics`.
 
     #[test]
     #[should_panic(expected = "conflicting access to component")]

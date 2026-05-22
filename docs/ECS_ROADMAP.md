@@ -77,11 +77,26 @@ do not refile it. Originally filed as #25 and closed as stale.
   (`add_resource` / `Res` / `ResMut`) gated on `Resource`, every demo and
   test migrated to the derives.
 
-**3. Scheduler / workload — ⬜ not filed (stage-shape migration ✅ shipped with #32).**
+**3. Scheduler / workload — 🚧 in progress (epic #30; stage-shape ✅ #32, Access + batching + sequential executor ✅ #33).**
 - *Work:* `Access` declaration on every `SystemParam` (aggregating the
   `QueryAccess` primitive from issue 1b); conflict detection; explicit
   `.before()/.after()`; topo-sorted DAG; system batching. Executor is
   **sequential** but the DAG/batch structure is built now.
+  - ✅ **shipped with #33 (epic child 2/6):** system-level `Access`
+    (`components`/`resources` read-write sets reusing `QueryAccess`),
+    `SystemParam::collect_access` on `Res`/`ResMut`/`Query`/`Commands`,
+    `IntoSystem::access()` aggregation, `Access::compatible_with`
+    cross-system conflict detection, and a `Schedule` that ASAP-layers
+    systems into access-disjoint batches and walks them with a sequential
+    executor (commands flush once at the end). The implicit ordering here
+    is **access-derived in registration order** — conflicting systems
+    serialise earliest-registered-first; only provably-independent systems
+    are ever reordered.
+  - ⬜ **remaining:** explicit `.before()/.after()` user ordering and the
+    `Workload` layer (child 3, #34); `Plugin` `&mut World` + `App`
+    registration + per-frame run loop wiring each `Stage` to a `Schedule`
+    (child 4, #35); `Events` (child 5, #36); `FixedUpdate` accumulator
+    (child 6, #37).
 - *Stage-shape migration:* **✅ shipped with #32.** Replaced the M1–M3
   stand-in (`pub mod stages { pub const STARTUP: &str = "startup"; … }`)
   with the canonical, **closed** `pub enum Stage { Startup, First,

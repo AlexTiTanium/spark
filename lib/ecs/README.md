@@ -1627,6 +1627,78 @@ and workloads are ordered inside **schedules** (frame-shape slots).
    └────────────────────────────────────────────────────────────────┘
 ```
 
+### Batching systems: `Schedule`
+
+A `Schedule` is the piece that actually runs systems today. You hand it
+functions with `add_system`, and from their *parameter types alone* it
+works out which ones conflict — one writes a component or resource that
+another reads or writes. Systems that touch disjoint data are grouped
+into a **batch**; conflicting ones are split across batches and run in
+registration order. The executor walks the batches one system at a time
+(parallelism per batch is the M4 upgrade) and flushes queued commands
+once at the end, the same boundary `Application::run_stage` uses.
+
+```rust
+use spark_ecs::{Component, Query, Res, Resource, Schedule, World};
+
+#[derive(Resource)]
+struct Gravity(f32);
+
+#[derive(Component)]
+struct Velocity {
+    y: f32,
+}
+
+#[derive(Component)]
+struct Position {
+    y: f32,
+}
+
+// Reads Gravity, writes Velocity.
+fn apply_gravity(g: Res<Gravity>, mut q: Query<&mut Velocity>) {
+    for v in q.iter_mut() {
+        v.y -= g.0;
+    }
+}
+
+// Writes Position, reads Velocity.
+fn integrate(mut q: Query<(&mut Position, &Velocity)>) {
+    for (p, v) in q.iter_mut() {
+        p.y += v.y;
+    }
+}
+
+let mut world = World::new();
+world.add_resource(Gravity(9.8));
+world.spawn().insert(Position { y: 100.0 }).insert(Velocity { y: 0.0 });
+
+let mut schedule = Schedule::new();
+schedule.add_system(apply_gravity);
+schedule.add_system(integrate);
+
+// `integrate` reads Velocity, which `apply_gravity` writes — they
+// conflict, so they land in separate batches and apply_gravity (added
+// first) runs first.
+assert_eq!(schedule.batches().len(), 2);
+
+schedule.run(&mut world); // gravity then integration, then command flush
+```
+
+Two systems whose data never overlaps share one batch instead — the unit
+the M4 executor will hand to a thread pool:
+
+<!-- `ignore`: `spawn_particles`/`age_timers` are illustrative names with no
+     real definitions in this crate, so the block can't compile as a doctest. -->
+```rust,ignore
+schedule.add_system(spawn_particles); // writes Particle
+schedule.add_system(age_timers);      // writes Timer
+// Disjoint access → one batch → ready to run in parallel at M4.
+```
+
+`Commands` is the exception to conflict tracking: it records *deferred*
+edits, so a `Commands`-using system never conflicts with anything and can
+share a batch with any other system.
+
 A workload is a named bundle. Power-grid systems go together in
 `Workload::PowerGrid`; city-tick systems in `Workload::CityTick`.
 Workloads can declare ordering between each other:
@@ -1645,9 +1717,10 @@ app.add_workload(Workload::CityTick, Stage::FixedUpdate, |w| {
 });
 ```
 
-Within a workload, the M4 scheduler reads each system's declared
-access set (from its parameter types) and runs non-conflicting
-systems in parallel via Rayon. Between workloads, everything is
+The access-based batching shown for `Schedule` above is exactly the
+within-workload analysis: a workload will own a `Schedule`, and the M4
+executor will run each batch's non-conflicting systems in parallel via
+Rayon instead of one at a time. Between workloads, everything stays
 sequential and deterministic — commands flush, events propagate.
 
 > **Where the `Stage` enum lives.** The per-frame phases are the closed
@@ -1655,10 +1728,12 @@ sequential and deterministic — commands flush, events propagate.
 > a system with `app.add_system(Stage::Update, my_fn)`. `Stage` lives in
 > `spark-core` — the frame/app layer — not in `spark-ecs`, mirroring how
 > Bevy's `bevy_app` owns `Update` / `Startup` while `bevy_ecs` owns the
-> generic schedule machinery. The workload layer and parallel executor
-> shown above are still ahead; when the `spark-ecs` scheduler lands it
-> will accept `Stage` through a `StageLabel` trait, keeping the
-> dependency direction (`spark-ecs` *below* `spark-core`) cycle-free.
+> generic schedule machinery. The `Schedule` batcher above already lives
+> in `spark-ecs`; the workload layer, the parallel executor, and the
+> wiring that routes each `Stage` to a `Schedule` are still ahead. When
+> that wiring lands, `add_system` will reach `Stage` through a
+> `StageLabel` trait, keeping the dependency direction (`spark-ecs`
+> *below* `spark-core`) cycle-free.
 
 ## Derive macros
 
