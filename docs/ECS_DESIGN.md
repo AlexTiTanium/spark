@@ -280,29 +280,32 @@ pub enum Workload {
 }
 
 app.add_workload(Workload::Input, Stage::PreUpdate, |w| {
-    w.add(poll_window_events);
-    w.add(update_input_state).after(poll_window_events);
-    w.add(update_mouse_world_pos).after(update_input_state);
+    let poll  = w.add_system(poll_window_events);          // add_system → SystemRef (Copy handle)
+    let state = w.add_system(update_input_state).after(poll);
+    w.add_system(update_mouse_world_pos).after(state);
 });
 
 app.add_workload(Workload::PowerGrid, Stage::FixedUpdate, |w| {
-    w.after_workload(Workload::Simulation);
+    // These run in parallel — disjoint access, no order declared.
+    let supply = w.add_system(collect_supply);
+    let demand = w.add_system(compute_demand);
 
-    // These run in parallel — disjoint access
-    w.add(collect_supply);
-    w.add(compute_demand);
-
-    // Runs after both of the above
-    w.add(distribute_power).after_all_prior();
-    w.add(emit_blackout_events).after(distribute_power);
-});
+    // Ordered against the handles above — a partial order, not a linear chain.
+    let distribute = w.add_system(distribute_power).after(supply).after(demand);
+    w.add_system(emit_blackout_events).after(distribute);
+})
+.after(Workload::Simulation);   // workload ordering: same verb, label arg, on the chained return
 ```
 
-Workload-level features:
-- `.after_workload(label)` — explicit ordering between workloads
-- Systems inside use `.after(other_system)` / `.before(other_system)` / `.after_all_prior()`
-- Commands flush at workload boundaries (i.e. all queued commands are applied after a workload completes, before the next workload starts)
-- Editor visualizes workloads as a labelled DAG
+Workload ordering uses **one `.after`/`.before` verb pair, reused at both levels** — only the argument type changes:
+- **Systems** order against the `SystemRef` handle returned by `add_system`: `.after(handle)` / `.before(handle)`. Calls accumulate (`.after(a).after(b)` = "after both"). Handles, not `fn` items, because the same function added twice must stay distinguishable.
+- **Workloads** order against a `WorkloadLabel` on the `add_workload(...)` **return**: `.after(label)` / `.before(label)`. No handle is needed — every workload already carries a label, and labels are `pub` enum variants, so a plugin orders against another plugin's workload with no shared state. (`add_workload` therefore returns an *ordering builder*, not `&mut App`; it does not fluent-chain with `init_resource` / `add_event`.)
+- **An undeclared order between two conflicting systems — or two conflicting workloads — is a registration error** (decision (a)): overlapping write access with no `.after`/`.before` between them is rejected, not silently ordered. Acknowledge an intentional don't-care per pair with `.ambiguous_with(handle | label)`. Because `Commands` declares zero access, this fires only on real component/resource clashes.
+- **Labels resolve lazily, at schedule-build time** — you may `.after(Workload::X)` before `X` is registered. Eager resolution would reintroduce "register A before B", the implicit ordering decision B2 abolishes.
+- Commands flush at workload boundaries (all queued commands apply after a workload completes, before the next starts) — this is what makes a workload the atomic unit; a system needing a *different* upstream belongs in its own workload.
+- Editor visualizes workloads as a labelled DAG.
+
+> **Why handles + `.after`/`.before`, not `.chain()`.** An earlier draft ordered systems with `.after(some_fn)` and `.after_all_prior()`. Both were dropped: `fn`-item identity is fragile (duplicates, closures, generics), and `.after_all_prior()` is registration-order-coupled — the exact thing B2 forbids. A linear `.chain()` was weighed and rejected too, because real dependencies form a *partial* order (a diamond: `files → {meshes ∥ textures} → upload`) that a chain can't express without falsely serialising the independent branches. Handle/label `.after`/`.before` expresses the DAG directly. See #34 for the full decision trail.
 
 Why workloads on top of stages? Stages define the broad frame structure; workloads let modules group their related systems with a meaningful name. A plugin can add a self-contained workload — defining its *own* `WorkloadLabel` enum, with no central list to edit — without worrying about exact system order in some giant frame-wide list.
 
@@ -327,7 +330,7 @@ pub enum Stage {
 
 Per-frame order: `First → PreUpdate → (FixedUpdate × N) → Update → PostUpdate → Render → Last`.
 
-Inside a stage, workloads run in the order their explicit `.after_workload()` constraints dictate. Within a workload, systems run in the order their access conflicts and `.after()` constraints dictate.
+Inside a stage, workloads run in the order their explicit `.after`/`.before` constraints (by label) dictate. Within a workload, systems run in the order their explicit `.after`/`.before` constraints (by handle) dictate; an undeclared order between two conflicting systems is a registration error, not an implicit choice.
 
 Commands flush between every workload. Events double-buffer between `Last` (frame N) and `First` (frame N+1).
 
@@ -348,14 +351,16 @@ impl Plugin for PowerGridPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<PowerNetwork>()
            .add_event::<BlackoutStarted>()
-           .add_event::<BlackoutEnded>()
-           .add_workload(Workload::PowerGrid, Stage::FixedUpdate, |w| {
-               w.after_workload(Workload::Simulation);
-               w.add(collect_supply);
-               w.add(compute_demand);
-               w.add(distribute_power).after_all_prior();
-               w.add(emit_blackout_events).after(distribute_power);
-           });
+           .add_event::<BlackoutEnded>();
+
+        // `add_workload` returns an ordering builder, so it is its own statement.
+        app.add_workload(Workload::PowerGrid, Stage::FixedUpdate, |w| {
+            let supply = w.add_system(collect_supply);
+            let demand = w.add_system(compute_demand);
+            let distribute = w.add_system(distribute_power).after(supply).after(demand);
+            w.add_system(emit_blackout_events).after(distribute);
+        })
+        .after(Workload::Simulation);
     }
 }
 ```
@@ -505,7 +510,7 @@ Zero-cost when the editor isn't attached — registration-time metadata only; th
 
 Each system declares its access set via the `SystemParam::access()` method. The scheduler within a workload:
 
-1. Builds a DAG: edges for declared `.after()` ordering, plus implicit edges where two systems' access sets conflict (read-write or write-write on same `TypeId`).
+1. Builds a DAG from the declared `.after`/`.before` edges. An access conflict (read-write or write-write on the same `TypeId`) keeps two systems out of the same batch, but it does **not** silently add an ordering edge — two conflicting systems with no declared order are a registration error (decision (a)) unless acknowledged with `.ambiguous_with`.
 2. Topologically batches: systems with no remaining dependencies and no current-batch conflicts run in parallel via Rayon.
 3. Commands flush between workloads (single-threaded, deterministic).
 
@@ -623,7 +628,7 @@ pub struct Scheduler {
 
 pub struct StageData {
     workloads: Vec<WorkloadData>,
-    workload_order: Vec<WorkloadId>,   // topo-sorted by .after_workload()
+    workload_order: Vec<WorkloadId>,   // topo-sorted by .after/.before (by label)
 }
 
 pub struct WorkloadData {
@@ -787,12 +792,12 @@ Test: extract a query from a world via the param trait.
 Test: write a regular function with two params, register it, invoke via the system box.
 
 **Stage 11 — `Stage` enum + sequential scheduler** (1 day)
-`Stage::Startup`, `First`, `PreUpdate`, `FixedUpdate`, `Update`, `PostUpdate`, `Render`, `Last`. Scheduler walks them in order, runs systems sequentially within each. The **`Stage` enum + call-site migration shipped with #32**: the enum lives in `spark-core` (replacing the M1–M3 `pub mod stages { pub const STARTUP: &str = "startup"; … }` stand-in), and `add_system(stages::FOO, …)` call-sites moved to `add_system(Stage::Foo, …)` — the method keeps its name (a plural `add_systems` is a separate, undecided API; see roadmap item 3). The sequential scheduler itself is still pending (scheduler epic children 2–6). See roadmap item 3.
+`Stage::Startup`, `First`, `PreUpdate`, `FixedUpdate`, `Update`, `PostUpdate`, `Render`, `Last`. Scheduler walks them in order, runs systems sequentially within each. The **`Stage` enum + call-site migration shipped with #32**: the enum lives in `spark-core` (replacing the M1–M3 `pub mod stages { pub const STARTUP: &str = "startup"; … }` stand-in), and `add_system(stages::FOO, …)` call-sites moved to `add_system(Stage::Foo, …)` — the method keeps its name (a plural `add_systems` was deferred then; resolved 2026-05-22 as the unordered-tuple form, singular stays orderable — see #41). The sequential scheduler itself is still pending (scheduler epic children 2–6). See roadmap item 3.
 Test: three systems in three different stages run in correct order.
 
 **Stage 12 — `Workload` + builder** (2 days)
-`WorkloadLabel` trait + `#[derive(WorkloadLabel)]` (matches over an enum's variants to generate per-variant identity + name). Workload builder closure: `app.add_workload(label, stage, |w| { ... })`. `.after_workload()`, `.after(other_sys)`, `.before(other_sys)`, `.after_all_prior()`. Topo-sort within workload.
-Test: ordering constraints respected; cycle detected at registration.
+`WorkloadLabel` trait + `#[derive(WorkloadLabel)]` (matches over an enum's variants to generate per-variant identity + name). Workload builder closure: `app.add_workload(label, stage, |w| { ... })`. Ordering is one verb pair at both levels: `w.add_system(sys) -> SystemRef` then `.after(handle)` / `.before(handle)` for systems; `app.add_workload(...).after(label)` / `.before(label)` for workloads (lazy label resolution at build). An undeclared conflict is a registration error (decision (a)); `.ambiguous_with(handle | label)` is the escape hatch. No `.chain()` / `.after_all_prior()`. Topo-sort within *and* across workloads.
+Test: ordering respected (incl. a diamond); undeclared conflict errors and `.ambiguous_with` silences it; cycle detected with the pinned message; a forward-referenced label resolves at build. See #34.
 
 **Stage 13 — `Commands` + `CommandQueue`** (2 days)
 `Commands::spawn`, `despawn`, `entity(e).insert().remove()`, `insert_resource`, `update_resource`. Queue flush between workloads.
@@ -943,15 +948,17 @@ pub struct DemoPlugin;
 impl Plugin for DemoPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Camera>()
-           .add_system(Stage::Startup, spawn_player)
-           .add_workload(Workload::PlayerInput, Stage::PreUpdate, |w| {
-               w.after_workload(Workload::Input);
-               w.add(read_player_input);
-           })
-           .add_workload(Workload::PlayerMotion, Stage::Update, |w| {
-               w.add(integrate_motion);
-               w.add(camera_follow).after(integrate_motion);
-           });
+           .add_system(Stage::Startup, spawn_player);
+
+        app.add_workload(Workload::PlayerInput, Stage::PreUpdate, |w| {
+            w.add_system(read_player_input);
+        })
+        .after(Workload::Input);
+
+        app.add_workload(Workload::PlayerMotion, Stage::Update, |w| {
+            let motion = w.add_system(integrate_motion);
+            w.add_system(camera_follow).after(motion);
+        });
     }
 }
 ```
@@ -1069,16 +1076,18 @@ pub struct PowerCityPlugin;
 impl Plugin for PowerCityPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<PowerNetwork>()
-           .add_event::<CityTierUp>()
-           .add_workload(Workload::PowerGrid, Stage::FixedUpdate, |w| {
-               w.add(collect_supply);
-               w.add(compute_demand).after(collect_supply);
-               w.add(distribute_power).after(compute_demand);
-           })
-           .add_workload(Workload::CityTick, Stage::FixedUpdate, |w| {
-               w.after_workload(Workload::PowerGrid);
-               w.add(city_growth);
-           });
+           .add_event::<CityTierUp>();
+
+        app.add_workload(Workload::PowerGrid, Stage::FixedUpdate, |w| {
+            let supply = w.add_system(collect_supply);
+            let demand = w.add_system(compute_demand).after(supply);
+            w.add_system(distribute_power).after(demand);
+        });
+
+        app.add_workload(Workload::CityTick, Stage::FixedUpdate, |w| {
+            w.add_system(city_growth);
+        })
+        .after(Workload::PowerGrid);
     }
 }
 ```
