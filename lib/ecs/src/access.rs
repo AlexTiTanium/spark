@@ -16,6 +16,38 @@
 
 use std::any::{TypeId, type_name};
 
+/// How two access sets clash on a shared type — the companion to the
+/// boolean [`Access::compatible_with`] that *names the reason*.
+///
+/// [`Access::find_conflicts`] returns one of these per offending
+/// [`TypeId`] so a diagnostic can say *why* two systems (or two
+/// workloads) cannot run without a declared order. Read/read overlap is
+/// never a conflict, so it has no variant here.
+///
+/// # Examples
+///
+/// ```
+/// use spark_ecs::{Access, ConflictKind};
+///
+/// struct Position(f32, f32);
+///
+/// let mut writer = Access::new();
+/// writer.components_mut().add_write::<Position>();
+/// let mut reader = Access::new();
+/// reader.components_mut().add_read::<Position>();
+///
+/// let conflicts = writer.find_conflicts(&reader);
+/// assert_eq!(conflicts.len(), 1);
+/// assert_eq!(conflicts[0].1, ConflictKind::WriteRead);
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConflictKind {
+    /// Both sides write the same type — the strongest clash.
+    WriteWrite,
+    /// One side writes a type the other reads.
+    WriteRead,
+}
+
 /// What a query reads and writes — one entry per component type
 /// referenced in the data shape, identified by [`TypeId`] and carrying
 /// its type name for diagnostics.
@@ -70,6 +102,7 @@ pub struct QueryAccess {
 
 /// One `(TypeId, name)` pair — the name is captured at the impl site so a
 /// conflict panic can name the offending type after the types are erased.
+#[derive(Clone, Copy)]
 struct Entry {
     id: TypeId,
     name: &'static str,
@@ -197,6 +230,50 @@ impl QueryAccess {
         !aliases(&self.writes, &other.writes)
             && !aliases(&self.writes, &other.reads)
             && !aliases(&other.writes, &self.reads)
+    }
+
+    /// Pushes every conflicting `(TypeId, ConflictKind)` between `self`
+    /// and `other` into `out` — the same three checks
+    /// [`is_compatible_with`](Self::is_compatible_with) folds into a
+    /// bool, but recording *which* type clashed and *how*.
+    ///
+    /// Write/write is pushed before write/read so a consumer that takes
+    /// the first conflict reports the strongest clash for that type.
+    fn collect_conflicts(&self, other: &QueryAccess, out: &mut Vec<(TypeId, ConflictKind)>) {
+        for w in &self.writes {
+            if other.writes.iter().any(|o| o.id == w.id) {
+                out.push((w.id, ConflictKind::WriteWrite));
+            }
+        }
+        for w in &self.writes {
+            if other.reads.iter().any(|o| o.id == w.id) {
+                out.push((w.id, ConflictKind::WriteRead));
+            }
+        }
+        for w in &other.writes {
+            if self.reads.iter().any(|o| o.id == w.id) {
+                out.push((w.id, ConflictKind::WriteRead));
+            }
+        }
+    }
+
+    /// The diagnostic name recorded for `id`, if this set references it.
+    /// Looks in both reads and writes — a type appears in at most one
+    /// per [`assert_no_self_conflict`](Self::assert_no_self_conflict).
+    fn name_of(&self, id: TypeId) -> Option<&'static str> {
+        self.reads
+            .iter()
+            .chain(self.writes.iter())
+            .find(|e| e.id == id)
+            .map(|e| e.name)
+    }
+
+    /// Folds `other`'s reads and writes into `self`. Used to aggregate a
+    /// workload's access from its members; entries are not deduplicated
+    /// (the conflict checks tolerate repeats, and the lists stay tiny).
+    fn extend(&mut self, other: &QueryAccess) {
+        self.reads.extend_from_slice(&other.reads);
+        self.writes.extend_from_slice(&other.writes);
     }
 }
 
@@ -404,6 +481,69 @@ impl Access {
         self.components.is_compatible_with(&other.components)
             && self.resources.is_compatible_with(&other.resources)
     }
+
+    /// Every conflicting type between `self` and `other`, paired with the
+    /// kind of clash — the diagnostic companion to
+    /// [`compatible_with`](Self::compatible_with).
+    ///
+    /// Where `compatible_with` answers *can these run together?*,
+    /// `find_conflicts` answers *which types stop them, and how?* — the
+    /// input the workload layer turns into a "these two conflict on
+    /// `Position`, declare an order" message. Components and resources
+    /// are checked in their own domains (a type used as both never
+    /// cross-conflicts), and the returned [`TypeId`]s are resolved back
+    /// to names with [`describe`](Self::describe).
+    ///
+    /// An empty result is exactly `compatible_with(other) == true`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use spark_ecs::{Access, ConflictKind};
+    ///
+    /// struct Score(u32);   // a resource
+    ///
+    /// let mut a = Access::new();
+    /// a.add_resource_write::<Score>();
+    /// let mut b = Access::new();
+    /// b.add_resource_write::<Score>();
+    ///
+    /// let conflicts = a.find_conflicts(&b);
+    /// assert_eq!(conflicts[0].1, ConflictKind::WriteWrite);
+    /// assert!(!a.compatible_with(&b));
+    /// ```
+    #[must_use]
+    pub fn find_conflicts(&self, other: &Access) -> Vec<(TypeId, ConflictKind)> {
+        let mut out = Vec::new();
+        self.components
+            .collect_conflicts(&other.components, &mut out);
+        self.resources.collect_conflicts(&other.resources, &mut out);
+        out
+    }
+
+    /// The name and domain word (`"component"` / `"resource"`) recorded
+    /// for `id`, if this set references it.
+    ///
+    /// `find_conflicts` returns bare [`TypeId`]s (the scheduler's
+    /// currency); this resolves one back to the human-readable pieces a
+    /// conflict message needs — `"Position"` and `"component"`. Returns
+    /// `None` if `id` is not in this set.
+    #[must_use]
+    pub fn describe(&self, id: TypeId) -> Option<(&'static str, &'static str)> {
+        if let Some(name) = self.components.name_of(id) {
+            Some((name, "component"))
+        } else {
+            self.resources.name_of(id).map(|name| (name, "resource"))
+        }
+    }
+
+    /// Folds `other`'s component and resource access into `self` — the
+    /// union used to build a workload's aggregate access from its member
+    /// systems, which cross-workload conflict detection then compares.
+    pub(crate) fn extend(&mut self, other: &Access) {
+        self.components.extend(&other.components);
+        self.resources.extend(&other.resources);
+    }
 }
 
 #[cfg(test)]
@@ -595,5 +735,63 @@ mod tests {
         access.add_resource_write::<A>();
         access.add_resource_read::<B>();
         access.assert_no_self_conflict();
+    }
+
+    #[test]
+    fn find_conflicts_reports_write_write() {
+        let mut a = Access::new();
+        a.components_mut().add_write::<A>();
+        let mut b = Access::new();
+        b.components_mut().add_write::<A>();
+        let conflicts = a.find_conflicts(&b);
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].0, TypeId::of::<A>());
+        assert_eq!(conflicts[0].1, ConflictKind::WriteWrite);
+    }
+
+    #[test]
+    fn find_conflicts_reports_write_read_in_either_order() {
+        // self writes, other reads.
+        let mut writer = Access::new();
+        writer.components_mut().add_write::<A>();
+        let mut reader = Access::new();
+        reader.components_mut().add_read::<A>();
+        assert_eq!(writer.find_conflicts(&reader)[0].1, ConflictKind::WriteRead);
+        // Mirror: other writes, self reads — still WriteRead.
+        assert_eq!(reader.find_conflicts(&writer)[0].1, ConflictKind::WriteRead);
+    }
+
+    #[test]
+    fn find_conflicts_empty_iff_compatible() {
+        let mut a = Access::new();
+        a.components_mut().add_write::<A>();
+        let mut b = Access::new();
+        b.components_mut().add_write::<B>();
+        assert!(a.find_conflicts(&b).is_empty());
+        assert!(a.compatible_with(&b));
+    }
+
+    #[test]
+    fn find_conflicts_keeps_component_and_resource_domains_apart() {
+        // Component `A` vs resource `A`: different storages, no conflict.
+        let mut component_writer = Access::new();
+        component_writer.components_mut().add_write::<A>();
+        let mut resource_writer = Access::new();
+        resource_writer.add_resource_write::<A>();
+        assert!(component_writer.find_conflicts(&resource_writer).is_empty());
+    }
+
+    #[test]
+    fn describe_resolves_name_and_domain() {
+        let mut access = Access::new();
+        access.components_mut().add_write::<A>();
+        access.add_resource_read::<B>();
+        let (name, domain) = access.describe(TypeId::of::<A>()).expect("A is present");
+        assert!(name.ends_with("::A") || name == "A");
+        assert_eq!(domain, "component");
+        assert_eq!(
+            access.describe(TypeId::of::<B>()).map(|(_, d)| d),
+            Some("resource")
+        );
     }
 }

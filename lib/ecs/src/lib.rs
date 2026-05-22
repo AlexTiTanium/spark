@@ -14,24 +14,30 @@ mod query;
 mod scheduler;
 mod storage;
 mod system;
+mod workload;
 mod world;
 
-pub use access::{Access, QueryAccess};
+pub use access::{Access, ConflictKind, QueryAccess};
 pub use commands::{CommandQueue, Commands, EntityCommands};
 pub use entity::{Entity, EntityAllocator};
 pub use filter::{And, Or, QueryFilter, With, Without};
 pub use query::{Query, QueryData, ReadOnlyQueryData};
-pub use scheduler::{Schedule, SystemId};
+pub use scheduler::{Schedule, WorkloadOrderBuilder};
 pub use storage::{AnyStorage, ComponentStorage};
 pub use system::{IntoSystem, Res, ResMut, SystemParam};
+pub use workload::{
+    IntoSystemTuple, SystemId, SystemOrderBuilder, SystemRef, WorkloadBuilder, WorkloadId,
+    WorkloadLabel,
+};
 pub use world::{EntityMut, World};
 
 // The trait and the derive macro deliberately share a name (`Component`
 // is both `trait Component` here and the `#[derive(Component)]` macro
 // re-exported below). They live in different namespaces — type vs macro
 // — so one `use spark_ecs::Component;` pulls in both, exactly like
-// `serde::Serialize`.
-pub use spark_ecs_macros::{Component, Resource};
+// `serde::Serialize`. `WorkloadLabel` follows the same dual-name pattern:
+// the trait lives in `workload`, the derive in `spark-ecs-macros`.
+pub use spark_ecs_macros::{Component, Resource, WorkloadLabel};
 
 /// Marker trait for types that attach to entities as components and are
 /// matched by [`Query`](crate::Query).
