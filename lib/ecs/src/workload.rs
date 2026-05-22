@@ -133,15 +133,16 @@ pub trait WorkloadLabel: 'static {
 /// against an unrelated system. In debug builds a stamped workload id
 /// catches exactly that: the ordering methods assert the handle came from
 /// the workload they belong to, turning a silent mis-order into a panic.
-/// (The tag is `#[cfg(debug_assertions)]`-only, so release builds pay
-/// nothing.)
+/// (The check is a `debug_assert`, compiled out of release; the handle is
+/// a transient build-time value, so the stamped id costs nothing that
+/// matters.)
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SystemRef {
     idx: usize,
-    /// The workload this handle was minted in — checked in debug builds by
-    /// the ordering methods so a cross-workload handle panics instead of
-    /// silently aliasing the wrong system.
-    #[cfg(debug_assertions)]
+    /// The workload this handle was minted in. The ordering methods
+    /// `debug_assert` against it, so a cross-workload handle panics in
+    /// debug instead of silently aliasing the wrong system; the check is
+    /// compiled out in release.
     workload: WorkloadId,
 }
 
@@ -311,11 +312,10 @@ impl WorkloadData {
 /// ```
 pub struct WorkloadBuilder {
     data: WorkloadData,
-    /// The label this builder is for, stamped into the [`SystemRef`]s it
+    /// The label this builder is for, stamped into every [`SystemRef`] it
     /// hands out so the ordering methods can reject a handle from a
-    /// different workload. Debug-only, matching the guard it serves; held
-    /// directly (not via `data.label`) so there is no `Option` to unwrap.
-    #[cfg(debug_assertions)]
+    /// different workload. Held directly (not via `data.label`) so there is
+    /// no `Option` to unwrap.
     id: WorkloadId,
 }
 
@@ -324,16 +324,8 @@ impl WorkloadBuilder {
     pub(crate) fn new(label: WorkloadId, name: &'static str) -> Self {
         Self {
             data: WorkloadData::new(Some(label), name),
-            #[cfg(debug_assertions)]
             id: label,
         }
-    }
-
-    /// This builder's workload id, for the cross-workload [`SystemRef`]
-    /// guard. Debug-only, matching the guard it serves.
-    #[cfg(debug_assertions)]
-    fn workload_id(&self) -> WorkloadId {
-        self.id
     }
 
     /// Registers `system` and returns a [`SystemOrderBuilder`] for
@@ -493,28 +485,20 @@ impl SystemOrderBuilder<'_> {
     pub fn id(&self) -> SystemRef {
         SystemRef {
             idx: self.idx,
-            #[cfg(debug_assertions)]
-            workload: self.builder.workload_id(),
+            workload: self.builder.id,
         }
     }
 
-    /// Debug-only guard: panics if `other` was minted in a different
-    /// workload, catching a stashed handle fed to the wrong builder. A
-    /// no-op in release (the `SystemRef` carries no tag there).
-    #[cfg(debug_assertions)]
+    /// Guards against a handle minted in a different workload (a stashed
+    /// `SystemRef` fed to the wrong builder). The check is a `debug_assert`,
+    /// so it costs nothing in release.
     fn assert_same_workload(&self, other: SystemRef) {
-        assert_eq!(
-            other.workload,
-            self.builder.workload_id(),
+        debug_assert_eq!(
+            other.workload, self.builder.id,
             "a SystemRef was used to order a system in a different workload than the \
              one that produced it"
         );
     }
-
-    /// Release build: the tag does not exist, so there is nothing to check.
-    #[cfg(not(debug_assertions))]
-    #[expect(clippy::unused_self, reason = "matches the debug-build signature")]
-    fn assert_same_workload(&self, _other: SystemRef) {}
 }
 
 /// A tuple of systems that [`add_systems`](WorkloadBuilder::add_systems)
