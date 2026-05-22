@@ -233,6 +233,14 @@ impl Schedule {
     /// [`SystemParam`](crate::SystemParam) — the same `IntoSystem` bound
     /// the rest of the engine uses, so call sites need no turbofish.
     ///
+    /// # Panics
+    ///
+    /// Panics if the system's own parameters conflict — two that write the
+    /// same component/resource, or one writing what another reads (e.g.
+    /// `fn(Query<&mut Pos>, Query<&mut Pos>)`). Refusing it here, naming
+    /// the type, beats the `RefCell` "already borrowed" panic it would
+    /// otherwise hit mid-run. See [`Access::assert_no_self_conflict`].
+    ///
     /// # Examples
     ///
     /// ```
@@ -250,9 +258,14 @@ impl Schedule {
     where
         S: IntoSystem<Marker>,
     {
+        let access = <S as IntoSystem<Marker>>::access();
+        // Refuse a self-conflicting system at registration rather than
+        // letting it RefCell-panic mid-run when its second aliasing
+        // parameter is fetched.
+        access.assert_no_self_conflict();
         self.systems.push(BoxedSystem {
             name: std::any::type_name::<S>(),
-            access: <S as IntoSystem<Marker>>::access(),
+            access,
             run: system.into_system(),
         });
         self.batches = None;
@@ -594,6 +607,34 @@ mod tests {
         assert_eq!(batches[0], vec![SystemId(0)]);
         assert_eq!(batches[1], vec![SystemId(1)]);
         assert_eq!(batches[2], vec![SystemId(2)]);
+    }
+
+    #[test]
+    #[should_panic(expected = "conflicting access to component")]
+    fn registering_self_conflicting_query_system_panics() {
+        // Two parameters both write Position — refused at registration with
+        // a named component, not as a `RefCell` panic mid-run. (This is the
+        // exact shape that previously slipped through to runtime.)
+        fn weird(mut q1: Query<&mut Position>, mut q2: Query<&mut Position>) {
+            for p in q1.iter_mut() {
+                p.x += 1.0;
+            }
+            for p in q2.iter_mut() {
+                p.x += 1.0;
+            }
+        }
+        Schedule::new().add_system(weird);
+    }
+
+    #[test]
+    #[should_panic(expected = "conflicting access to resource")]
+    fn registering_resource_self_conflicting_system_panics() {
+        // `Res<Score>` + `ResMut<Score>`: shared and exclusive borrow of
+        // the same resource in one system — refused at registration.
+        fn weird(_r: Res<Score>, mut w: ResMut<Score>) {
+            w.value += 1;
+        }
+        Schedule::new().add_system(weird);
     }
 
     #[test]

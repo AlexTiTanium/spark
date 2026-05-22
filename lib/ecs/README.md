@@ -1699,6 +1699,12 @@ schedule.add_system(age_timers);      // writes Timer
 edits, so a `Commands`-using system never conflicts with anything and can
 share a batch with any other system.
 
+A system whose *own* parameters conflict — two that write the same
+component, or one writing what another reads, like
+`fn(Query<&mut Pos>, Query<&mut Pos>)` — is refused by `add_system` at
+registration, naming the offending type, rather than surfacing as a
+`RefCell` "already borrowed" panic deep inside a later `run`.
+
 A workload is a named bundle. Power-grid systems go together in
 `Workload::PowerGrid`; city-tick systems in `Workload::CityTick`.
 Workloads can declare ordering between each other:

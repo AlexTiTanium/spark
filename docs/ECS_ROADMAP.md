@@ -86,7 +86,8 @@ do not refile it. Originally filed as #25 and closed as stale.
     (`components`/`resources` read-write sets reusing `QueryAccess`),
     `SystemParam::collect_access` on `Res`/`ResMut`/`Query`/`Commands`,
     `IntoSystem::access()` aggregation, `Access::compatible_with`
-    cross-system conflict detection, and a `Schedule` that ASAP-layers
+    cross-system conflict detection (+ `Access::assert_no_self_conflict`,
+    refusing self-aliasing systems at registration), and a `Schedule` that ASAP-layers
     systems into access-disjoint batches and walks them with a sequential
     executor (commands flush once at the end). The implicit ordering here
     is **access-derived in registration order** — conflicting systems

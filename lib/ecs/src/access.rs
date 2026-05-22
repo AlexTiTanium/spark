@@ -68,11 +68,21 @@ pub struct QueryAccess {
     writes: Vec<Entry>,
 }
 
-/// One `(TypeId, name)` pair — name captured at the impl site so the
-/// panic can identify the component.
+/// One `(TypeId, name)` pair — the name is captured at the impl site so a
+/// conflict panic can name the offending type after the types are erased.
 struct Entry {
     id: TypeId,
     name: &'static str,
+}
+
+impl Entry {
+    /// Records `T`'s [`TypeId`] alongside its [`type_name`] for diagnostics.
+    fn of<T: 'static>() -> Self {
+        Self {
+            id: TypeId::of::<T>(),
+            name: type_name::<T>(),
+        }
+    }
 }
 
 impl QueryAccess {
@@ -90,10 +100,7 @@ impl QueryAccess {
     /// access.assert_no_self_conflict();
     /// ```
     pub fn add_read<T: 'static>(&mut self) {
-        self.reads.push(Entry {
-            id: TypeId::of::<T>(),
-            name: type_name::<T>(),
-        });
+        self.reads.push(Entry::of::<T>());
     }
 
     /// Records that the query writes `T`.
@@ -110,10 +117,7 @@ impl QueryAccess {
     /// access.assert_no_self_conflict();
     /// ```
     pub fn add_write<T: 'static>(&mut self) {
-        self.writes.push(Entry {
-            id: TypeId::of::<T>(),
-            name: type_name::<T>(),
-        });
+        self.writes.push(Entry::of::<T>());
     }
 
     /// Panics if any single component is written and either written or
@@ -134,15 +138,22 @@ impl QueryAccess {
     /// `{name}`"` where `{name}` is the offending type's
     /// [`std::any::type_name`].
     pub fn assert_no_self_conflict(&self) {
+        self.assert_no_self_conflict_named("query", "component");
+    }
+
+    /// Shared self-conflict loop. `scope`/`kind` shape the message so the
+    /// per-query check reads `("query", "component")` and the per-system
+    /// check via [`Access`] reads `("system", "component" | "resource")`.
+    fn assert_no_self_conflict_named(&self, scope: &str, kind: &str) {
         for (i, w) in self.writes.iter().enumerate() {
             assert!(
                 !self.writes[i + 1..].iter().any(|other| other.id == w.id),
-                "query has conflicting access to component `{}` (written twice)",
+                "{scope} has conflicting access to {kind} `{}` (written twice)",
                 w.name
             );
             assert!(
                 !self.reads.iter().any(|other| other.id == w.id),
-                "query has conflicting access to component `{}` (written and read)",
+                "{scope} has conflicting access to {kind} `{}` (written and read)",
                 w.name
             );
         }
@@ -181,10 +192,8 @@ impl QueryAccess {
     /// ```
     #[must_use]
     pub fn is_compatible_with(&self, other: &QueryAccess) -> bool {
-        // A conflict is exactly: one side writes a type the other side
-        // touches. write/write and self-write/other-read are the first
-        // two checks; other-write/self-read is the mirror (read/read is
-        // never a conflict, so it needs no check).
+        // write/write and self-write/other-read are the first two checks;
+        // other-write/self-read is the mirror (read/read never conflicts).
         !aliases(&self.writes, &other.writes)
             && !aliases(&self.writes, &other.reads)
             && !aliases(&other.writes, &self.reads)
@@ -223,6 +232,10 @@ fn aliases(writes: &[Entry], against: &[Entry]) -> bool {
 /// ├── components: QueryAccess { reads: [Velocity], writes: [Position] }
 /// └── resources:  QueryAccess { reads: [Time],     writes: []         }
 /// ```
+///
+/// Both sets are [`QueryAccess`] — reused here purely as a read/write set
+/// with a conflict rule; the "query" in the name is incidental for the
+/// resource set. Same rule, two domains.
 ///
 /// # Why the two sets stay separate
 ///
@@ -268,6 +281,9 @@ fn aliases(writes: &[Entry], against: &[Entry]) -> bool {
 #[derive(Default)]
 pub struct Access {
     components: QueryAccess,
+    /// Resource reads/writes. Reuses [`QueryAccess`] as a plain read/write
+    /// set with a conflict rule — kept separate from `components` so a type
+    /// used as both a component and a resource never cross-conflicts.
     resources: QueryAccess,
 }
 
@@ -338,15 +354,38 @@ impl Access {
         self.resources.add_write::<T>();
     }
 
+    /// Panics if this system's own parameters conflict with each other —
+    /// two parameters writing the same component or resource, or one
+    /// writing what another reads (e.g. `fn(Query<&mut Pos>, Query<&mut
+    /// Pos>)`, or `fn(Res<A>, ResMut<A>)`).
+    ///
+    /// Called at registration so the conflict is refused *there*, naming
+    /// the offending type, instead of surfacing later as a `RefCell`
+    /// "already borrowed" panic when the system runs and fetches its
+    /// second aliasing parameter. This is the intra-system mirror of
+    /// [`QueryAccess::assert_no_self_conflict`]; the cross-system rule is
+    /// [`compatible_with`](Self::compatible_with), which is separate.
+    ///
+    /// # Panics
+    ///
+    /// Panics with `"system has conflicting access to {component|resource}
+    /// `{name}` …"`, naming the first offending type.
+    pub fn assert_no_self_conflict(&self) {
+        self.components
+            .assert_no_self_conflict_named("system", "component");
+        self.resources
+            .assert_no_self_conflict_named("system", "resource");
+    }
+
     /// Returns `true` if `self` and `other` can run concurrently — no
     /// component **and** no resource written by one is read or written by
     /// the other.
     ///
-    /// Components and resources are checked independently
-    /// ([`QueryAccess::is_compatible_with`] on each set), so a clash in
-    /// either set is enough to force serialisation, while a type that
-    /// happens to name both a component and a resource never
-    /// cross-contaminates. Read/read overlap is always compatible.
+    /// Components and resources are checked independently — the same
+    /// read/write conflict rule applied to each set — so a clash in
+    /// either is enough to force serialisation, while a type that happens
+    /// to name both a component and a resource never cross-contaminates.
+    /// Read/read overlap is always compatible.
     ///
     /// # Examples
     ///
@@ -525,5 +564,36 @@ mod tests {
         let mut reader = Access::new();
         reader.components_mut().add_read::<A>();
         assert!(!writer.compatible_with(&reader));
+    }
+
+    #[test]
+    #[should_panic(expected = "system has conflicting access to component")]
+    fn access_self_conflict_component_written_twice_panics() {
+        // Two parameters both writing component `A` — the system-level
+        // mirror of a per-query self-conflict.
+        let mut access = Access::new();
+        access.components_mut().add_write::<A>();
+        access.components_mut().add_write::<A>();
+        access.assert_no_self_conflict();
+    }
+
+    #[test]
+    #[should_panic(expected = "system has conflicting access to resource")]
+    fn access_self_conflict_resource_written_and_read_panics() {
+        let mut access = Access::new();
+        access.add_resource_write::<A>();
+        access.add_resource_read::<A>();
+        access.assert_no_self_conflict();
+    }
+
+    #[test]
+    fn access_disjoint_params_have_no_self_conflict() {
+        // Component `A` and resource `A` are different domains, so writing
+        // both is not a self-conflict; distinct resource reads are fine too.
+        let mut access = Access::new();
+        access.components_mut().add_write::<A>();
+        access.add_resource_write::<A>();
+        access.add_resource_read::<B>();
+        access.assert_no_self_conflict();
     }
 }
