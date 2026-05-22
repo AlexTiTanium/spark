@@ -93,8 +93,9 @@ do not refile it. Originally filed as #25 and closed as stale.
     is **access-derived in registration order** — conflicting systems
     serialise earliest-registered-first; only provably-independent systems
     are ever reordered.
-  - ⬜ **remaining:** explicit `.before()/.after()` user ordering and the
-    `Workload` layer (child 3, #34); `Plugin` `&mut World` + `App`
+  - ⬜ **remaining:** explicit `.before`/`.after` user ordering and the
+    `Workload` layer (child 3, #34 — **design resolved 2026-05-22**, see
+    *Workload labels* below); `Plugin` `&mut World` + `App`
     registration + per-frame run loop wiring each `Stage` to a `Schedule`
     (child 4, #35); `Events` (child 5, #36); `FixedUpdate` accumulator
     (child 6, #37).
@@ -107,8 +108,9 @@ do not refile it. Originally filed as #25 and closed as stale.
   the future `spark-ecs` scheduler reaches it through a `StageLabel` trait
   to stay cycle-free. `add_system(stages::FOO, …)` call-sites moved to
   `add_system(Stage::Foo, …)`: **the method keeps its name** — a plural
-  `add_systems` (multi-system registration) is a *separate, undecided*
-  API, deferred until usage demands it (tracked in #41). The enum gives
+  `add_systems` (multi-system registration) was deferred at the time
+  (tracked in #41; **resolved 2026-05-22** — adopt plural as the
+  unordered-tuple form, singular stays the orderable handle). The enum gives
   compile-time
   exhaustiveness for the editor's stage view and removes the
   stringly-typed footgun. `Stage` is **closed**: one frame timeline means
@@ -124,8 +126,21 @@ do not refile it. Originally filed as #25 and closed as stale.
   per ECS_DESIGN.md. Workloads are how plugins group related systems
   under a name; they sit *inside* a `Stage` and are the granularity
   the scheduler topo-sorts and batches.
+  **Design resolved 2026-05-22 (#34):** one `.after`/`.before` verb pair at
+  both levels — `SystemRef` handles for systems (`w.add_system(s).after(h)`),
+  `WorkloadLabel` for workloads (`add_workload(...).after(label)`, on the
+  returned ordering builder, resolved lazily at build). An undeclared order
+  between two conflicting systems *or* workloads is a registration error
+  (the conflict-policy decision below); `.ambiguous_with(handle | label)` is
+  the per-pair escape hatch. No `.chain()` / `.after_all_prior()` — fragile
+  `fn`-identity and registration-order coupling, both rejected. `add_systems((..))`
+  is the unordered-tuple form, `add_system` the orderable singular (#41 resolved).
 - *Decisions:* **B2** (explicit ordering + topo-sort, not registration order);
-  **C1** (`Access` + DAG now, parallel executor committed for M4).
+  the **conflict-policy decision** (#34 — an undeclared write-overlap is a
+  registration error at system *and* workload level, escape hatch
+  `.ambiguous_with`; viable because `Commands` declares zero access, so it
+  never false-positives); **C1** (`Access` + DAG now, parallel executor
+  committed for M4).
 - *Warnings:* `Access` is the **safety proof** for M4 lockless parallelism, not
   just an ambiguity check — it must be complete and correct from day one.
   All storage access must funnel through one chokepoint so the M4
