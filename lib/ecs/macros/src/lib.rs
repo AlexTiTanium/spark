@@ -2,7 +2,7 @@
 
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{DeriveInput, parse_macro_input};
+use syn::{Data, DeriveInput, Fields, parse_macro_input};
 
 /// Derives `Component` — the explicit opt-in that lets a type be
 /// stored on entities and matched by `Query`.
@@ -55,6 +55,87 @@ pub fn derive_component(input: TokenStream) -> TokenStream {
 #[proc_macro_derive(Resource)]
 pub fn derive_resource(input: TokenStream) -> TokenStream {
     impl_marker(input, &quote!(::spark_ecs::Resource))
+}
+
+/// Derives `WorkloadLabel` for an enum — one variant, one workload label.
+///
+/// Matches over the enum's unit variants to generate `id()` (the enum's
+/// [`TypeId`](std::any::TypeId) paired with the 0-based variant index) and
+/// `name()` (the qualified `"Enum::Variant"` string, so diagnostics
+/// disambiguate labels from different enums). This is why it applies to an
+/// *enum*, not a unit struct: the scheduler needs one identity and one
+/// name per label, and an enum's variants enumerate exactly those.
+///
+/// # Errors
+///
+/// Emits a `compile_error!` if applied to anything but an enum whose
+/// variants are all unit variants — a tuple or struct variant has no
+/// single meaningful label, and a struct/union isn't a set of labels at
+/// all.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// // `ignore`: this crate can't depend on `spark-ecs` (cycle), so the
+/// // trait isn't importable here. Runnable examples live in the ECS
+/// // crate's tests and README.
+/// use spark_ecs::WorkloadLabel;
+///
+/// #[derive(WorkloadLabel)]
+/// enum Grid { Supply, Distribute, Cleanup }
+/// ```
+#[proc_macro_derive(WorkloadLabel)]
+pub fn derive_workload_label(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    let name = &input.ident;
+
+    let Data::Enum(data) = &input.data else {
+        return syn::Error::new_spanned(
+            name,
+            "#[derive(WorkloadLabel)] is only valid on enums — one variant per workload label",
+        )
+        .into_compile_error()
+        .into();
+    };
+
+    // Each variant must be a unit variant: a label carries no data.
+    for variant in &data.variants {
+        if !matches!(variant.fields, Fields::Unit) {
+            return syn::Error::new_spanned(
+                &variant.ident,
+                "#[derive(WorkloadLabel)] requires unit variants only (no fields)",
+            )
+            .into_compile_error()
+            .into();
+        }
+    }
+
+    let id_arms = data.variants.iter().enumerate().map(|(index, variant)| {
+        let variant = &variant.ident;
+        quote! {
+            #name::#variant => ::spark_ecs::WorkloadId::new(
+                ::std::any::TypeId::of::<#name>(),
+                #index,
+            )
+        }
+    });
+    let name_arms = data.variants.iter().map(|variant| {
+        let variant = &variant.ident;
+        let qualified = format!("{name}::{variant}");
+        quote! { #name::#variant => #qualified }
+    });
+
+    quote! {
+        impl ::spark_ecs::WorkloadLabel for #name {
+            fn id(&self) -> ::spark_ecs::WorkloadId {
+                match self { #(#id_arms,)* }
+            }
+            fn name(&self) -> &'static str {
+                match self { #(#name_arms,)* }
+            }
+        }
+    }
+    .into()
 }
 
 /// Emits an empty marker `impl #trait_path for #Type {}`, threading the

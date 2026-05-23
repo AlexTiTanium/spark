@@ -1,15 +1,31 @@
-//! The sequential scheduler: a [`Schedule`] groups systems into
-//! conflict-free batches and runs them.
+//! The sequential-batch scheduler: a [`Schedule`] is one stage's worth of
+//! **workloads**, ordered and run batch by batch.
 //!
-//! A [`Schedule`] owns a list of registered systems. At run time it
-//! partitions them into **batches** — each batch a set of systems whose
-//! [`Access`] sets are pairwise disjoint, so nothing in a batch reads
-//! what another member writes. Today the executor walks the batches one
-//! system at a time on the calling thread; the batch *structure* is the
-//! plan the M4 parallel executor will hand to Rayon unchanged. Building
-//! and testing that structure now, under a sequential walk, means M4 only
-//! swaps the innermost loop (`for sys` → `rayon::scope`) — the analysis
-//! that makes it sound is already proven.
+//! Spark registers work two ways, by intent, through two separate
+//! mechanisms that share only the frame `Stage` they sit in:
+//!
+//! - **Sequential systems** live on `spark_core::Application`
+//!   (`app.add_system(stage, fn)`): they run in the calling thread, in
+//!   registration order, with no batching and no parallelism. A `Schedule`
+//!   knows nothing about them.
+//! - **Parallel-capable workloads** live here. A [`Schedule`] is a
+//!   *container for named workloads* —
+//!   [`add_workload(label, |w| { … })`](Schedule::add_workload) is its only
+//!   entry point. The scheduler partitions each workload's systems into
+//!   access-disjoint batches (Rayon-backed in M4; a sequential batch walk
+//!   today). Reach for a workload when you want the scheduler to extract
+//!   parallelism.
+//!
+//! Workloads are ordered against each other by
+//! [`WorkloadLabel`](crate::WorkloadLabel); systems inside a workload are
+//! ordered against each other by handle ([`SystemRef`](crate::SystemRef)).
+//! Both use the same `.after`/`.before` verb — see [`crate::workload`].
+//!
+//! Inside a workload, systems partition into **batches** — each batch a set
+//! whose [`Access`](crate::Access) sets are pairwise disjoint, so nothing
+//! in a batch reads what another member writes. Today the executor walks
+//! the batches one system at a time; the batch *structure* is the plan the
+//! M4 parallel executor will hand to Rayon unchanged.
 //!
 //! One caveat to that promise: [`Commands`](crate::Commands) declares no
 //! access, so two command-queuing systems may share a batch. Running
@@ -18,174 +34,69 @@
 //! in its own right. Every other parameter's safety does follow from the
 //! batch structure alone.
 //!
-//! Ordering is **access-derived** only: with no explicit
-//! `.before()`/`.after()` yet (that lands with workloads), two systems
-//! that conflict are serialised in *registration order* — the earlier
-//! `add_system` call runs first. See [`Schedule`] for how the batching
-//! turns that rule into layers.
+//! # Ordering is explicit, not registration order (decision B2)
+//!
+//! Two systems — or two workloads — whose access *conflicts* with no
+//! order declared between them is a **registration error**
+//! ([`validate_system_conflicts`](crate::workload::validate_system_conflicts)),
+//! not a silent fallthrough. Declare `.after`/`.before`, or assert the two
+//! may run in any order with `.any_order_with`. A conflicting pair is
+//! always placed in separate batches; a declared edge fixes which runs
+//! first, while an any-order pair simply takes its topological position
+//! (registration index when no edge constrains it).
 
-use crate::access::Access;
-use crate::system::IntoSystem;
+use crate::workload::{
+    EdgeKind, SystemId, WorkloadBuilder, WorkloadData, WorkloadId, WorkloadLabel, cycle_message,
+    cycle_path, first_conflict, has_declared_order, successors_of, topo_sort,
+    unknown_label_message, workload_conflict_message,
+};
 use crate::world::World;
 
-/// Identifies a system within a [`Schedule`] — its registration index.
+/// One stage's worth of **workloads** — named, parallel-capable groups,
+/// batched by access conflicts and ordered by explicit `.after`/`.before`.
 ///
-/// Returned inside the batch lists from [`Schedule::batches`]. The inner
-/// value is a position in the schedule's system list, so [`usize`] (the
-/// natural index type) avoids any cast on the hot path.
-///
-/// # Examples
-///
-/// ```
-/// use spark_ecs::{Schedule, World};
-///
-/// fn noop() {}
-/// let mut schedule = Schedule::new();
-/// schedule.add_system(noop);
-/// let first = schedule.batches()[0][0];
-/// assert_eq!(first, first);   // `SystemId` is comparable
-/// ```
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct SystemId(usize);
-
-/// A registered system: its erased run closure, its declared [`Access`],
-/// and its name (the fn's type path, for diagnostics).
-struct BoxedSystem {
-    name: &'static str,
-    access: Access,
-    run: Box<dyn FnMut(&World) + 'static>,
-}
-
-/// Partitions systems into access-disjoint batches via **ASAP layering**.
+/// A `Schedule` is purely a container for named workloads:
+/// [`add_workload(label, |w| { … })`](Self::add_workload) is its **only**
+/// entry point, returning a [`WorkloadOrderBuilder`] for `.after(label)` /
+/// `.before(label)`. Sequential systems are a *separate* mechanism living on
+/// `spark_core::Application` (`app.add_system(stage, fn)`); a `Schedule`
+/// never sees them.
 ///
 /// # Logic
 ///
-/// Each system gets a *rank*. Walking systems in registration order, a
-/// system's rank is one more than the highest rank of any **earlier**
-/// system it conflicts with, or `0` if it conflicts with none:
-///
-/// ```text
-/// rank[i] = max( rank[j] + 1 ) over all j < i where i and j conflict
-///         = 0 if no such j
-/// ```
-///
-/// Systems sharing a rank become one batch, in registration order.
-///
-/// # Memory layout
-///
-/// ```text
-/// registration:  S0(write A)  S1(write B)  S2(read A)  S3(read B)
-/// conflicts:      S2↔S0 (A)    S3↔S1 (B)
-/// rank:           0            0            1           1
-/// batches:        [ [S0, S1], [S2, S3] ]
-///                   rank 0      rank 1
-/// ```
-///
-/// S1 and S3 touch only B, so they slot into the *earliest* batch that
-/// holds no conflicting predecessor — not a later one just because they
-/// were registered late.
-///
-/// # Why it works
-///
-/// Two systems land in the same batch only if they have equal rank. If
-/// they conflicted, the later-registered one would have taken
-/// `rank+1` — so equal rank *proves* disjoint access. That is the exact
-/// invariant the M4 parallel executor needs: every member of a batch can
-/// run on its own thread because none aliases another's writes. And
-/// because a conflict always raises the later system's rank, conflicting
-/// pairs keep registration order; only provably-independent systems are
-/// ever reordered, and reordering independent work changes no observable
-/// result.
-///
-/// # Cost
-///
-/// Ranking compares every system against every earlier one — `O(n²)`
-/// access checks for `n` systems, run once per [`Schedule`] rebuild (not
-/// per frame). At the tens-to-hundreds of systems a stage holds, that is
-/// negligible; an indexed-by-`TypeId` scheme would only pay off at a
-/// scale this engine will not reach.
-fn build_batches(systems: &[BoxedSystem]) -> Vec<Vec<SystemId>> {
-    let mut rank = vec![0usize; systems.len()];
-    for i in 0..systems.len() {
-        for j in 0..i {
-            if !systems[j].access.compatible_with(&systems[i].access) {
-                rank[i] = rank[i].max(rank[j] + 1);
-            }
-        }
-    }
-
-    let batch_count = rank.iter().copied().max().map_or(0, |max| max + 1);
-    let mut batches = vec![Vec::new(); batch_count];
-    for (i, &r) in rank.iter().enumerate() {
-        batches[r].push(SystemId(i));
-    }
-
-    // The whole point of the rank scheme is "same batch ⟹ disjoint
-    // access" — the proof the M4 parallel executor leans on. Assert it
-    // directly in debug/test builds rather than trusting the argument:
-    // any future tweak (e.g. an explicit-ordering pass) that breaks it
-    // trips here instead of racing silently later.
-    #[cfg(debug_assertions)]
-    for batch in &batches {
-        for (pos, &SystemId(a)) in batch.iter().enumerate() {
-            for &SystemId(b) in &batch[pos + 1..] {
-                assert!(
-                    systems[a].access.compatible_with(&systems[b].access),
-                    "build_batches invariant violated: `{}` and `{}` share a batch but conflict",
-                    systems[a].name,
-                    systems[b].name,
-                );
-            }
-        }
-    }
-
-    batches
-}
-
-/// A runnable group of systems, batched by access conflicts.
-///
-/// # Logic
-///
-/// [`add_system`](Self::add_system) records each system's run closure and
-/// its declared [`Access`] (read straight off the parameter types) and
-/// invalidates the cached batch plan. The plan is rebuilt lazily on the
-/// next [`run`](Self::run) or [`batches`](Self::batches) call by
-/// [`build_batches`] — an *as-soon-as-possible* layering where each batch
-/// holds only systems with pairwise-disjoint access.
+/// The plan is rebuilt lazily on the next [`run`](Self::run) /
+/// [`batches`](Self::batches): workloads topo-sort by their label edges,
+/// then each workload's systems topo-sort by their handle edges and
+/// partition into batches.
 ///
 /// # Memory layout
 ///
 /// ```text
 /// Schedule
-/// ├── systems: [ S0, S1, S2, … ]          ← registration order
-/// └── batches: Some([ [S0, S1], [S2] ])   ← None until first run, then cached
+/// ├── workloads: [ "Grid::Supply", "Grid::Distribute" ]
+/// │                     │                 │
+/// │                     └─ systems + intra-workload edges + cached batches
+/// ├── workload_edges: [ WorkloadEdge { subject: 1, kind: After, target: Grid::Supply } ]
+/// └── order: Some([0, 1])    ← None until first run, then cached
 /// ```
-///
-/// # Why batches exist before parallelism does
-///
-/// The executor walks batches **sequentially** today — one thread, one
-/// system at a time. The batches still earn their keep: they are the
-/// safety proof for M4 lockless parallelism. Same-batch systems have
-/// disjoint writes (see [`build_batches`]), so M4 can spawn each batch
-/// across Rayon workers with only a shared `&World` and no data race. The
-/// risky analysis ships and is tested now; M4 swaps the walk, not the
-/// proof.
 ///
 /// # How NOT to use
 ///
-/// - Don't read `Schedule::run` order as a contract between
-///   *non-conflicting* systems — independent systems may be reordered
-///   into earlier batches. Order is guaranteed only between systems that
-///   share state (and there it follows registration order).
-/// - Don't expect commands to apply mid-run: queued [`Commands`] flush
-///   **once**, after every batch has run (see [`run`](Self::run)).
-///
-/// [`Commands`]: crate::Commands
+/// - Don't read [`run`](Self::run) order as a contract between
+///   *non-conflicting, unordered* systems — independent systems may share
+///   a batch and reorder. Order holds only where declared, or between
+///   conflicting systems (which must be declared or acknowledged).
+/// - Don't expect commands to apply mid-workload: queued
+///   [`Commands`](crate::Commands) flush at every **workload boundary**
+///   (see [`run`](Self::run)).
 ///
 /// # Examples
 ///
 /// ```
-/// use spark_ecs::{ResMut, Resource, Schedule, World};
+/// use spark_ecs::{ResMut, Resource, Schedule, WorkloadLabel, World};
+///
+/// #[derive(WorkloadLabel)]
+/// enum Sim { Tick }
 ///
 /// #[derive(Resource)]
 /// struct Counter(u32);
@@ -198,21 +109,56 @@ fn build_batches(systems: &[BoxedSystem]) -> Vec<Vec<SystemId>> {
 /// world.add_resource(Counter(0));
 ///
 /// let mut schedule = Schedule::new();
-/// schedule.add_system(tick);
+/// schedule.add_workload(Sim::Tick, |w| {
+///     w.add_system(tick);
+/// });
 /// schedule.run(&mut world);
 /// schedule.run(&mut world);
 /// assert_eq!(world.resource::<Counter>().0, 2);
 /// ```
-#[derive(Default)]
 pub struct Schedule {
-    systems: Vec<BoxedSystem>,
-    /// `None` means "stale" — rebuilt lazily so a burst of `add_system`
-    /// calls costs one rebuild, not one per call.
-    batches: Option<Vec<Vec<SystemId>>>,
+    /// Every registered workload, each carrying a label. Indices are
+    /// assigned in registration order and used as graph node ids.
+    workloads: Vec<WorkloadData>,
+    /// Workload-level ordering edges, resolved to indices lazily at build
+    /// (so forward references work).
+    workload_edges: Vec<WorkloadEdge>,
+    /// Acknowledged any-order workload pairs (the workload-level
+    /// `.any_order_with`).
+    workload_any_order: Vec<WorkloadAnyOrder>,
+    /// Topo-sorted workload execution order. `None` means "stale" — rebuilt
+    /// lazily so a burst of registrations costs one rebuild, not one each.
+    order: Option<Vec<usize>>,
+}
+
+/// One workload-level ordering declaration, before label resolution.
+///
+/// `subject` is the index of the workload that declared it; `target` is
+/// the label it ordered against, resolved to an index at build time.
+/// `target_name` rides along solely so an unknown-label error can name the
+/// missing workload (the [`WorkloadId`] alone isn't human-readable).
+struct WorkloadEdge {
+    subject: usize,
+    kind: EdgeKind,
+    target: WorkloadId,
+    target_name: &'static str,
+}
+
+/// A workload asserting that it and another (`other`, by label) may run in
+/// any order despite their conflict — the workload-level `.any_order_with`.
+struct WorkloadAnyOrder {
+    subject: usize,
+    other: WorkloadId,
+}
+
+impl Default for Schedule {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Schedule {
-    /// Creates an empty schedule.
+    /// Creates an empty schedule — no workloads yet.
     ///
     /// # Examples
     ///
@@ -223,114 +169,177 @@ impl Schedule {
     /// ```
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            workloads: Vec::new(),
+            workload_edges: Vec::new(),
+            workload_any_order: Vec::new(),
+            order: None,
+        }
     }
 
-    /// Registers `system`, collecting its [`Access`] from its parameter
-    /// types and marking the batch plan stale.
+    /// Registers a named, **parallel-capable** workload — the scheduler
+    /// partitions its systems into access-disjoint batches — building its
+    /// contents in the closure, and returns a [`WorkloadOrderBuilder`] for
+    /// ordering it against other workloads by label.
     ///
-    /// Accepts any function whose parameters are all
-    /// [`SystemParam`](crate::SystemParam) — the same `IntoSystem` bound
-    /// the rest of the engine uses, so call sites need no turbofish.
+    /// Inside `build`, use [`w.add_system(..)`](WorkloadBuilder::add_system)
+    /// (handle-ordered) and [`w.add_systems((..))`](WorkloadBuilder::add_systems)
+    /// (unordered). The returned builder is a *statement*, not a fluent
+    /// `&mut Self` — chain `.after(label)` / `.before(label)` on it (see the
+    /// example below).
     ///
     /// # Panics
     ///
-    /// Panics if the system's own parameters conflict — two that write the
-    /// same component/resource, or one writing what another reads (e.g.
-    /// `fn(Query<&mut Pos>, Query<&mut Pos>)`). Refusing it here, naming
-    /// the type, beats the `RefCell` "already borrowed" panic it would
-    /// otherwise hit mid-run. See [`Access::assert_no_self_conflict`].
+    /// Panics if `label` is already registered in this schedule — each
+    /// label names exactly one workload.
     ///
     /// # Examples
     ///
     /// ```
-    /// use spark_ecs::{Res, Resource, Schedule};
+    /// use spark_ecs::{Schedule, WorkloadLabel};
     ///
-    /// #[derive(Resource)]
-    /// struct Config(u32);
+    /// #[derive(WorkloadLabel)]
+    /// enum Grid { Supply, Distribute }
     ///
-    /// fn read_config(_c: Res<Config>) {}
+    /// fn collect_supply() {}
+    /// fn compute_demand() {}
+    /// fn route_power() {}
     ///
     /// let mut schedule = Schedule::new();
-    /// schedule.add_system(read_config);
+    /// schedule.add_workload(Grid::Supply, |w| {
+    ///     w.add_system(collect_supply);
+    /// });
+    /// schedule
+    ///     .add_workload(Grid::Distribute, |w| {
+    ///         let demand = w.add_system(compute_demand);
+    ///         w.add_system(route_power).after(demand);
+    ///     })
+    ///     .after(Grid::Supply); // workload ordering, by label
     /// ```
-    pub fn add_system<S, Marker>(&mut self, system: S) -> &mut Self
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "the label is a throwaway unit-enum variant passed inline \
+                  (`Grid::Supply`); by-value keeps the call site ergonomic."
+    )]
+    pub fn add_workload<L, F>(&mut self, label: L, build: F) -> WorkloadOrderBuilder<'_>
     where
-        S: IntoSystem<Marker>,
+        L: WorkloadLabel,
+        F: FnOnce(&WorkloadBuilder),
     {
-        let access = <S as IntoSystem<Marker>>::access();
-        // Refuse a self-conflicting system at registration rather than
-        // letting it RefCell-panic mid-run when its second aliasing
-        // parameter is fetched.
-        access.assert_no_self_conflict();
-        self.systems.push(BoxedSystem {
-            name: std::any::type_name::<S>(),
-            access,
-            run: system.into_system(),
-        });
-        self.batches = None;
-        self
+        // Each label names exactly one workload; a second registration
+        // would make `.after(label)` ambiguous (it resolves to the first),
+        // silently leaving the duplicate unordered. Refuse it outright.
+        assert!(
+            self.index_of(label.id()).is_none(),
+            "WorkloadLabel `{}` is registered twice in the same schedule — each label names one workload",
+            label.name(),
+        );
+        let builder = WorkloadBuilder::new(label.id(), label.name());
+        build(&builder);
+        let idx = self.workloads.len();
+        self.workloads.push(builder.into_data());
+        self.order = None;
+        WorkloadOrderBuilder {
+            schedule: self,
+            idx,
+        }
     }
 
-    /// Returns the batch plan, rebuilding it if a system was added since
-    /// the last call.
+    /// Returns the batch plan of the workload labelled `label`, rebuilding
+    /// the schedule if a registration happened since the last call. An
+    /// unregistered label yields `&[]`.
     ///
     /// Each inner slice is one batch — systems with pairwise-disjoint
-    /// [`Access`], safe to run together. The outer order is execution
-    /// order. Primarily a window for tests and (later) the editor's
-    /// schedule view; [`run`](Self::run) uses the same plan internally.
+    /// [`Access`](crate::Access), safe to run together. This is the
+    /// inspection window onto a workload's computed plan, for tests and
+    /// diagnostics; [`run`](Self::run) executes every workload regardless.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the build hits an undeclared conflict, an unknown
+    /// workload label in an ordering edge, or a cycle — see [`run`](Self::run).
     ///
     /// # Examples
     ///
     /// ```
-    /// use spark_ecs::{ResMut, Resource, Schedule};
+    /// use spark_ecs::{Schedule, WorkloadLabel};
     ///
-    /// #[derive(Resource)]
-    /// struct Score(u32);
+    /// #[derive(WorkloadLabel)]
+    /// enum Frame { Tick }
     ///
-    /// fn write_a(mut s: ResMut<Score>) { s.0 += 1; }
-    /// fn write_b(mut s: ResMut<Score>) { s.0 += 1; }
+    /// fn a() {}
+    /// fn b() {}
     ///
     /// let mut schedule = Schedule::new();
-    /// schedule.add_system(write_a);
-    /// schedule.add_system(write_b);
-    /// // Both write Score, so they cannot share a batch.
-    /// assert_eq!(schedule.batches().len(), 2);
+    /// schedule.add_workload(Frame::Tick, |w| {
+    ///     w.add_systems((a, b));
+    /// });
+    /// // Disjoint (no params) → one batch of two.
+    /// assert_eq!(schedule.batches(Frame::Tick).len(), 1);
+    /// assert_eq!(schedule.batches(Frame::Tick)[0].len(), 2);
     /// ```
-    pub fn batches(&mut self) -> &[Vec<SystemId>] {
-        self.batches
-            .get_or_insert_with(|| build_batches(&self.systems))
-            .as_slice()
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "the label is a throwaway unit-enum variant passed inline \
+                  (`Frame::Tick`); by-value matches the rest of the label API."
+    )]
+    pub fn batches<L: WorkloadLabel>(&mut self, label: L) -> &[Vec<SystemId>] {
+        if self.order.is_none() {
+            self.build();
+        }
+        match self.index_of(label.id()) {
+            Some(idx) => &self.workloads[idx].batches,
+            None => &[],
+        }
     }
 
-    /// Names of the registered systems, in registration order.
+    /// Names of every registered system, across all workloads, in
+    /// registration order.
     ///
     /// # Examples
     ///
     /// ```
-    /// use spark_ecs::Schedule;
+    /// use spark_ecs::{Schedule, WorkloadLabel};
+    ///
+    /// #[derive(WorkloadLabel)]
+    /// enum W { Tick }
     ///
     /// fn my_system() {}
     /// let mut schedule = Schedule::new();
-    /// schedule.add_system(my_system);
+    /// schedule.add_workload(W::Tick, |w| {
+    ///     w.add_system(my_system);
+    /// });
     /// assert!(schedule.system_names().next().unwrap().ends_with("my_system"));
     /// ```
     pub fn system_names(&self) -> impl Iterator<Item = &'static str> + '_ {
-        self.systems.iter().map(|s| s.name)
+        self.workloads
+            .iter()
+            .flat_map(|w| w.systems.iter().map(|s| s.name))
     }
 
-    /// Runs every system once, batch by batch, then flushes commands.
+    /// Runs every workload in dependency order, each batch by batch, with
+    /// a command flush at every workload boundary.
     ///
-    /// Batches run in order; within a batch, systems run in registration
-    /// order (sequentially — M4 makes a batch parallel). After the last
-    /// system, [`World::flush_commands`] applies everything queued via
-    /// [`Commands`](crate::Commands) — **once** for the whole run, the
-    /// same per-stage boundary [`Application::run_stage`] uses.
+    /// Workloads run in topo order; within a workload, batches run in order
+    /// and systems within a batch run sequentially (M4 makes a batch
+    /// parallel). After **each** workload,
+    /// [`World::flush_commands`] applies everything it queued via
+    /// [`Commands`](crate::Commands) — the boundary that makes a workload
+    /// the atomic unit.
+    ///
+    /// # Panics
+    ///
+    /// Panics on a registration error surfaced at build: an undeclared
+    /// conflict between systems or workloads, a `.after`/`.before` against
+    /// an unknown label, or a cycle in either ordering level.
     ///
     /// # Examples
     ///
     /// ```
-    /// use spark_ecs::{Commands, Component, Query, Schedule, World};
+    /// use spark_ecs::{Commands, Component, Query, Schedule, WorkloadLabel, World};
+    ///
+    /// #[derive(WorkloadLabel)]
+    /// enum Boot { Spawn }
     ///
     /// #[derive(Component)]
     /// struct Spawned;
@@ -341,33 +350,215 @@ impl Schedule {
     ///
     /// let mut world = World::new();
     /// let mut schedule = Schedule::new();
-    /// schedule.add_system(spawn_one);
+    /// schedule.add_workload(Boot::Spawn, |w| {
+    ///     w.add_system(spawn_one);
+    /// });
     /// schedule.run(&mut world);
-    /// // The deferred spawn was flushed at the end of the run.
     /// assert_eq!(Query::<&Spawned>::from_world(&world).iter().count(), 1);
     /// ```
-    ///
-    /// [`Application::run_stage`]: https://docs.rs/spark-core
     pub fn run(&mut self, world: &mut World) {
-        // Take the cached plan out (building it if stale) so the loop can
-        // borrow `self.systems` mutably without a simultaneous borrow of
-        // `self.batches`; the owned `batches` local holds no borrow of
-        // `self`. Restored right after — the plan is moved out and back,
-        // never reallocated when the cache is warm.
-        let batches = self
-            .batches
-            .take()
-            .unwrap_or_else(|| build_batches(&self.systems));
-        for batch in &batches {
-            for &SystemId(idx) in batch {
-                // `world` is `&mut World`; it coerces to the `&World` the
-                // run closure expects, leaving it usable mutably for the
-                // flush below.
-                (self.systems[idx].run)(world);
+        if self.order.is_none() {
+            self.build();
+        }
+        // Take the order out so the loop can borrow `self.workloads`
+        // mutably (to call `run`) without a simultaneous borrow of
+        // `self.order`. Restored right after.
+        let order = self.order.take().expect("build populated order");
+        for &widx in &order {
+            // Move the batch plan out of this workload so the run closures
+            // can borrow its `systems` mutably; the owned `batches` local
+            // holds no borrow of `self`. Restored right after.
+            let batches = std::mem::take(&mut self.workloads[widx].batches);
+            for batch in &batches {
+                for &SystemId(sidx) in batch {
+                    (self.workloads[widx].systems[sidx].run)(world);
+                }
+            }
+            self.workloads[widx].batches = batches;
+            world.flush_commands();
+        }
+        self.order = Some(order);
+    }
+
+    /// Validates, orders, and batches the whole schedule — the lazy build
+    /// behind [`run`](Self::run) and [`batches`](Self::batches).
+    ///
+    /// Resolves workload labels to indices (forward references allowed),
+    /// rejects undeclared cross-workload conflicts, topo-sorts the
+    /// workloads, then asks each workload to validate and batch itself.
+    ///
+    /// The two levels split cleanly: this method owns the *cross-workload*
+    /// concerns (label resolution, workload conflicts, workload order);
+    /// [`WorkloadData::build`] owns the *within-workload* concerns
+    /// (system conflicts, system-ordering cycle, batches).
+    ///
+    /// # Panics
+    ///
+    /// On an unknown label, a cycle (workload or system), or an undeclared
+    /// conflict — each with its pinned message.
+    fn build(&mut self) {
+        let resolved = self.resolve_workload_edges();
+        self.validate_workload_conflicts(&resolved);
+
+        let order = topo_sort(self.workloads.len(), &resolved).unwrap_or_else(|leftover| {
+            let path = cycle_path(&leftover, &resolved);
+            let names: Vec<&str> = path.iter().map(|&i| self.workloads[i].name).collect();
+            panic!("{}", cycle_message("workload", &names));
+        });
+
+        for workload in &mut self.workloads {
+            workload.build();
+        }
+
+        self.order = Some(order);
+    }
+
+    /// Resolves each workload-level label edge to a directed
+    /// `(before, after)` index pair, normalising `Before` to its mirror.
+    ///
+    /// # Panics
+    ///
+    /// Panics with [`unknown_label_message`] if an edge names a label no
+    /// workload in this schedule carries.
+    fn resolve_workload_edges(&self) -> Vec<(usize, usize)> {
+        let mut resolved = Vec::with_capacity(self.workload_edges.len());
+        for edge in &self.workload_edges {
+            let target = self
+                .index_of(edge.target)
+                .unwrap_or_else(|| panic!("{}", unknown_label_message(edge.target_name)));
+            match edge.kind {
+                EdgeKind::After => resolved.push((target, edge.subject)),
+                EdgeKind::Before => resolved.push((edge.subject, target)),
             }
         }
-        self.batches = Some(batches);
-        world.flush_commands();
+        resolved
+    }
+
+    /// The index of the workload carrying `id`, if any.
+    fn index_of(&self, id: WorkloadId) -> Option<usize> {
+        self.workloads.iter().position(|w| w.label == id)
+    }
+
+    /// Rejects any pair of workloads whose aggregate access conflicts with
+    /// no order declared and no `.any_order_with`.
+    ///
+    /// # Panics
+    ///
+    /// With [`workload_conflict_message`], naming both workloads and the
+    /// clashing type.
+    fn validate_workload_conflicts(&self, resolved: &[(usize, usize)]) {
+        let n = self.workloads.len();
+        let successors = successors_of(n, resolved);
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let (a, b) = (&self.workloads[i], &self.workloads[j]);
+                // Gate on the cheap predicate; disjoint workloads short-circuit.
+                if a.aggregate_access.compatible_with(&b.aggregate_access) {
+                    continue;
+                }
+                let (id_i, id_j) = (a.label, b.label);
+                let acknowledged = self.workload_any_order.iter().any(|ack| {
+                    (ack.subject == i && ack.other == id_j)
+                        || (ack.subject == j && ack.other == id_i)
+                });
+                if has_declared_order(i, j, &successors) || acknowledged {
+                    continue;
+                }
+                // Error path only — name the clashing type for the message.
+                let (type_id, kind) = first_conflict(&a.aggregate_access, &b.aggregate_access);
+                let (type_name, _) = a
+                    .aggregate_access
+                    .describe(type_id)
+                    .or_else(|| b.aggregate_access.describe(type_id))
+                    .unwrap_or(("<unknown>", "value"));
+                panic!(
+                    "{}",
+                    workload_conflict_message(a.name, b.name, type_name, kind)
+                );
+            }
+        }
+    }
+}
+
+/// The ordering builder returned by [`Schedule::add_workload`] — orders
+/// the just-registered workload against others by label.
+///
+/// `.after(label)` / `.before(label)` **accumulate** and resolve lazily at
+/// build, so a workload may be ordered against one registered later.
+/// `.any_order_with(label)` asserts that this workload and a conflicting
+/// one may run in either order. It is deliberately *not* `&mut Schedule`: a
+/// workload's position is its own statement, separate from its contents.
+///
+/// # Examples
+///
+/// ```
+/// use spark_ecs::{Schedule, WorkloadLabel};
+///
+/// #[derive(WorkloadLabel)]
+/// enum Phase { Input, Sim, Cleanup }
+///
+/// fn poll() {}
+/// fn step() {}
+/// fn sweep() {}
+///
+/// let mut schedule = Schedule::new();
+/// schedule.add_workload(Phase::Input, |w| { w.add_system(poll); });
+/// schedule
+///     .add_workload(Phase::Sim, |w| { w.add_system(step); })
+///     .after(Phase::Input);
+/// schedule
+///     .add_workload(Phase::Cleanup, |w| { w.add_system(sweep); })
+///     .after(Phase::Sim);
+/// ```
+pub struct WorkloadOrderBuilder<'s> {
+    schedule: &'s mut Schedule,
+    idx: usize,
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "a WorkloadLabel is a throwaway unit-enum variant constructed inline at \
+              the call site (`.after(Grid::Supply)`); taking it by value keeps that \
+              ergonomic — there is nothing worth borrowing."
+)]
+impl WorkloadOrderBuilder<'_> {
+    /// Orders this workload **after** the workload labelled `label`.
+    /// Accumulates; resolves lazily at build (forward references allowed).
+    pub fn after<L: WorkloadLabel>(&mut self, label: L) -> &mut Self {
+        self.schedule.workload_edges.push(WorkloadEdge {
+            subject: self.idx,
+            kind: EdgeKind::After,
+            target: label.id(),
+            target_name: label.name(),
+        });
+        self.schedule.order = None;
+        self
+    }
+
+    /// Orders this workload **before** the workload labelled `label`.
+    /// Accumulates; resolves lazily at build.
+    pub fn before<L: WorkloadLabel>(&mut self, label: L) -> &mut Self {
+        self.schedule.workload_edges.push(WorkloadEdge {
+            subject: self.idx,
+            kind: EdgeKind::Before,
+            target: label.id(),
+            target_name: label.name(),
+        });
+        self.schedule.order = None;
+        self
+    }
+
+    /// Asserts that this workload and the one labelled `label` may run in
+    /// **any order** despite their conflict — silences the workload
+    /// conflict-policy error for that pair. As at the system level, the
+    /// scheduler cannot verify the commutativity you are asserting.
+    pub fn any_order_with<L: WorkloadLabel>(&mut self, label: L) -> &mut Self {
+        self.schedule.workload_any_order.push(WorkloadAnyOrder {
+            subject: self.idx,
+            other: label.id(),
+        });
+        self.schedule.order = None;
+        self
     }
 }
 
@@ -381,7 +572,7 @@ impl Schedule {
 )]
 mod tests {
     use super::*;
-    use crate::{Commands, Component, Query, Res, ResMut, Resource, With};
+    use crate::{Commands, Component, Query, Res, ResMut, Resource, WorkloadLabel};
 
     #[derive(Resource)]
     struct Score {
@@ -399,21 +590,22 @@ mod tests {
     struct Position {
         x: f32,
     }
-    #[derive(Component)]
-    struct Velocity {
-        x: f32,
-    }
+
+    // ── Schedule: build, batch, run ─────────────────────────────────────
 
     #[test]
     fn empty_schedule_runs_and_flushes() {
         let mut world = World::new();
         let mut schedule = Schedule::new();
-        schedule.run(&mut world); // no panic, no systems
-        assert_eq!(schedule.batches().len(), 0);
+        schedule.run(&mut world); // no panic, no workloads
     }
 
     #[test]
     fn disjoint_systems_share_one_batch() {
+        #[derive(WorkloadLabel)]
+        enum W {
+            Tick,
+        }
         fn touch_score(mut s: ResMut<Score>) {
             s.value += 1;
         }
@@ -421,224 +613,38 @@ mod tests {
             f.n += 1;
         }
         let mut schedule = Schedule::new();
-        schedule.add_system(touch_score);
-        schedule.add_system(touch_frame);
-        // Different resources → no conflict → one batch of two.
-        assert_eq!(schedule.batches().len(), 1);
-        assert_eq!(schedule.batches()[0].len(), 2);
+        schedule.add_workload(W::Tick, |w| {
+            w.add_system(touch_score);
+            w.add_system(touch_frame);
+        });
+        assert_eq!(schedule.batches(W::Tick).len(), 1);
+        assert_eq!(schedule.batches(W::Tick)[0].len(), 2);
     }
 
     #[test]
-    fn conflicting_systems_split_into_separate_batches() {
-        fn writer(mut s: ResMut<Score>) {
-            s.value += 1;
+    fn batches_of_unregistered_label_is_empty() {
+        #[derive(WorkloadLabel)]
+        enum W {
+            A,
+            B,
         }
-        fn reader(s: Res<Score>) {
-            let _ = s.value;
-        }
+        fn noop() {}
         let mut schedule = Schedule::new();
-        schedule.add_system(writer);
-        schedule.add_system(reader);
-        let batches = schedule.batches();
-        assert_eq!(batches.len(), 2);
-        assert_eq!(batches[0], vec![SystemId(0)]); // writer first (registration order)
-        assert_eq!(batches[1], vec![SystemId(1)]); // reader after
-    }
-
-    #[test]
-    fn independent_system_packs_into_earliest_batch() {
-        // S0 writes Score, S1 reads Score (conflict → rank 1),
-        // S2 reads Frame (conflicts with neither → rank 0).
-        fn write_score(mut s: ResMut<Score>) {
-            s.value += 1;
-        }
-        fn read_score(s: Res<Score>) {
-            let _ = s.value;
-        }
-        fn read_frame(f: Res<Frame>) {
-            let _ = f.n;
-        }
-        let mut schedule = Schedule::new();
-        schedule.add_system(write_score);
-        schedule.add_system(read_score);
-        schedule.add_system(read_frame);
-        let batches = schedule.batches();
-        assert_eq!(batches.len(), 2);
-        assert_eq!(batches[0], vec![SystemId(0), SystemId(2)]); // S2 joins S0's batch
-        assert_eq!(batches[1], vec![SystemId(1)]);
-    }
-
-    #[test]
-    fn component_query_conflicts_feed_batching() {
-        // One system writes Position; another reads it → conflict.
-        fn move_pos(mut q: Query<&mut Position>) {
-            for p in q.iter_mut() {
-                p.x += 1.0;
-            }
-        }
-        fn read_pos(q: Query<&Position>) {
-            for p in q.iter() {
-                let _ = p.x;
-            }
-        }
-        let mut schedule = Schedule::new();
-        schedule.add_system(move_pos);
-        schedule.add_system(read_pos);
-        assert_eq!(schedule.batches().len(), 2);
-    }
-
-    #[test]
-    fn query_over_disjoint_components_shares_a_batch() {
-        fn move_pos(mut q: Query<&mut Position>) {
-            for p in q.iter_mut() {
-                p.x += 1.0;
-            }
-        }
-        fn move_vel(mut q: Query<&mut Velocity>) {
-            for v in q.iter_mut() {
-                v.x += 1.0;
-            }
-        }
-        let mut schedule = Schedule::new();
-        schedule.add_system(move_pos);
-        schedule.add_system(move_vel);
-        assert_eq!(schedule.batches().len(), 1);
-    }
-
-    #[test]
-    fn access_aggregates_across_multiple_params() {
-        // `mover`'s access is the union of all four params: a resource
-        // read (Frame), a resource write (Score), a component write
-        // (Position), and Commands (no access). If aggregation folded only
-        // the first param — or Commands wrongly cleared the rest — the
-        // conflicts below would vanish and the batch layout would change.
-        fn mover(_f: Res<Frame>, mut s: ResMut<Score>, mut q: Query<&mut Position>, _c: Commands) {
-            s.value += 1;
-            for p in q.iter_mut() {
-                p.x += 1.0;
-            }
-        }
-        fn reads_pos(q: Query<&Position>) {
-            for p in q.iter() {
-                let _ = p.x;
-            }
-        }
-        fn reads_score(s: Res<Score>) {
-            let _ = s.value;
-        }
-        fn moves_vel(mut q: Query<&mut Velocity>) {
-            for v in q.iter_mut() {
-                v.x += 1.0;
-            }
-        }
-
-        let mut schedule = Schedule::new();
-        schedule.add_system(mover); // 0
-        schedule.add_system(reads_pos); // 1 — conflicts mover on Position (component)
-        schedule.add_system(reads_score); // 2 — conflicts mover on Score (resource)
-        schedule.add_system(moves_vel); // 3 — disjoint from all
-
-        let batches = schedule.batches();
-        assert_eq!(batches.len(), 2);
-        // mover writes both Position and Score, so it conflicts with the
-        // Position reader AND the Score reader — proof both writes landed
-        // in its access. `moves_vel` is disjoint and packs into batch 0.
-        assert_eq!(batches[0], vec![SystemId(0), SystemId(3)]);
-        assert_eq!(batches[1], vec![SystemId(1), SystemId(2)]);
-    }
-
-    #[test]
-    fn filter_read_access_feeds_batching() {
-        // `With<Velocity>` makes `filtered` *read* Velocity even though it
-        // only yields `&Position` — so it conflicts with a Velocity writer.
-        // `plain_pos` has no filter, reads only Position, and stays
-        // conflict-free: the filter is the sole reason `filtered` is held
-        // back a batch.
-        fn writes_vel(mut q: Query<&mut Velocity>) {
-            for v in q.iter_mut() {
-                v.x += 1.0;
-            }
-        }
-        fn filtered(q: Query<&Position, With<Velocity>>) {
-            for p in q.iter() {
-                let _ = p.x;
-            }
-        }
-        fn plain_pos(q: Query<&Position>) {
-            for p in q.iter() {
-                let _ = p.x;
-            }
-        }
-
-        let mut schedule = Schedule::new();
-        schedule.add_system(writes_vel); // 0 — writes Velocity
-        schedule.add_system(filtered); // 1 — reads Position + (via filter) Velocity → conflict
-        schedule.add_system(plain_pos); // 2 — reads Position only → disjoint
-
-        let batches = schedule.batches();
-        assert_eq!(batches.len(), 2);
-        assert_eq!(batches[0], vec![SystemId(0), SystemId(2)]);
-        assert_eq!(batches[1], vec![SystemId(1)]);
-    }
-
-    #[test]
-    fn conflict_chain_layers_into_three_batches() {
-        // A transitive chain forces ranks 0 → 1 → 2: S0 writes Score, S1
-        // reads Score (after S0) and writes Frame, S2 reads Frame (after
-        // S1). S2's rank can only reach 2 by inheriting S1's rank — the
-        // recursive `max(rank[j] + 1)` step a non-recursive splitter misses.
-        fn write_score(mut s: ResMut<Score>) {
-            s.value += 1;
-        }
-        fn score_to_frame(s: Res<Score>, mut f: ResMut<Frame>) {
-            f.n += s.value;
-        }
-        fn read_frame(f: Res<Frame>) {
-            let _ = f.n;
-        }
-
-        let mut schedule = Schedule::new();
-        schedule.add_system(write_score); // 0 — rank 0
-        schedule.add_system(score_to_frame); // 1 — conflicts S0 on Score → rank 1
-        schedule.add_system(read_frame); // 2 — conflicts S1 on Frame → rank 2
-
-        let batches = schedule.batches();
-        assert_eq!(batches.len(), 3);
-        assert_eq!(batches[0], vec![SystemId(0)]);
-        assert_eq!(batches[1], vec![SystemId(1)]);
-        assert_eq!(batches[2], vec![SystemId(2)]);
-    }
-
-    #[test]
-    #[should_panic(expected = "conflicting access to component")]
-    fn registering_self_conflicting_query_system_panics() {
-        // Two parameters both write Position — refused at registration with
-        // a named component, not as a `RefCell` panic mid-run. (This is the
-        // exact shape that previously slipped through to runtime.)
-        fn weird(mut q1: Query<&mut Position>, mut q2: Query<&mut Position>) {
-            for p in q1.iter_mut() {
-                p.x += 1.0;
-            }
-            for p in q2.iter_mut() {
-                p.x += 1.0;
-            }
-        }
-        Schedule::new().add_system(weird);
-    }
-
-    #[test]
-    #[should_panic(expected = "conflicting access to resource")]
-    fn registering_resource_self_conflicting_system_panics() {
-        // `Res<Score>` + `ResMut<Score>`: shared and exclusive borrow of
-        // the same resource in one system — refused at registration.
-        fn weird(_r: Res<Score>, mut w: ResMut<Score>) {
-            w.value += 1;
-        }
-        Schedule::new().add_system(weird);
+        schedule.add_workload(W::A, |w| {
+            w.add_system(noop);
+        });
+        // `W::B` was never registered → empty plan, no panic (and the lazy
+        // build still runs cleanly for the labels that do exist).
+        assert!(schedule.batches(W::B).is_empty());
+        assert_eq!(schedule.batches(W::A).len(), 1);
     }
 
     #[test]
     fn run_executes_every_system_once() {
+        #[derive(WorkloadLabel)]
+        enum W {
+            Tick,
+        }
         fn bump_score(mut s: ResMut<Score>) {
             s.value += 1;
         }
@@ -649,17 +655,140 @@ mod tests {
         world.add_resource(Score { value: 0 });
         world.add_resource(Frame { n: 0 });
         let mut schedule = Schedule::new();
-        schedule.add_system(bump_score);
-        schedule.add_system(bump_frame);
+        schedule.add_workload(W::Tick, |w| {
+            w.add_system(bump_score);
+            w.add_system(bump_frame);
+        });
         schedule.run(&mut world);
         assert_eq!(world.resource::<Score>().value, 1);
         assert_eq!(world.resource::<Frame>().n, 10);
     }
 
     #[test]
-    fn conflicting_systems_run_in_registration_order() {
-        // Both touch Log (write), so they are serialised; the earlier
-        // registration must run first.
+    fn run_flushes_commands_after_the_workload() {
+        #[derive(WorkloadLabel)]
+        enum W {
+            Spawn,
+        }
+        #[derive(Component)]
+        struct Tag;
+        fn spawn_two(mut commands: Commands) {
+            commands.spawn().insert(Tag);
+            commands.spawn().insert(Tag);
+        }
+        let mut world = World::new();
+        let mut schedule = Schedule::new();
+        schedule.add_workload(W::Spawn, |w| {
+            w.add_system(spawn_two);
+        });
+        schedule.run(&mut world);
+        assert_eq!(Query::<&Tag>::from_world(&world).iter().count(), 2);
+    }
+
+    #[test]
+    fn registering_a_workload_rebuilds_the_plan() {
+        #[derive(WorkloadLabel)]
+        enum W {
+            A,
+            B,
+        }
+        fn a(mut s: ResMut<Score>) {
+            s.value += 1;
+        }
+        fn b(mut f: ResMut<Frame>) {
+            f.n += 1;
+        }
+        let mut schedule = Schedule::new();
+        schedule.add_workload(W::A, |w| {
+            w.add_system(a);
+        });
+        assert_eq!(schedule.batches(W::A)[0].len(), 1); // builds + caches
+        schedule.add_workload(W::B, |w| {
+            w.add_system(b);
+        }); // invalidates the cached plan
+        assert_eq!(schedule.batches(W::B)[0].len(), 1); // rebuilt with both workloads present
+    }
+
+    #[test]
+    fn add_systems_registers_an_unordered_group() {
+        #[derive(WorkloadLabel)]
+        enum W {
+            Tick,
+        }
+        fn a() {}
+        fn b() {}
+        fn c() {}
+        let mut schedule = Schedule::new();
+        schedule.add_workload(W::Tick, |w| {
+            w.add_systems((a, b, c));
+        });
+        // No params → no conflict → one batch of three.
+        assert_eq!(schedule.batches(W::Tick).len(), 1);
+        assert_eq!(schedule.batches(W::Tick)[0].len(), 3);
+    }
+
+    #[test]
+    fn system_names_track_registration() {
+        #[derive(WorkloadLabel)]
+        enum W {
+            Tick,
+        }
+        fn alpha() {}
+        fn beta() {}
+        let mut schedule = Schedule::new();
+        schedule.add_workload(W::Tick, |w| {
+            w.add_system(alpha);
+            w.add_system(beta);
+        });
+        let names: Vec<&str> = schedule.system_names().collect();
+        assert_eq!(names.len(), 2);
+        assert!(names[0].ends_with("alpha"));
+        assert!(names[1].ends_with("beta"));
+    }
+
+    #[test]
+    #[should_panic(expected = "conflicting access to component")]
+    fn registering_self_conflicting_query_system_panics() {
+        #[derive(WorkloadLabel)]
+        enum W {
+            Tick,
+        }
+        fn weird(mut q1: Query<&mut Position>, mut q2: Query<&mut Position>) {
+            for p in q1.iter_mut() {
+                p.x += 1.0;
+            }
+            for p in q2.iter_mut() {
+                p.x += 1.0;
+            }
+        }
+        Schedule::new().add_workload(W::Tick, |w| {
+            w.add_system(weird);
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "conflicting access to resource")]
+    fn registering_resource_self_conflicting_system_panics() {
+        #[derive(WorkloadLabel)]
+        enum W {
+            Tick,
+        }
+        fn weird(_r: Res<Score>, mut w: ResMut<Score>) {
+            w.value += 1;
+        }
+        Schedule::new().add_workload(W::Tick, |w| {
+            w.add_system(weird);
+        });
+    }
+
+    // ── Schedule: ordering & conflicts ──────────────────────────────────
+
+    #[test]
+    fn workload_systems_run_in_declared_order() {
+        #[derive(WorkloadLabel)]
+        enum W {
+            A,
+        }
         fn first(mut log: ResMut<Log>) {
             log.order.push("first");
         }
@@ -669,52 +798,63 @@ mod tests {
         let mut world = World::new();
         world.add_resource(Log { order: Vec::new() });
         let mut schedule = Schedule::new();
-        schedule.add_system(first);
-        schedule.add_system(second);
+        schedule.add_workload(W::A, |w| {
+            let f = w.add_system(first);
+            w.add_system(second).after(f);
+        });
         schedule.run(&mut world);
         assert_eq!(world.resource::<Log>().order, vec!["first", "second"]);
     }
 
     #[test]
-    fn run_flushes_commands_once_at_the_end() {
-        #[derive(Component)]
-        struct Tag;
-        fn spawn_two(mut commands: Commands) {
-            commands.spawn().insert(Tag);
-            commands.spawn().insert(Tag);
+    fn any_order_with_silences_a_conflicting_system_pair() {
+        #[derive(WorkloadLabel)]
+        enum W {
+            A,
         }
-        let mut world = World::new();
-        let mut schedule = Schedule::new();
-        schedule.add_system(spawn_two);
-        schedule.run(&mut world);
-        assert_eq!(Query::<&Tag>::from_world(&world).iter().count(), 2);
-    }
-
-    #[test]
-    fn adding_a_system_rebuilds_the_batch_plan() {
-        fn a(mut s: ResMut<Score>) {
+        fn sweep(mut s: ResMut<Score>) {
             s.value += 1;
         }
-        fn b(mut f: ResMut<Frame>) {
-            f.n += 1;
+        fn compact(mut s: ResMut<Score>) {
+            s.value += 1;
         }
+        let mut world = World::new();
+        world.add_resource(Score { value: 0 });
         let mut schedule = Schedule::new();
-        schedule.add_system(a);
-        assert_eq!(schedule.batches().len(), 1); // builds + caches
-        schedule.add_system(b); // invalidates cache
-        assert_eq!(schedule.batches()[0].len(), 2); // rebuilt with both
+        schedule.add_workload(W::A, |w| {
+            let s = w.add_system(sweep);
+            w.add_system(compact).any_order_with(s); // both write Score; OK
+        });
+        schedule.run(&mut world); // no panic
+        assert_eq!(world.resource::<Score>().value, 2);
     }
 
     #[test]
-    fn system_names_track_registration() {
-        fn alpha() {}
-        fn beta() {}
+    fn workloads_run_in_label_declared_order() {
+        #[derive(WorkloadLabel)]
+        enum W {
+            Supply,
+            Distribute,
+        }
+        fn supply(mut log: ResMut<Log>) {
+            log.order.push("supply");
+        }
+        fn distribute(mut log: ResMut<Log>) {
+            log.order.push("distribute");
+        }
+        let mut world = World::new();
+        world.add_resource(Log { order: Vec::new() });
         let mut schedule = Schedule::new();
-        schedule.add_system(alpha);
-        schedule.add_system(beta);
-        let names: Vec<&str> = schedule.system_names().collect();
-        assert_eq!(names.len(), 2);
-        assert!(names[0].ends_with("alpha"));
-        assert!(names[1].ends_with("beta"));
+        // Register Distribute first, but order it after Supply (forward ref).
+        schedule
+            .add_workload(W::Distribute, |w| {
+                w.add_system(distribute);
+            })
+            .after(W::Supply);
+        schedule.add_workload(W::Supply, |w| {
+            w.add_system(supply);
+        });
+        schedule.run(&mut world);
+        assert_eq!(world.resource::<Log>().order, vec!["supply", "distribute"]);
     }
 }

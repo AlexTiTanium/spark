@@ -527,8 +527,10 @@ impl World {
     ///
     /// Called by
     /// [`Application::run_stage`](../../spark_core/struct.Application.html#method.run_stage)
-    /// at every stage boundary, after the stage's systems have all
-    /// run. Ops that enqueue more ops (e.g. a closure that constructs
+    /// after a stage's sequential systems, and by
+    /// [`Schedule::run`](crate::Schedule::run) at every workload boundary —
+    /// so deferred ops apply before the next group of systems that should
+    /// see them. Ops that enqueue more ops (e.g. a closure that constructs
     /// a fresh [`crate::Commands`] mid-flush) are picked up by the
     /// internal loop and applied in the same call.
     ///

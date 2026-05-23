@@ -5,8 +5,9 @@ The foundation crate of the Spark engine. Every other engine crate
 one. Brings four things together:
 
 - **[`Application`]** — the composition root. Holds the ECS [`World`],
-  the list of registered systems, and (optionally) the runner that
-  takes the main thread after startup.
+  the registered **sequential systems** and **parallel-capable
+  workloads** per stage, and (optionally) the runner that takes the main
+  thread after startup.
 - **[`Plugin`]** — the trait every engine subsystem implements. A
   plugin is a *registrar*: it tells the `Application` what resources
   to insert, what systems to run, and (optionally) what runner to
@@ -14,8 +15,8 @@ one. Brings four things together:
 - **[`Stage`]** — the closed enum of per-frame phases (`Startup`,
   `PreUpdate`, `Update`, `PostUpdate`, …) in a fixed execution order.
   `run_stage` flushes pending
-  [`Commands`](../spark_ecs/struct.Commands.html) at every stage
-  boundary.
+  [`Commands`](../spark_ecs/struct.Commands.html) after a stage's
+  sequential systems and at every workload boundary within it.
 - **[`EngineError`]** — the erased error type that flows through every
   plugin seam (a re-export of [`anyhow::Error`]).
 
@@ -243,6 +244,55 @@ mechanism.
 
 [`SystemParam`]: ../spark_ecs/trait.SystemParam.html
 
+## Workloads: parallel-capable groups
+
+`add_system` is **sequential** — its systems run in registration order, in
+the calling thread. When you instead want the scheduler to *extract
+parallelism*, register a **workload** with
+`add_workload(label, stage, |w| { … })`. A workload is a named group whose
+systems the scheduler partitions into access-disjoint **batches** (a
+sequential batch walk today, Rayon-backed at M4). The two are separate
+mechanisms sharing only the `Stage`; within a stage, sequential systems run
+first, then the stage's workloads.
+
+```rust
+use spark_core::{Application, Stage};
+use spark_ecs::{ResMut, Resource, WorkloadLabel};
+
+// One enum per subsystem; each variant names a workload.
+#[derive(WorkloadLabel)]
+enum Grid { Supply, Distribute }
+
+#[derive(Resource)]
+struct Power(u32);
+
+fn collect(mut p: ResMut<Power>) { p.0 += 1; }
+fn route(mut p: ResMut<Power>) { p.0 += 1; }
+
+let mut app = Application::new();
+app.add_resource(Power(0));
+app.add_workload(Grid::Supply, Stage::Update, |w| {
+    w.add_system(collect);
+});
+// Both write Power, so declare the order; workloads order against each
+// other by label on the builder `add_workload` returns.
+app.add_workload(Grid::Distribute, Stage::Update, |w| {
+    w.add_system(route);
+})
+.after(Grid::Supply);
+
+app.run_stage(Stage::Update);
+assert_eq!(app.world().resource::<Power>().0, 2);
+```
+
+Inside the closure, `w.add_system(fn)` returns a handle for
+`.after(handle)` / `.before(handle)` / `.any_order_with(handle)`, and
+`w.add_systems((a, b, c))` adds an unordered group. Two systems (or two
+workloads) that conflict on the same data with **no** order declared are a
+registration error, surfaced on the first `run_stage` for that stage —
+declare an order, or assert commutativity with `.any_order_with`. The full
+workload API lives in [`spark-ecs`](../spark_ecs/).
+
 ## Stages: when systems run
 
 A **stage** is one phase of the frame. The stages are the variants of a
@@ -293,11 +343,13 @@ app.run_stage(Stage::FixedUpdate);      // Tick = 1
 app.run_stage(Stage::FixedUpdate);      // Tick = 2
 ```
 
-Each `run_stage` call **runs every system in registration order, then
-flushes pending [`Commands`](../spark_ecs/struct.Commands.html) into the
-world**. A `commands.spawn().insert(…)` queued in `Update` becomes
-visible to `PostUpdate` of the same frame, and to every system in every
-later frame.
+Each `run_stage` call **runs the stage's sequential systems in registration
+order, then flushes pending
+[`Commands`](../spark_ecs/struct.Commands.html) into the world, then runs
+that stage's parallel-capable workloads (if any)** — which flush again at
+every workload boundary. A `commands.spawn().insert(…)` queued by a
+sequential system in `Update` is visible to that stage's workloads, to
+`PostUpdate` of the same frame, and to every system in every later frame.
 
 > **Why a closed enum, not string labels?** There is exactly one frame
 > timeline, so there is one shared set of phases. A closed enum makes a
@@ -306,9 +358,9 @@ later frame.
 > nothing ever runs, which is what a `&'static str` label allowed. (The
 > variants are *listed* in run order for readability; the order itself
 > comes from the `run_stage` call sequence, not from the enum.) A subsystem that needs
-> its own internal ordering will group related systems into a *workload*
-> inside a stage (a later scheduler feature), not by inventing a new
-> global stage.
+> its own internal ordering groups related systems into a *workload* inside
+> a stage (via [`add_workload`](struct.Application.html#method.add_workload)),
+> not by inventing a new global stage.
 
 ## The `run()` lifecycle
 
@@ -317,8 +369,8 @@ later frame.
 ```text
    1. drain `add_startup_system` closures, in registration order
       └─ first Err short-circuits — `run` returns the error
-   2. run every system on `Stage::Startup` once, in registration
-      order (these are infallible — `fn(&World) -> ()`)
+   2. run `Stage::Startup`: its sequential systems (registration
+      order), then any Startup-stage workloads
    3. if a runner is installed, hand the `Application` to it
       └─ runner blocks until exit (typically winit's event loop)
    4. when the runner returns, `run` returns its Result

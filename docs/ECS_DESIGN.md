@@ -259,6 +259,8 @@ Always deferred. Single-threaded. Deterministic.
 
 A workload is a named bundle of systems that belong together. Systems inside a workload can run in parallel when access allows. Workloads have explicit ordering between each other within a stage.
 
+Work is registered two ways, by intent — two separate mechanisms sharing only the `Stage` they sit in. **Sequential** systems go on the `Application` (`app.add_system(stage, fn)`): they run in the calling thread, in registration order, with no batching or conflict-checking between them. A **parallel-capable** group is a workload (`app.add_workload(label, stage, |w| { … })`, which forwards to a per-`Stage` `Schedule`): the scheduler batches its systems by access disjointness. `Schedule` is a workloads-only container — it has no `add_system`, no anonymous workload. Within a stage, `run_stage` runs the sequential systems first, then a command flush (so the workloads observe what those systems queued), then the stage's workloads — which flush again at every workload boundary.
+
 ```rust
 // One enum per subsystem; each variant is a workload label. The derive
 // reads the variant names at compile time, so it generates both the
@@ -300,7 +302,7 @@ app.add_workload(Workload::PowerGrid, Stage::FixedUpdate, |w| {
 Workload ordering uses **one `.after`/`.before` verb pair, reused at both levels** — only the argument type changes:
 - **Systems** order against the `SystemRef` handle returned by `add_system`: `.after(handle)` / `.before(handle)`. Calls accumulate (`.after(a).after(b)` = "after both"). Handles, not `fn` items, because the same function added twice must stay distinguishable.
 - **Workloads** order against a `WorkloadLabel` on the `add_workload(...)` **return**: `.after(label)` / `.before(label)`. No handle is needed — every workload already carries a label, and labels are `pub` enum variants, so a plugin orders against another plugin's workload with no shared state. (`add_workload` therefore returns an *ordering builder*, not `&mut App`; it does not fluent-chain with `init_resource` / `add_event`.)
-- **An undeclared order between two conflicting systems — or two conflicting workloads — is a registration error** (decision (a)): overlapping write access with no `.after`/`.before` between them is rejected, not silently ordered. Acknowledge an intentional don't-care per pair with `.ambiguous_with(handle | label)`. Because `Commands` declares zero access, this fires only on real component/resource clashes.
+- **An undeclared order between two conflicting systems — or two conflicting workloads — is a registration error** (decision (a)): overlapping write access with no `.after`/`.before` between them is rejected, not silently ordered. Assert, per pair, that either order is fine with `.any_order_with(handle | label)` — a property of the code, which the scheduler trusts but cannot verify. Because `Commands` declares zero access, this fires only on real component/resource clashes.
 - **Labels resolve lazily, at schedule-build time** — you may `.after(Workload::X)` before `X` is registered. Eager resolution would reintroduce "register A before B", the implicit ordering decision B2 abolishes.
 - Commands flush at workload boundaries (all queued commands apply after a workload completes, before the next starts) — this is what makes a workload the atomic unit; a system needing a *different* upstream belongs in its own workload.
 - Editor visualizes workloads as a labelled DAG.
@@ -510,7 +512,7 @@ Zero-cost when the editor isn't attached — registration-time metadata only; th
 
 Each system declares its access set via the `SystemParam::access()` method. The scheduler within a workload:
 
-1. Builds a DAG from the declared `.after`/`.before` edges. An access conflict (read-write or write-write on the same `TypeId`) keeps two systems out of the same batch, but it does **not** silently add an ordering edge — two conflicting systems with no declared order are a registration error (decision (a)) unless acknowledged with `.ambiguous_with`.
+1. Builds a DAG from the declared `.after`/`.before` edges. An access conflict (read-write or write-write on the same `TypeId`) keeps two systems out of the same batch, but it does **not** silently add an ordering edge — two conflicting systems with no declared order are a registration error (decision (a)) unless acknowledged with `.any_order_with`.
 2. Topologically batches: systems with no remaining dependencies and no current-batch conflicts run in parallel via Rayon.
 3. Commands flush between workloads (single-threaded, deterministic).
 
@@ -639,6 +641,8 @@ pub struct WorkloadData {
 ```
 
 Phase 1: `Scheduler::run(world)` walks stages → workloads → systems sequentially. M4 (Stage 19): builds parallel batches within a workload via Rayon, using the per-system access set as the disjointness proof.
+
+> **As shipped (2026-05-23 architecture split):** there is no central `Scheduler` type. `spark-core`'s `Application` owns `schedules: HashMap<Stage, Schedule>` directly, and each `spark_ecs::Schedule` holds its `Vec<WorkloadData>` + cached order — `StageData` is folded into `Schedule`. `Application::run_stage(stage)` (not a `Scheduler::run`) runs the stage's *sequential* systems, flushes, then runs the stage's `Schedule` (workloads → batches → systems). The `WorkloadData { label: WorkloadId, … }` shape above is accurate (the label is non-optional — every workload is named).
 
 ## Crate structure
 
@@ -792,12 +796,12 @@ Test: extract a query from a world via the param trait.
 Test: write a regular function with two params, register it, invoke via the system box.
 
 **Stage 11 — `Stage` enum + sequential scheduler** (1 day)
-`Stage::Startup`, `First`, `PreUpdate`, `FixedUpdate`, `Update`, `PostUpdate`, `Render`, `Last`. Scheduler walks them in order, runs systems sequentially within each. The **`Stage` enum + call-site migration shipped with #32**: the enum lives in `spark-core` (replacing the M1–M3 `pub mod stages { pub const STARTUP: &str = "startup"; … }` stand-in), and `add_system(stages::FOO, …)` call-sites moved to `add_system(Stage::Foo, …)` — the method keeps its name (a plural `add_systems` was deferred then; resolved 2026-05-22 as the unordered-tuple form, singular stays orderable — see #41). The sequential scheduler itself is still pending (scheduler epic children 2–6). See roadmap item 3.
+`Stage::Startup`, `First`, `PreUpdate`, `FixedUpdate`, `Update`, `PostUpdate`, `Render`, `Last`. Scheduler walks them in order, runs systems sequentially within each. The **`Stage` enum + call-site migration shipped with #32**: the enum lives in `spark-core` (replacing the M1–M3 `pub mod stages { pub const STARTUP: &str = "startup"; … }` stand-in), and `add_system(stages::FOO, …)` call-sites moved to `add_system(Stage::Foo, …)` — the method keeps its name (a plural `add_systems` was deferred then; resolved 2026-05-22/05-23 — the plural *unordered* form lives on the workload builder as `w.add_systems((..))`, while `App::add_system` stays the singular **sequential** registrar — see #41). The sequential scheduler itself is still pending (scheduler epic children 2–6). See roadmap item 3.
 Test: three systems in three different stages run in correct order.
 
 **Stage 12 — `Workload` + builder** (2 days)
-`WorkloadLabel` trait + `#[derive(WorkloadLabel)]` (matches over an enum's variants to generate per-variant identity + name). Workload builder closure: `app.add_workload(label, stage, |w| { ... })`. Ordering is one verb pair at both levels: `w.add_system(sys) -> SystemRef` then `.after(handle)` / `.before(handle)` for systems; `app.add_workload(...).after(label)` / `.before(label)` for workloads (lazy label resolution at build). An undeclared conflict is a registration error (decision (a)); `.ambiguous_with(handle | label)` is the escape hatch. No `.chain()` / `.after_all_prior()`. Topo-sort within *and* across workloads.
-Test: ordering respected (incl. a diamond); undeclared conflict errors and `.ambiguous_with` silences it; cycle detected with the pinned message; a forward-referenced label resolves at build. See #34.
+`WorkloadLabel` trait + `#[derive(WorkloadLabel)]` (matches over an enum's variants to generate per-variant identity + name). Workload builder closure: `app.add_workload(label, stage, |w| { ... })`. Ordering is one verb pair at both levels: `w.add_system(sys)` returns a handle directly (no `.id()`) — then `.after(handle)` / `.before(handle)` for systems; `app.add_workload(...).after(label)` / `.before(label)` for workloads (lazy label resolution at build). An undeclared conflict is a registration error (decision (a)); `.any_order_with(handle | label)` is the escape hatch. No `.chain()` / `.after_all_prior()`. Topo-sort within *and* across workloads.
+Test: ordering respected (incl. a diamond); undeclared conflict errors and `.any_order_with` silences it; cycle detected with the pinned message; a forward-referenced label resolves at build. See #34.
 
 **Stage 13 — `Commands` + `CommandQueue`** (2 days)
 `Commands::spawn`, `despawn`, `entity(e).insert().remove()`, `insert_resource`, `update_resource`. Queue flush between workloads.

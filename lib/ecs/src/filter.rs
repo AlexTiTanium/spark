@@ -103,7 +103,7 @@ pub trait QueryFilter {
     fn collect_access(access: &mut QueryAccess);
 }
 
-/// The always-true filter — the default `F` for [`Query<'w, D>`].
+/// The always-true filter — the default `F` for `Query<'w, D>`.
 ///
 /// Matches every entity and reports no access, so `Query<D>` and
 /// `Query<D, ()>` are the same query.

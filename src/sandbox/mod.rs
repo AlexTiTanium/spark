@@ -19,7 +19,8 @@
 //!
 //! Mirror the `ecs/` folder layout, expose `<Name>SandboxPlugin`,
 //! add one `.add_plugin(<Name>SandboxPlugin)` line inside
-//! [`SandboxPlugin::build`]. The shared `components` and `resources`
+//! `SandboxPlugin`'s [`Plugin::build`](spark_core::Plugin::build). The
+//! shared `components` and `resources`
 //! are already in scope under `crate::sandbox::*`, so the new
 //! sub-sandbox can reuse `Position` / `Velocity` / `Health` /
 //! `TickCount` without redefining them.

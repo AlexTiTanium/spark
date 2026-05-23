@@ -17,8 +17,10 @@ other engine crate (including `spark-core`) sits on top.
 > **Today vs tomorrow.** Code blocks tagged ` ```rust ` compile and
 > run today — they're doc tests, kept honest by
 > `cargo test --doc -p spark-ecs`. Code blocks tagged ` ```rust,ignore `
-> show types that don't exist yet (`Commands`, `Workload`, `Event`);
-> they're the spec of what's coming, not what's runnable. `Query`
+> show types that don't exist yet (e.g. `Event`, `EventReader` /
+> `EventWriter`); they're the spec of what's coming, not what's runnable.
+> (`Commands` and the workload API — `WorkloadLabel` / `Schedule` /
+> `add_workload` — ship today.) `Query`
 > exists today for `&T` / `&mut T`, every `&` / `&mut` combination
 > of 2-/3-/4-/5-tuples (including multi-mut at any arity, e.g.
 > `(&mut A, &mut B, &mut C)`), and the filter generic `Query<D, F>`
@@ -1510,16 +1512,22 @@ assert_eq!(Query::<&Tag>::from_world(&world).iter().count(), 0);
 
 ### Flush timing
 
-`Application::run_stage(stage)` runs every system in the stage in
-registration order, then calls `world.flush_commands()`. So:
+`Application::run_stage(stage)` flushes once after the stage's **sequential**
+systems (those registered with `app.add_system(stage, fn)`), then runs the
+stage's workload `Schedule` if one exists. So:
 
-- A `spawn` in `Startup` is visible in every `PreUpdate` /
+- A sequential `spawn` in `Startup` is visible in every `PreUpdate` /
   `Update` / `PostUpdate` system that follows.
-- A `spawn` in `Update` is visible in `PostUpdate` of the same
-  frame.
-- Two systems both running in `UPDATE`: the second one does **not**
-  see entities the first one queued. They flush together at the
-  stage boundary.
+- A sequential `spawn` in `Update` is visible in `PostUpdate` of the same
+  frame — and to that stage's *own* workloads, which run after the flush.
+- Two **sequential** systems both running in `Update`: the second does
+  **not** see entities the first queued. They all run before the
+  post-sequential flush.
+
+Inside a `Schedule` (the workload batcher in *Ordering with workloads*
+below) the flush is finer-grained: commands flush at every **workload**
+boundary, so a later workload *does* see an earlier workload's queued
+commands.
 
 ### Commands available today
 
@@ -1629,39 +1637,107 @@ and workloads are ordered inside **schedules** (frame-shape slots).
 
 ### Batching systems: `Schedule`
 
-A `Schedule` is the piece that actually runs systems today. You hand it
-functions with `add_system`, and from their *parameter types alone* it
-works out which ones conflict — one writes a component or resource that
-another reads or writes. Systems that touch disjoint data are grouped
-into a **batch**; conflicting ones are split across batches and run in
-registration order. The executor walks the batches one system at a time
-(parallelism per batch is the M4 upgrade) and flushes queued commands
-once at the end, the same boundary `Application::run_stage` uses.
+Spark registers work two ways, by **intent** — two separate mechanisms that
+share only the `Stage` they sit in:
+
+- **Sequential systems** live on the `Application` (in `spark-core`):
+  `app.add_system(stage, fn)` runs systems in the calling thread, in
+  registration order, with no batching. Reach for these when you want
+  predictability and no parallelism. (That side is documented in
+  `spark-core`; this crate is the engine below it.)
+- **Parallel-capable workloads** live in a `Schedule`. A `Schedule` is a
+  *container for named workloads* — `add_workload(label, |w| { … })` is its
+  only entry point. The scheduler reads each system's parameter types and
+  packs systems that touch disjoint data into the same **batch** — the unit
+  the M4 executor will hand to a thread pool.
+
+A `Schedule` is **one stage's worth of workloads**. Inside a workload, from a
+system's *parameter types alone* the scheduler knows what each reads and
+writes; `batches(label)` reports the grouping for one workload, for tests and
+diagnostics:
 
 ```rust
-use spark_ecs::{Component, Query, Res, Resource, Schedule, World};
+use spark_ecs::{Component, Query, Schedule, WorkloadLabel, World};
+
+#[derive(WorkloadLabel)]
+enum Motion {
+    Step,
+}
+
+#[derive(Component)]
+struct Position {
+    x: f32,
+}
+
+#[derive(Component)]
+struct Velocity {
+    x: f32,
+}
+
+// Touch different components → no conflict → one shared batch.
+fn move_positions(mut q: Query<&mut Position>) {
+    for p in q.iter_mut() {
+        p.x += 1.0;
+    }
+}
+fn move_velocities(mut q: Query<&mut Velocity>) {
+    for v in q.iter_mut() {
+        v.x += 1.0;
+    }
+}
+
+let mut schedule = Schedule::new();
+schedule.add_workload(Motion::Step, |w| {
+    w.add_systems((move_positions, move_velocities));
+});
+assert_eq!(schedule.batches(Motion::Step).len(), 1); // disjoint → one batch
+
+let mut world = World::new();
+schedule.run(&mut world); // runs the batch, then flushes commands
+```
+
+`Commands` is the exception to conflict tracking: it records *deferred*
+edits, so a `Commands`-using system never conflicts with anything and
+shares a batch freely.
+
+A system whose *own* parameters conflict — two that write the same
+component, or one writing what another reads, like
+`fn(Query<&mut Pos>, Query<&mut Pos>)` — is refused by `w.add_system` at
+registration, naming the offending type, rather than surfacing as a
+`RefCell` "already borrowed" panic deep inside a later `run`.
+
+### Ordering with workloads
+
+When two systems in a workload *conflict* — one writes what the other reads —
+sharing a batch is unsound, so you must say which runs first. `w.add_system`
+hands back a handle for exactly that — order the systems against each other
+inside the closure:
+
+```rust
+use spark_ecs::{Component, Query, Res, Resource, Schedule, WorkloadLabel, World};
+
+// One enum per subsystem; each variant is a workload label.
+#[derive(WorkloadLabel)]
+enum Physics {
+    Step,
+}
 
 #[derive(Resource)]
 struct Gravity(f32);
-
 #[derive(Component)]
 struct Velocity {
     y: f32,
 }
-
 #[derive(Component)]
 struct Position {
     y: f32,
 }
 
-// Reads Gravity, writes Velocity.
 fn apply_gravity(g: Res<Gravity>, mut q: Query<&mut Velocity>) {
     for v in q.iter_mut() {
         v.y -= g.0;
     }
 }
-
-// Writes Position, reads Velocity.
 fn integrate(mut q: Query<(&mut Position, &Velocity)>) {
     for (p, v) in q.iter_mut() {
         p.y += v.y;
@@ -1673,61 +1749,119 @@ world.add_resource(Gravity(9.8));
 world.spawn().insert(Position { y: 100.0 }).insert(Velocity { y: 0.0 });
 
 let mut schedule = Schedule::new();
-schedule.add_system(apply_gravity);
-schedule.add_system(integrate);
-
-// `integrate` reads Velocity, which `apply_gravity` writes — they
-// conflict, so they land in separate batches and apply_gravity (added
-// first) runs first.
-assert_eq!(schedule.batches().len(), 2);
-
-schedule.run(&mut world); // gravity then integration, then command flush
-```
-
-Two systems whose data never overlaps share one batch instead — the unit
-the M4 executor will hand to a thread pool:
-
-<!-- `ignore`: `spawn_particles`/`age_timers` are illustrative names with no
-     real definitions in this crate, so the block can't compile as a doctest. -->
-```rust,ignore
-schedule.add_system(spawn_particles); // writes Particle
-schedule.add_system(age_timers);      // writes Timer
-// Disjoint access → one batch → ready to run in parallel at M4.
-```
-
-`Commands` is the exception to conflict tracking: it records *deferred*
-edits, so a `Commands`-using system never conflicts with anything and can
-share a batch with any other system.
-
-A system whose *own* parameters conflict — two that write the same
-component, or one writing what another reads, like
-`fn(Query<&mut Pos>, Query<&mut Pos>)` — is refused by `add_system` at
-registration, naming the offending type, rather than surfacing as a
-`RefCell` "already borrowed" panic deep inside a later `run`.
-
-A workload is a named bundle. Power-grid systems go together in
-`Workload::PowerGrid`; city-tick systems in `Workload::CityTick`.
-Workloads can declare ordering between each other:
-
-```rust,ignore
-app.add_workload(Workload::PowerGrid, Stage::FixedUpdate, |w| {
-    w.add(collect_supply);                        // disjoint access
-    w.add(compute_demand);                        // run in parallel
-    w.add(distribute_power).after_all_prior();    // joins after both
-    w.add(emit_blackout_events).after(distribute_power);
+schedule.add_workload(Physics::Step, |w| {
+    // `integrate` reads Velocity, which `apply_gravity` writes — declare it.
+    let gravity = w.add_system(apply_gravity);
+    w.add_system(integrate).after(gravity);
 });
-
-app.add_workload(Workload::CityTick, Stage::FixedUpdate, |w| {
-    w.after_workload(Workload::PowerGrid);        // sequential between workloads
-    w.add(city_growth);
-});
+schedule.run(&mut world); // gravity, then integration, then a command flush
 ```
 
-The access-based batching shown for `Schedule` above is exactly the
-within-workload analysis: a workload will own a `Schedule`, and the M4
-executor will run each batch's non-conflicting systems in parallel via
-Rayon instead of one at a time. Between workloads, everything stays
-sequential and deterministic — commands flush, events propagate.
+`w.add_system(..)` hands back a `SystemRef` you order against, directly —
+no `.id()` step. It's a *handle*, not the function itself, so the same `fn`
+added twice stays two distinct systems. `.after` / `.before` accumulate, so
+one system can wait on several: real dependencies form a *partial* order (a
+diamond), not a line.
+
+```rust
+use spark_ecs::{Schedule, WorkloadLabel, World};
+
+#[derive(WorkloadLabel)]
+enum Assets {
+    Load,
+}
+
+fn read_files() {}
+fn parse_meshes() {}
+fn parse_textures() {}
+fn upload_to_gpu() {}
+
+let mut schedule = Schedule::new();
+schedule.add_workload(Assets::Load, |w| {
+    let files = w.add_system(read_files);
+    let meshes = w.add_system(parse_meshes).after(files);
+    let textures = w.add_system(parse_textures).after(files);
+    w.add_system(upload_to_gpu).after(meshes).after(textures); // waits for both
+});
+schedule.run(&mut World::new());
+```
+
+Workloads order against *each other* by **label** — the same `.after` /
+`.before` verb, on the value `add_workload` returns, with a
+`WorkloadLabel` argument instead of a handle. Labels resolve lazily, so a
+workload may be ordered against one registered later:
+
+```rust
+use spark_ecs::{Schedule, WorkloadLabel, World};
+
+#[derive(WorkloadLabel)]
+enum Grid {
+    Supply,
+    Distribute,
+}
+
+fn collect_supply() {}
+fn route_power() {}
+
+let mut schedule = Schedule::new();
+schedule
+    .add_workload(Grid::Distribute, |w| {
+        w.add_system(route_power);
+    })
+    .after(Grid::Supply); // ordered against a workload not yet registered
+schedule.add_workload(Grid::Supply, |w| {
+    w.add_system(collect_supply);
+});
+schedule.run(&mut World::new()); // Supply runs before Distribute
+```
+
+### The conflict policy
+
+A write-overlap with **no** declared order — between two systems, or two
+workloads — is a registration error, surfaced when the schedule first
+runs. `.any_order_with` asserts, per pair, that the two may run in either
+order: they still land in separate batches (a conflict can never share
+one), but you waive the *requirement to declare which comes first*. The
+scheduler can't verify that commutativity — it doesn't see the system
+bodies — so reach for `.after` / `.before` when in doubt. Because
+`Commands` declares zero access, this fires only on real
+component/resource clashes.
+
+```rust
+use spark_ecs::{ResMut, Resource, Schedule, WorkloadLabel, World};
+
+#[derive(WorkloadLabel)]
+enum Cleanup {
+    Sweep,
+}
+
+#[derive(Resource)]
+struct DeadCount(u32);
+
+fn sweep_dead(mut d: ResMut<DeadCount>) {
+    d.0 = 0;
+}
+fn compact_storage(mut d: ResMut<DeadCount>) {
+    d.0 += 1;
+}
+
+let mut world = World::new();
+world.add_resource(DeadCount(3));
+let mut schedule = Schedule::new();
+schedule.add_workload(Cleanup::Sweep, |w| {
+    let sweep = w.add_system(sweep_dead);
+    // Both write DeadCount; the result is the same in either order.
+    w.add_system(compact_storage).any_order_with(sweep);
+});
+schedule.run(&mut world); // no panic — the conflict is acknowledged
+```
+
+Commands flush at every **workload boundary**: a workload's queued
+spawns/despawns all apply before the next workload begins, which is what
+makes a workload the atomic unit. The within-workload batching is the same
+access analysis shown above; at M4 each batch's non-conflicting systems
+will run in parallel via Rayon instead of one at a time. Between
+workloads, everything stays sequential and deterministic.
 
 > **Where the `Stage` enum lives.** The per-frame phases are the closed
 > `Stage` enum (`Stage::Startup`, `Stage::Update`, …), and you register
@@ -1743,12 +1877,19 @@ sequential and deterministic — commands flush, events propagate.
 
 ## Derive macros
 
-`#[derive(Component)]` and `#[derive(Resource)]` ship today, from a
-nested `spark-ecs-macros` crate at `lib/ecs/macros/`. Consumers depend
-only on `spark-ecs`, which re-exports the derives — so one
-`use spark_ecs::Component;` brings in both the trait and its derive.
-`#[derive(Event)]` and `#[derive(WorkloadLabel)]` join them in later
-PRs.
+`#[derive(Component)]`, `#[derive(Resource)]`, and `#[derive(WorkloadLabel)]`
+ship today, from a nested `spark-ecs-macros` crate at `lib/ecs/macros/`.
+Consumers depend only on `spark-ecs`, which re-exports the derives — so
+one `use spark_ecs::Component;` brings in both the trait and its derive.
+`#[derive(Event)]` joins them in a later PR.
+
+`#[derive(WorkloadLabel)]` is the odd one out: it applies to an *enum*,
+not a struct, and generates real method bodies rather than an empty marker
+impl. The derive matches over the enum's unit variants to produce a
+`WorkloadId` (the enum's `TypeId` plus the variant index) and a qualified
+`"Enum::Variant"` name per variant — which is why it needs an enum, where
+each variant is exactly one workload label. A tuple/struct variant, or a
+non-enum, is a compile error.
 
 The derive makes ECS membership explicit: a type is a component only
 if it `#[derive(Component)]`s, a resource only if it
