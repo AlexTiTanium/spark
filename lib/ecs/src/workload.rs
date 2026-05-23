@@ -195,9 +195,9 @@ pub(crate) struct BoxedSystem {
 impl BoxedSystem {
     /// Boxes a system fn, capturing its name and declared [`Access`].
     ///
-    /// Shared by [`Schedule::add_system`](crate::Schedule::add_system) and
-    /// the workload builder so both registration paths refuse a
-    /// self-conflicting system identically.
+    /// Shared by [`WorkloadBuilder::add_system`] and
+    /// [`add_systems`](WorkloadBuilder::add_systems) so both registration
+    /// paths refuse a self-conflicting system identically.
     ///
     /// # Panics
     ///
@@ -360,9 +360,9 @@ pub struct WorkloadBuilder {
     data: RefCell<WorkloadData>,
     /// The label this builder is for, stamped into every [`SystemRef`] it
     /// hands out so the ordering methods can reject a handle from a
-    /// different workload. Held directly (not via `data.label`) so there is
-    /// no `Option` to unwrap — and outside the `RefCell`, so the
-    /// debug guard reads it without a borrow.
+    /// different workload. Duplicated here (it also lives in `data.label`)
+    /// so it sits *outside* the `RefCell` — the `assert_same_workload` debug
+    /// guard reads it without taking a borrow.
     id: WorkloadId,
 }
 
@@ -385,8 +385,8 @@ impl WorkloadBuilder {
     ///
     /// Panics if `system`'s own parameters conflict (two writing the same
     /// component/resource, or one writing what another reads) — refused
-    /// here, naming the type, the same as
-    /// [`Schedule::add_system`](crate::Schedule::add_system).
+    /// here at registration, naming the type, the same as
+    /// [`add_systems`](Self::add_systems).
     ///
     /// # Examples
     ///
@@ -615,8 +615,7 @@ impl From<SystemOrderBuilder<'_>> for SystemRef {
 }
 
 /// A tuple of systems that [`add_systems`](WorkloadBuilder::add_systems)
-/// (and [`Schedule::add_systems`](crate::Schedule::add_systems)) can
-/// register in one call.
+/// can register in one call.
 ///
 /// `Marker` is a tuple of each system's own `IntoSystem` marker, carried
 /// in the trait so the per-element marker type parameters stay

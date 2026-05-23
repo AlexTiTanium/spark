@@ -127,11 +127,12 @@ do not refile it. Originally filed as #25 and closed as stale.
     order instead of panicking.) System code (`BoxedSystem`, `SystemId`,
     `build_batches`) lives in `workload.rs`, leaving `Schedule` a thin
     cross-workload orchestrator — the module dependency is one-directional.
-  - ⬜ **remaining:** `Plugin::run(&mut World)` + the full per-frame run
-    loop (child 4, #35 — the `App ↔ Schedule` wiring, `add_workload`, and
-    `run_stage` running workloads landed early with the 2026-05-23
-    architecture split); `Events` (child 5, #36); `FixedUpdate`
-    accumulator (child 6, #37).
+  - ⬜ **remaining (#35):** `Plugin::run(&mut World)` + the full per-frame
+    run loop. *(The App↔Schedule wiring proper — `Application::schedules`,
+    `add_workload(label, stage, |w|)`, and `run_stage` running sequential
+    systems, then a flush, then workloads — landed early with the 2026-05-23
+    architecture split, so it is no longer part of #35.)* `Events` (child 5,
+    #36); `FixedUpdate` accumulator (child 6, #37).
 - *Stage-shape migration:* **✅ shipped with #32.** Replaced the M1–M3
   stand-in (`pub mod stages { pub const STARTUP: &str = "startup"; … }`)
   with the canonical, **closed** `pub enum Stage { Startup, First,
@@ -178,9 +179,10 @@ do not refile it. Originally filed as #25 and closed as stale.
     (`app.add_system(stage, fn)`), unchanged. `Application` now also owns a
     `schedules: HashMap<Stage, Schedule>` and an
     `add_workload(label, stage, |w| …)` wrapper that forwards to the stage's
-    `Schedule`; `run_stage` runs the stage's sequential systems first, then
-    its workloads, then one command flush. (The remaining #35 work is
-    `Plugin::run(&mut World)` + the full per-frame loop.)
+    `Schedule`; `run_stage` runs the stage's sequential systems first, then a
+    command flush, then its workloads (each flushing at its own boundary).
+    (The remaining #35 work is `Plugin::run(&mut World)` + the full per-frame
+    loop.)
   - *`add_system` returns the handle directly* (no `.id()` — settled by the
     final design directive, 2026-05-23). `w.add_system(s)` hands back a
     `Copy` `SystemOrderBuilder` that both chains

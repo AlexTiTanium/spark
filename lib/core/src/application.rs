@@ -334,20 +334,25 @@ impl Application {
             .add_workload(label, build)
     }
 
-    /// Runs `stage`: every **sequential** system first (registration order,
-    /// in-thread), then the stage's **workload** [`Schedule`](spark_ecs::Schedule)
-    /// if one exists, then [flushes pending
-    /// commands](spark_ecs::World::flush_commands) into the world.
+    /// Runs `stage` in order: its **sequential** systems first (registration
+    /// order, in-thread), then [a command
+    /// flush](spark_ecs::World::flush_commands) so the stage's workloads
+    /// observe what those systems queued, then the stage's **workload**
+    /// [`Schedule`](spark_ecs::Schedule) if one exists (which flushes again
+    /// at every workload boundary inside
+    /// [`Schedule::run`](spark_ecs::Schedule::run)).
     ///
     /// The flush is what makes [`Commands`](spark_ecs::Commands) usable
-    /// across stages: a system that runs in [`Stage::Startup`] and queues a
-    /// `spawn().insert(Position)` has the resulting entity visible to systems
-    /// in [`Stage::PreUpdate`] (and every later stage) — but *not* to later
-    /// systems within the same `Startup` pass. Workloads additionally flush
-    /// at every workload boundary inside [`Schedule::run`](spark_ecs::Schedule::run).
+    /// across the seam: a sequential system that queues a
+    /// `spawn().insert(Position)` has the entity visible to *this* stage's
+    /// workloads, to every later stage, and to every later frame — but *not*
+    /// to other sequential systems in the same pass (they all run before the
+    /// flush). The mid-stage flush is the only flush `run_stage` issues
+    /// itself; `Schedule::run` owns the workload-boundary flushes, so there
+    /// is no redundant trailing flush.
     ///
-    /// No-op for stages with neither systems nor workloads (the trailing
-    /// flush still runs, but it's cheap when the queue is empty).
+    /// No-op for stages with neither systems nor workloads (the flush still
+    /// runs, but it's cheap when the queue is empty).
     ///
     /// # Examples
     ///
@@ -375,10 +380,14 @@ impl Application {
                 system(&self.world);
             }
         }
+        // Apply the sequential systems' queued commands *before* the stage's
+        // workloads run, so they observe a consistent world. Workloads then
+        // flush at each of their own boundaries inside `Schedule::run` (the
+        // last one included), so no trailing flush is needed here.
+        self.world.flush_commands();
         if let Some(schedule) = self.schedules.get_mut(&stage) {
             schedule.run(&mut self.world);
         }
-        self.world.flush_commands();
     }
 
     /// Installs the runner — the closure that takes the main thread
@@ -453,7 +462,7 @@ impl Application {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use spark_ecs::{ResMut, Resource, WorkloadLabel};
+    use spark_ecs::{Commands, Component, Query, ResMut, Resource, WorkloadLabel};
 
     #[derive(Resource)]
     struct Counter(u32);
@@ -551,5 +560,95 @@ mod tests {
         app.run_stage(Stage::Update);
         app.run_stage(Stage::Update);
         assert_eq!(app.world.resource::<Counter>().0, 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "conflict on write/write")]
+    fn add_workload_conflict_panics_on_first_run_stage() {
+        // Two workloads on the same stage both write Counter with no order
+        // declared between them — a registration error surfaced lazily, on
+        // the first `run_stage` (the App wrapper defers the schedule build).
+        #[derive(WorkloadLabel)]
+        enum W {
+            A,
+            B,
+        }
+        let mut app = Application::new();
+        app.add_resource(Counter(0));
+        app.add_workload(W::A, Stage::Update, |w| {
+            w.add_system(bump);
+        });
+        app.add_workload(W::B, Stage::Update, |w| {
+            w.add_system(bump);
+        });
+        app.run_stage(Stage::Update); // build() panics here, not at registration
+    }
+
+    #[test]
+    #[should_panic(expected = "registered twice")]
+    fn add_workload_same_label_same_stage_panics() {
+        // The duplicate-label check is per-`Schedule`, so two workloads with
+        // the same label on the same stage are rejected — at registration.
+        #[derive(WorkloadLabel)]
+        enum W {
+            Tick,
+        }
+        let mut app = Application::new();
+        app.add_workload(W::Tick, Stage::Update, |w| {
+            w.add_system(bump);
+        });
+        app.add_workload(W::Tick, Stage::Update, |w| {
+            w.add_system(bump);
+        }); // panics here, before any run
+    }
+
+    #[test]
+    fn same_label_on_different_stages_is_allowed() {
+        // Each stage owns its own `Schedule`, so the per-`Schedule`
+        // duplicate-label check does not fire across stages.
+        #[derive(WorkloadLabel)]
+        enum W {
+            Tick,
+        }
+        let mut app = Application::new();
+        app.add_resource(Counter(0));
+        app.add_workload(W::Tick, Stage::PreUpdate, |w| {
+            w.add_system(bump);
+        });
+        app.add_workload(W::Tick, Stage::Update, |w| {
+            w.add_system(bump);
+        });
+        app.run_stage(Stage::PreUpdate);
+        app.run_stage(Stage::Update);
+        assert_eq!(app.world.resource::<Counter>().0, 2); // both ran
+    }
+
+    #[test]
+    fn sequential_command_is_visible_to_same_stage_workload() {
+        // A sequential system's queued commands flush before the stage's
+        // workloads run, so a workload in the same stage observes them.
+        #[derive(WorkloadLabel)]
+        enum W {
+            Count,
+        }
+        #[derive(Component)]
+        struct Tag;
+        #[derive(Resource)]
+        struct Seen(usize);
+
+        let mut app = Application::new();
+        app.add_resource(Seen(0));
+        // Sequential: spawn a tagged entity (deferred via Commands).
+        app.add_system(Stage::Update, |mut c: Commands| {
+            c.spawn().insert(Tag);
+        });
+        // Workload in the same stage: count Tag entities it can see.
+        app.add_workload(W::Count, Stage::Update, |w| {
+            w.add_system(|q: Query<&Tag>, mut seen: ResMut<Seen>| {
+                seen.0 = q.iter().count();
+            });
+        });
+        app.run_stage(Stage::Update);
+        assert_eq!(app.world().resource::<Seen>().0, 1);
     }
 }

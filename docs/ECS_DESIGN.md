@@ -259,7 +259,7 @@ Always deferred. Single-threaded. Deterministic.
 
 A workload is a named bundle of systems that belong together. Systems inside a workload can run in parallel when access allows. Workloads have explicit ordering between each other within a stage.
 
-Work is registered two ways, by intent — two separate mechanisms sharing only the `Stage` they sit in. **Sequential** systems go on the `Application` (`app.add_system(stage, fn)`): they run in the calling thread, in registration order, with no batching or conflict-checking between them. A **parallel-capable** group is a workload (`app.add_workload(label, stage, |w| { … })`, which forwards to a per-`Stage` `Schedule`): the scheduler batches its systems by access disjointness. `Schedule` is a workloads-only container — it has no `add_system`, no anonymous workload. Within a stage, `run_stage` runs the sequential systems first, then the stage's workloads, then one command flush.
+Work is registered two ways, by intent — two separate mechanisms sharing only the `Stage` they sit in. **Sequential** systems go on the `Application` (`app.add_system(stage, fn)`): they run in the calling thread, in registration order, with no batching or conflict-checking between them. A **parallel-capable** group is a workload (`app.add_workload(label, stage, |w| { … })`, which forwards to a per-`Stage` `Schedule`): the scheduler batches its systems by access disjointness. `Schedule` is a workloads-only container — it has no `add_system`, no anonymous workload. Within a stage, `run_stage` runs the sequential systems first, then a command flush (so the workloads observe what those systems queued), then the stage's workloads — which flush again at every workload boundary.
 
 ```rust
 // One enum per subsystem; each variant is a workload label. The derive
@@ -641,6 +641,8 @@ pub struct WorkloadData {
 ```
 
 Phase 1: `Scheduler::run(world)` walks stages → workloads → systems sequentially. M4 (Stage 19): builds parallel batches within a workload via Rayon, using the per-system access set as the disjointness proof.
+
+> **As shipped (2026-05-23 architecture split):** there is no central `Scheduler` type. `spark-core`'s `Application` owns `schedules: HashMap<Stage, Schedule>` directly, and each `spark_ecs::Schedule` holds its `Vec<WorkloadData>` + cached order — `StageData` is folded into `Schedule`. `Application::run_stage(stage)` (not a `Scheduler::run`) runs the stage's *sequential* systems, flushes, then runs the stage's `Schedule` (workloads → batches → systems). The `WorkloadData { label: WorkloadId, … }` shape above is accurate (the label is non-optional — every workload is named).
 
 ## Crate structure
 

@@ -17,8 +17,10 @@ other engine crate (including `spark-core`) sits on top.
 > **Today vs tomorrow.** Code blocks tagged ` ```rust ` compile and
 > run today — they're doc tests, kept honest by
 > `cargo test --doc -p spark-ecs`. Code blocks tagged ` ```rust,ignore `
-> show types that don't exist yet (`Commands`, `Workload`, `Event`);
-> they're the spec of what's coming, not what's runnable. `Query`
+> show types that don't exist yet (e.g. `Event`, `EventReader` /
+> `EventWriter`); they're the spec of what's coming, not what's runnable.
+> (`Commands` and the workload API — `WorkloadLabel` / `Schedule` /
+> `add_workload` — ship today.) `Query`
 > exists today for `&T` / `&mut T`, every `&` / `&mut` combination
 > of 2-/3-/4-/5-tuples (including multi-mut at any arity, e.g.
 > `(&mut A, &mut B, &mut C)`), and the filter generic `Query<D, F>`
@@ -1510,23 +1512,22 @@ assert_eq!(Query::<&Tag>::from_world(&world).iter().count(), 0);
 
 ### Flush timing
 
-`Application::run_stage(stage)` runs every system in the stage in
-registration order, then calls `world.flush_commands()`. So:
+`Application::run_stage(stage)` flushes once after the stage's **sequential**
+systems (those registered with `app.add_system(stage, fn)`), then runs the
+stage's workload `Schedule` if one exists. So:
 
-- A `spawn` in `Startup` is visible in every `PreUpdate` /
+- A sequential `spawn` in `Startup` is visible in every `PreUpdate` /
   `Update` / `PostUpdate` system that follows.
-- A `spawn` in `Update` is visible in `PostUpdate` of the same
-  frame.
-- Two systems both running in `UPDATE`: the second one does **not**
-  see entities the first one queued. They flush together at the
-  stage boundary.
+- A sequential `spawn` in `Update` is visible in `PostUpdate` of the same
+  frame — and to that stage's *own* workloads, which run after the flush.
+- Two **sequential** systems both running in `Update`: the second does
+  **not** see entities the first queued. They all run before the
+  post-sequential flush.
 
-This is the `Application::run_stage` flush, the path the binary uses
-today. A `Schedule` (the workload batcher in *Ordering with workloads*
-above) is finer-grained: it flushes at every **workload** boundary, so a
-later workload *does* see an earlier workload's queued commands. Wiring
-each stage to a `Schedule` is a later step; until then `run_stage` is the
-one flush per stage.
+Inside a `Schedule` (the workload batcher in *Ordering with workloads*
+below) the flush is finer-grained: commands flush at every **workload**
+boundary, so a later workload *does* see an earlier workload's queued
+commands.
 
 ### Commands available today
 

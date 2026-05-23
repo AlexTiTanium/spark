@@ -15,8 +15,8 @@ one. Brings four things together:
 - **[`Stage`]** — the closed enum of per-frame phases (`Startup`,
   `PreUpdate`, `Update`, `PostUpdate`, …) in a fixed execution order.
   `run_stage` flushes pending
-  [`Commands`](../spark_ecs/struct.Commands.html) at every stage
-  boundary.
+  [`Commands`](../spark_ecs/struct.Commands.html) after a stage's
+  sequential systems and at every workload boundary within it.
 - **[`EngineError`]** — the erased error type that flows through every
   plugin seam (a re-export of [`anyhow::Error`]).
 
@@ -344,9 +344,11 @@ app.run_stage(Stage::FixedUpdate);      // Tick = 2
 ```
 
 Each `run_stage` call **runs the stage's sequential systems in registration
-order, then its parallel-capable workloads (if any), then flushes pending
-[`Commands`](../spark_ecs/struct.Commands.html) into the world**. A
-`commands.spawn().insert(…)` queued in `Update` becomes visible to
+order, then flushes pending
+[`Commands`](../spark_ecs/struct.Commands.html) into the world, then runs
+that stage's parallel-capable workloads (if any)** — which flush again at
+every workload boundary. A `commands.spawn().insert(…)` queued by a
+sequential system in `Update` is visible to that stage's workloads, to
 `PostUpdate` of the same frame, and to every system in every later frame.
 
 > **Why a closed enum, not string labels?** There is exactly one frame

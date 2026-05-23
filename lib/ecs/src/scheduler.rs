@@ -185,7 +185,8 @@ impl Schedule {
     /// Inside `build`, use [`w.add_system(..)`](WorkloadBuilder::add_system)
     /// (handle-ordered) and [`w.add_systems((..))`](WorkloadBuilder::add_systems)
     /// (unordered). The returned builder is a *statement*, not a fluent
-    /// `&mut Self` — chain `.after(label)` / `.before(label)` on it:
+    /// `&mut Self` — chain `.after(label)` / `.before(label)` on it (see the
+    /// example below).
     ///
     /// # Panics
     ///
@@ -618,6 +619,24 @@ mod tests {
         });
         assert_eq!(schedule.batches(W::Tick).len(), 1);
         assert_eq!(schedule.batches(W::Tick)[0].len(), 2);
+    }
+
+    #[test]
+    fn batches_of_unregistered_label_is_empty() {
+        #[derive(WorkloadLabel)]
+        enum W {
+            A,
+            B,
+        }
+        fn noop() {}
+        let mut schedule = Schedule::new();
+        schedule.add_workload(W::A, |w| {
+            w.add_system(noop);
+        });
+        // `W::B` was never registered → empty plan, no panic (and the lazy
+        // build still runs cleanly for the labels that do exist).
+        assert!(schedule.batches(W::B).is_empty());
+        assert_eq!(schedule.batches(W::A).len(), 1);
     }
 
     #[test]
