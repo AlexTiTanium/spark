@@ -141,23 +141,31 @@ The loop is built once inside [`run`], then handed to winit via
 `run_app(&mut runner)`. The runner owns the [`Application`] that was
 handed to it from the
 [`set_runner`](../spark_core/struct.Application.html#method.set_runner)
-closure. On every `WindowEvent::RedrawRequested`, the runner ticks
-the per-frame stages, then asks winit for the next redraw:
+closure. On every `WindowEvent::RedrawRequested`, the runner banks the
+frame's elapsed real time, ticks the per-frame stages — draining the
+fixed-timestep accumulator in the middle — then asks winit for the next
+redraw:
 
 ```text
    ┌──────────────────────────────────────────────────────┐
    │  one frame (on RedrawRequested) — TODAY              │
    │                                                      │
+   │   accumulator += min(elapsed, 250ms)                 │  ◀── real-time clock
+   │                                                      │
    │   1. app.run_stage(Stage::PreUpdate)                 │  ◀── input / time
    │      → flush queued commands                         │
    │                                                      │
-   │   2. app.run_stage(Stage::Update)                    │  ◀── game logic
+   │   2. while accumulator ≥ 1/60 s:                     │  ◀── fixed-timestep
+   │        app.run_stage(Stage::FixedUpdate)             │       simulation
+   │        accumulator -= 1/60 s                          │       (0..N steps)
+   │                                                      │
+   │   3. app.run_stage(Stage::Update)                    │  ◀── game logic
    │      → flush queued commands                         │       (movement,
    │                                                      │        spawning)
-   │   3. app.run_stage(Stage::PostUpdate)                │  ◀── settled-state
+   │   4. app.run_stage(Stage::PostUpdate)                │  ◀── settled-state
    │      → flush queued commands                         │       bookkeeping
    │                                                      │
-   │   4. window.request_redraw()                         │  ◀── queue next
+   │   5. window.request_redraw()                         │  ◀── queue next
    │                                                      │       frame
    └──────────────────────────────────────────────────────┘
 ```
@@ -168,6 +176,16 @@ into the [`spark_ecs::World`]. So a system that calls
 `commands.spawn().insert(Position { … })` in `Update` has its entity
 visible in `PostUpdate` of the same frame, and to every system in
 every later frame.
+
+**The fixed-timestep loop.** `Stage::FixedUpdate` runs off a real-time
+*accumulator*: each frame banks the elapsed wall-clock time, and the
+`while` loop spends it in whole 1/60 s steps, carrying the remainder to
+the next frame. A fast frame runs zero `FixedUpdate` steps; a slow one
+runs several — so simulation advances at a steady 60 Hz no matter the
+display rate, which is what keeps it deterministic across hardware. The
+per-frame time is clamped to 250 ms first: without that cap, one long
+stall (a breakpoint, a dragged title bar) would bank seconds and fire
+hundreds of catch-up steps at once — the "spiral of death".
 
 The control-flow mode is `ControlFlow::Wait`: the OS thread sleeps
 between frames and `window.request_redraw()` is what wakes it for
@@ -219,9 +237,11 @@ What's different from today:
   iteration; `RedrawRequested` only fires the render schedule. The
   swapchain (via `wgpu`) is what gates `RedrawRequested` cadence, so
   rendering paces against vsync without us doing anything special.
-- **A real `Stage::FixedUpdate` driver** with an accumulator, so simulation
-  stays deterministic across hardware (a save/replay/multiplayer
-  prerequisite).
+- **`Stage::FixedUpdate` moves to `about_to_wait`.** The accumulator
+  driver itself already ships (see *the fixed-timestep loop* above); under
+  `Poll` it relocates from the `RedrawRequested` handler to
+  `about_to_wait`, so simulation steps independently of when the GPU is
+  ready to draw.
 - **Per-frame `KeyboardInput` / `MouseInput` events** drain into an
   `InputState` resource before any sim runs, instead of being
   consumed inline as `tracing` events.
@@ -231,15 +251,15 @@ Each piece grows into its own crate as the milestones land:
 | Capability | Where it'll live | Milestone |
 |-|-|-|
 | Input collection — drain `KeyboardInput` / `MouseInput` into an `InputState` resource | `spark-input` | M3 follow-up |
-| `Stage::FixedUpdate` driver + accumulator (60 Hz, deterministic) | `spark-core` | M3 follow-up |
-| `ControlFlow::Wait → Poll` flip + `about_to_wait` driver | `spark-window` | lands with `Stage::FixedUpdate` |
+| ✅ `Stage::FixedUpdate` driver + accumulator (60 Hz, deterministic) | `spark-window` runner | **shipped** |
+| `ControlFlow::Wait → Poll` flip + `about_to_wait` driver (relocates `FixedUpdate`) | `spark-window` | M3 follow-up |
 | `Stage::Render` driver that pushes a frame to the GPU | `spark-render` (`wgpu` + WGSL) | M5 |
 | Multi-threaded scheduler | `spark-ecs` parallel executor | M4 |
 
 The per-stage pattern — *run every system, then flush pending
 `Commands`* — is settled and won't change. The `Stage` enum is closed:
-the reserved phases (`FixedUpdate`, `Render`, …) gain *drivers* as the
-milestones land, but the enum and the body of `run_stage` stay the same.
+the still-reserved phase (`Render`) gains its *driver* as the milestone
+lands, but the enum and the body of `run_stage` stay the same.
 
 ## How `WindowPlugin` plugs into `Application`
 
