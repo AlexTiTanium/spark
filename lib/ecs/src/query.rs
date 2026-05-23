@@ -718,7 +718,7 @@ impl_all_tuple!(A, B, C, D, E);
 /// so `Query<D>` means `Query<D, ()>` and every existing call site is
 /// unchanged. A non-default `F` narrows which entities iterate without
 /// changing the yielded item: `Query<&Position, With<Powered>>` still
-/// yields `&Position`. See the [`filter`](crate::filter) module.
+/// yields `&Position`. See the `With` / `Without` / `And` / `Or` filters.
 ///
 /// # Examples
 ///

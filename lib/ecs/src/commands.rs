@@ -26,7 +26,7 @@
 //! [`Commands`] borrows two cells on the world — `entities` and
 //! `pending` — both *disjoint* from every component storage. That's
 //! why a system can take both a `Query<&mut T>` (which borrows
-//! storage<T>) and `Commands` (which borrows entities + pending) at the
+//! `storage<T>`) and `Commands` (which borrows entities + pending) at the
 //! same time without [`std::cell::RefCell`] panicking.
 
 use std::cell::RefCell;
@@ -45,7 +45,7 @@ use crate::world::World;
 /// until the next stage boundary).
 pub(crate) type DeferredOp = Box<dyn FnOnce(&mut World) + 'static>;
 
-/// FIFO queue of [deferred ops](DeferredOp) drained at stage
+/// FIFO queue of `DeferredOp` closures drained at stage
 /// boundaries by [`Application::run_stage`](../../spark_core/struct.Application.html#method.run_stage).
 ///
 /// Lives inside the [`World`] as a single [`RefCell<CommandQueue>`];

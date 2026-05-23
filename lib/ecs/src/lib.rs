@@ -40,7 +40,7 @@ pub use world::{EntityMut, World};
 pub use spark_ecs_macros::{Component, Resource, WorkloadLabel};
 
 /// Marker trait for types that attach to entities as components and are
-/// matched by [`Query`](crate::Query).
+/// matched by [`Query`].
 ///
 /// # Explicit membership, by derive
 ///
@@ -48,7 +48,7 @@ pub use spark_ecs_macros::{Component, Resource, WorkloadLabel};
 /// `#[derive(Component)]`. There is deliberately no blanket
 /// `impl<T> Component for T` — that would make every `'static` type a
 /// component, so a [`Resource`] would silently satisfy
-/// [`Query`](crate::Query) and a stray `String` could be `insert`ed onto
+/// [`Query`] and a stray `String` could be `insert`ed onto
 /// an entity. The derive turns "this type is a component" into a
 /// checked, intentional decision.
 ///

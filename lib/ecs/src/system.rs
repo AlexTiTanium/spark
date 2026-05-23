@@ -41,7 +41,7 @@ use crate::{Access, Resource, World};
 /// the concrete value passed to the user's fn, with its lifetime tied
 /// to the world borrow. Today's implementors are [`Res<T>`] (shared
 /// resource borrow), [`ResMut<T>`] (exclusive resource borrow),
-/// [`Query`] (entity iteration), and [`Commands`] (deferred structural
+/// [`Query`](crate::Query) (entity iteration), and [`Commands`] (deferred structural
 /// mutation); events and locals land in later milestones. Each also
 /// declares its reads and writes via [`collect_access`], which the
 /// scheduler folds into a per-system [`Access`].
@@ -66,7 +66,7 @@ use crate::{Access, Resource, World};
 /// ```
 pub trait SystemParam {
     /// The concrete value handed to the user's system fn. Carries the
-    /// borrow lifetime `'w` taken from the [`&World`] argument.
+    /// borrow lifetime `'w` taken from the `&World` argument.
     ///
     /// The `Self: 'w` bound is the GAT well-formedness rule modern Rust
     /// asks for on every lifetime-generic associated type. `Res<'a, T>`
@@ -253,7 +253,7 @@ impl<'a, T: Resource> SystemParam for ResMut<'a, T> {
 /// the user never names it — Rust infers it from the fn signature.
 ///
 /// Implemented for arities 0..=4. A fn with more parameters needs a
-/// new arity row in [`impl_into_system`] (or, eventually, a system
+/// new arity row in `impl_into_system` (or, eventually, a system
 /// builder API).
 ///
 /// # Examples
