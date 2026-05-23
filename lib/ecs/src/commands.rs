@@ -7,9 +7,10 @@
 //! of bug as mutating a [`Vec`] while iterating it.
 //!
 //! The fix is to *defer*. [`Commands`] queues every structural change
-//! into a [`CommandQueue`]; the queue is flushed *between* systems —
-//! at the stage boundary — when no system holds borrows. Writes become
-//! visible at predictable points, never mid-iteration.
+//! into a [`CommandQueue`]; the queue is flushed at fixed points where no
+//! system holds borrows — after a stage's sequential systems, and at every
+//! workload boundary. Writes become visible at those points, never
+//! mid-iteration.
 //!
 //! # Why `spawn` is the exception
 //!
@@ -42,16 +43,17 @@ use crate::world::World;
 ///
 /// `FnOnce` because each op runs exactly once; `+ 'static` because the
 /// closure outlives the system that queued it (it lives in the queue
-/// until the next stage boundary).
+/// until the next flush point).
 pub(crate) type DeferredOp = Box<dyn FnOnce(&mut World) + 'static>;
 
-/// FIFO queue of `DeferredOp` closures drained at stage
-/// boundaries by [`Application::run_stage`](../../spark_core/struct.Application.html#method.run_stage).
+/// FIFO queue of `DeferredOp` closures drained at each flush point by
+/// [`Application::run_stage`](../../spark_core/struct.Application.html#method.run_stage)
+/// — after a stage's sequential systems, and at every workload boundary.
 ///
 /// Lives inside the [`World`] as a single [`RefCell<CommandQueue>`];
 /// [`Commands`] is the public way to enqueue, [`flush`](Self::flush) is
-/// the only way to drain. The queue is empty between flushes — every
-/// op pushed during a stage is consumed before the next stage starts.
+/// the only way to drain. The queue is empty between flushes — every op
+/// pushed since the last flush is consumed at the next.
 ///
 /// # Examples
 ///
@@ -172,10 +174,11 @@ impl CommandQueue {
 ///    references to the two cells, no data is moved.
 /// 2. The system queues spawns / inserts / despawns. Component writes
 ///    are *not yet visible* to other systems.
-/// 3. After every system in the stage finishes,
-///    [`World::flush_commands`] drains the queue into the world — the
-///    queued writes land all at once. The next stage's systems see
-///    them.
+/// 3. At the next flush point — after the stage's sequential systems, or
+///    at a workload boundary — [`World::flush_commands`] drains the queue
+///    into the world; the queued writes land all at once. Systems that run
+///    after that flush see them (a same-stage workload, a later workload,
+///    or any later stage).
 ///
 /// # Examples
 ///
@@ -217,7 +220,8 @@ impl Commands<'_> {
     /// The returned handle is real *now* — call `.id()` to capture it
     /// and use it within the same system, or pass it to
     /// [`despawn`](Self::despawn). Components inserted via the builder
-    /// don't show up until the next stage's flush.
+    /// don't show up until the next flush point (the post-sequential
+    /// flush, or the next workload boundary).
     ///
     /// # Examples
     ///
@@ -248,7 +252,7 @@ impl Commands<'_> {
     }
 
     /// Queues a despawn for `entity`. Equivalent to
-    /// [`World::despawn`] at the next stage flush.
+    /// [`World::despawn`] at the next flush point.
     ///
     /// Despawn is deferred — the entity is still alive (and its
     /// components readable) until the queue drains. Repeated

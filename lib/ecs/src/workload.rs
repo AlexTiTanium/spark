@@ -622,6 +622,13 @@ impl From<SystemOrderBuilder<'_>> for SystemRef {
 /// constrained — the same trick [`IntoSystem`] uses for arity.
 /// Implemented for tuples of 1..=8 systems; longer tuples need another
 /// `impl_into_system_tuple!` row.
+///
+/// **Sealed.** It is `pub` only because it is a bound on the public
+/// [`add_systems`](WorkloadBuilder::add_systems) (a `pub(crate)` trait there
+/// would trip the `private_bounds` lint, and the crate re-exports it). Its
+/// one method takes the opaque, `#[doc(hidden)]` [`WorkloadData`], so
+/// downstream crates cannot implement it — they only ever *use* the
+/// provided tuple impls.
 pub trait IntoSystemTuple<Marker> {
     /// Pushes every system in the tuple into `data`, unordered.
     ///
