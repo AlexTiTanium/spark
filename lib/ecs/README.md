@@ -1636,16 +1636,32 @@ and workloads are ordered inside **schedules** (frame-shape slots).
 
 ### Batching systems: `Schedule`
 
-A `Schedule` is **one stage's worth of work** and the piece that actually
-runs systems today. From a system's *parameter types alone* it knows what
-each reads and writes, and packs systems that touch disjoint data into the
-same **batch** — the unit the M4 executor will hand to a thread pool. Bare
-`add_system` / `add_systems` calls land in an anonymous group; because
-they hand back no handle, they must be mutually non-conflicting (see *The
-conflict policy* below).
+Spark registers work two ways, by **intent** — two separate mechanisms that
+share only the `Stage` they sit in:
+
+- **Sequential systems** live on the `Application` (in `spark-core`):
+  `app.add_system(stage, fn)` runs systems in the calling thread, in
+  registration order, with no batching. Reach for these when you want
+  predictability and no parallelism. (That side is documented in
+  `spark-core`; this crate is the engine below it.)
+- **Parallel-capable workloads** live in a `Schedule`. A `Schedule` is a
+  *container for named workloads* — `add_workload(label, |w| { … })` is its
+  only entry point. The scheduler reads each system's parameter types and
+  packs systems that touch disjoint data into the same **batch** — the unit
+  the M4 executor will hand to a thread pool.
+
+A `Schedule` is **one stage's worth of workloads**. Inside a workload, from a
+system's *parameter types alone* the scheduler knows what each reads and
+writes; `batches(label)` reports the grouping for one workload, for tests and
+diagnostics:
 
 ```rust
-use spark_ecs::{Component, Query, Schedule, World};
+use spark_ecs::{Component, Query, Schedule, WorkloadLabel, World};
+
+#[derive(WorkloadLabel)]
+enum Motion {
+    Step,
+}
 
 #[derive(Component)]
 struct Position {
@@ -1670,8 +1686,10 @@ fn move_velocities(mut q: Query<&mut Velocity>) {
 }
 
 let mut schedule = Schedule::new();
-schedule.add_systems((move_positions, move_velocities));
-assert_eq!(schedule.batches().len(), 1); // one batch, parallel-ready at M4
+schedule.add_workload(Motion::Step, |w| {
+    w.add_systems((move_positions, move_velocities));
+});
+assert_eq!(schedule.batches(Motion::Step).len(), 1); // disjoint → one batch
 
 let mut world = World::new();
 schedule.run(&mut world); // runs the batch, then flushes commands
@@ -1683,16 +1701,16 @@ shares a batch freely.
 
 A system whose *own* parameters conflict — two that write the same
 component, or one writing what another reads, like
-`fn(Query<&mut Pos>, Query<&mut Pos>)` — is refused by `add_system` at
+`fn(Query<&mut Pos>, Query<&mut Pos>)` — is refused by `w.add_system` at
 registration, naming the offending type, rather than surfacing as a
 `RefCell` "already borrowed" panic deep inside a later `run`.
 
 ### Ordering with workloads
 
-When two systems *do* conflict — one writes what the other reads — sharing
-a batch is unsound, so you must say which runs first. A bare `add_system`
-can't express that: it returns no handle. Group the systems in a named
-**workload** and order them against each other by handle:
+When two systems in a workload *conflict* — one writes what the other reads —
+sharing a batch is unsound, so you must say which runs first. `w.add_system`
+hands back a handle for exactly that — order the systems against each other
+inside the closure:
 
 ```rust
 use spark_ecs::{Component, Query, Res, Resource, Schedule, WorkloadLabel, World};
@@ -1732,17 +1750,17 @@ world.spawn().insert(Position { y: 100.0 }).insert(Velocity { y: 0.0 });
 let mut schedule = Schedule::new();
 schedule.add_workload(Physics::Step, |w| {
     // `integrate` reads Velocity, which `apply_gravity` writes — declare it.
-    let gravity = w.add_system(apply_gravity).id();
+    let gravity = w.add_system(apply_gravity);
     w.add_system(integrate).after(gravity);
 });
 schedule.run(&mut world); // gravity, then integration, then a command flush
 ```
 
-`w.add_system(..).id()` returns a `SystemRef` you order against — a
-*handle*, not the function itself, so the same `fn` added twice stays two
-distinct systems. `.after` / `.before` accumulate, so one system can wait
-on several: real dependencies form a *partial* order (a diamond), not a
-line.
+`w.add_system(..)` hands back a `SystemRef` you order against, directly —
+no `.id()` step. It's a *handle*, not the function itself, so the same `fn`
+added twice stays two distinct systems. `.after` / `.before` accumulate, so
+one system can wait on several: real dependencies form a *partial* order (a
+diamond), not a line.
 
 ```rust
 use spark_ecs::{Schedule, WorkloadLabel, World};
@@ -1759,9 +1777,9 @@ fn upload_to_gpu() {}
 
 let mut schedule = Schedule::new();
 schedule.add_workload(Assets::Load, |w| {
-    let files = w.add_system(read_files).id();
-    let meshes = w.add_system(parse_meshes).after(files).id();
-    let textures = w.add_system(parse_textures).after(files).id();
+    let files = w.add_system(read_files);
+    let meshes = w.add_system(parse_meshes).after(files);
+    let textures = w.add_system(parse_textures).after(files);
     w.add_system(upload_to_gpu).after(meshes).after(textures); // waits for both
 });
 schedule.run(&mut World::new());
@@ -1800,10 +1818,13 @@ schedule.run(&mut World::new()); // Supply runs before Distribute
 
 A write-overlap with **no** declared order — between two systems, or two
 workloads — is a registration error, surfaced when the schedule first
-runs. `.ambiguous_with` acknowledges an intentional don't-care per pair:
-the two still land in separate batches (a conflict can never share one),
-but you waive the *requirement to declare an order*. Because `Commands`
-declares zero access, this fires only on real component/resource clashes.
+runs. `.any_order_with` asserts, per pair, that the two may run in either
+order: they still land in separate batches (a conflict can never share
+one), but you waive the *requirement to declare which comes first*. The
+scheduler can't verify that commutativity — it doesn't see the system
+bodies — so reach for `.after` / `.before` when in doubt. Because
+`Commands` declares zero access, this fires only on real
+component/resource clashes.
 
 ```rust
 use spark_ecs::{ResMut, Resource, Schedule, WorkloadLabel, World};
@@ -1827,9 +1848,9 @@ let mut world = World::new();
 world.add_resource(DeadCount(3));
 let mut schedule = Schedule::new();
 schedule.add_workload(Cleanup::Sweep, |w| {
-    let sweep = w.add_system(sweep_dead).id();
-    // Both write DeadCount; order is intentionally undefined.
-    w.add_system(compact_storage).ambiguous_with(sweep);
+    let sweep = w.add_system(sweep_dead);
+    // Both write DeadCount; the result is the same in either order.
+    w.add_system(compact_storage).any_order_with(sweep);
 });
 schedule.run(&mut world); // no panic — the conflict is acknowledged
 ```

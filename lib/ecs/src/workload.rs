@@ -1,9 +1,16 @@
-//! Named system groups and the two-level ordering they sit in.
+//! A **workload** — a parallel-capable group of systems — and the
+//! within-group ordering it carries.
 //!
-//! A [`Schedule`](crate::Schedule) is one stage's worth of work. Inside
-//! it, systems live in **workloads** — named bundles a plugin registers
-//! together. This module owns everything *within* a workload (leaving
-//! [`Schedule`](crate::Schedule) only the cross-workload orchestration):
+//! Spark registers work two ways, by intent, through two separate
+//! mechanisms that share only the frame `Stage` they sit in. **Sequential**
+//! systems live on `spark_core::Application` (`app.add_system(stage, fn)`):
+//! they run in the calling thread, in registration order, and never reach
+//! this module. A **parallel-capable group** is a *workload*:
+//! [`add_workload(label, |w| …)`](crate::Schedule::add_workload) on a
+//! [`Schedule`](crate::Schedule) collects systems the scheduler partitions
+//! into access-disjoint batches. This module owns everything *inside* a
+//! workload, leaving [`Schedule`](crate::Schedule) only the cross-workload
+//! orchestration:
 //!
 //! - [`WorkloadLabel`] + [`WorkloadId`] — the stable identity a
 //!   `#[derive(WorkloadLabel)]` enum hands the scheduler.
@@ -21,14 +28,18 @@
 //! # The two levels, one verb
 //!
 //! Ordering reads the same at both levels — `.after` / `.before` — only
-//! the argument differs. **Systems** order against a [`SystemRef`] handle
-//! ([`SystemOrderBuilder`]); **workloads** order against a
-//! [`WorkloadLabel`] (the [`WorkloadOrderBuilder`](crate::WorkloadOrderBuilder)
-//! returned by [`Schedule::add_workload`](crate::Schedule::add_workload)).
-//! Handles, not function items, because the same `fn` registered twice
-//! must stay two distinct systems.
+//! the argument differs. **Systems** order against a [`SystemRef`] handle:
+//! [`add_system`](WorkloadBuilder::add_system) hands one back directly (as
+//! a [`SystemOrderBuilder`] that *is* the handle), so a later system says
+//! `.after(that_handle)` with no extra step. **Workloads** order against a
+//! [`WorkloadLabel`] (the
+//! [`WorkloadOrderBuilder`](crate::WorkloadOrderBuilder) returned by
+//! [`Schedule::add_workload`](crate::Schedule::add_workload)). Handles, not
+//! function items, because the same `fn` registered twice must stay two
+//! distinct systems.
 
 use std::any::TypeId;
+use std::cell::RefCell;
 use std::collections::VecDeque;
 
 use crate::access::{Access, ConflictKind};
@@ -119,11 +130,12 @@ pub trait WorkloadLabel: 'static {
 /// A handle to a system registered inside a [`WorkloadBuilder`] closure —
 /// what `.after` / `.before` order against.
 ///
-/// Returned (via [`SystemOrderBuilder::id`]) from
-/// [`WorkloadBuilder::add_system`]. It is a position within *that one
-/// workload*: ordering against the same `fn` added twice yields two
-/// distinct handles, which is the whole reason ordering keys off handles
-/// rather than function items.
+/// [`WorkloadBuilder::add_system`] hands one back directly, wrapped in a
+/// [`SystemOrderBuilder`] that derefs and converts to this `SystemRef` (so
+/// the builder *is* the handle — no `.id()` step). It is a position within
+/// *that one workload*: ordering against the same `fn` added twice yields
+/// two distinct handles, which is the whole reason ordering keys off
+/// handles rather than function items.
 ///
 /// # How NOT to use
 ///
@@ -155,12 +167,17 @@ pub struct SystemRef {
 /// # Examples
 ///
 /// ```
-/// use spark_ecs::{Schedule, World};
+/// use spark_ecs::{Schedule, WorkloadLabel};
+///
+/// #[derive(WorkloadLabel)]
+/// enum W { Tick }
 ///
 /// fn noop() {}
 /// let mut schedule = Schedule::new();
-/// schedule.add_system(noop);
-/// let first = schedule.batches()[0][0];
+/// schedule.add_workload(W::Tick, |w| {
+///     w.add_system(noop);
+/// });
+/// let first = schedule.batches(W::Tick)[0][0];
 /// assert_eq!(first, first); // `SystemId` is comparable
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -215,47 +232,44 @@ pub(crate) enum EdgeKind {
 /// One workload's contents: its systems and the intra-workload ordering
 /// the builder collected.
 ///
-/// `label` is `None` for the anonymous tier-0 workload (the home of bare
-/// [`add_system`](crate::Schedule::add_system) calls) and `Some` for a
-/// named one. `edges` are explicit `(before, after)` pairs by system
-/// index; `ambiguous` are acknowledged don't-care pairs in canonical
-/// `(min, max)` order. `aggregate_access` is the union of every member's
-/// access, used for cross-workload conflict detection. `batches` caches
-/// the built plan.
+/// Every workload carries a `label` (its [`WorkloadId`]) and a `name` (the
+/// label's qualified text, for diagnostics). `edges` are explicit
+/// `(before, after)` pairs by system index; `any_order` are acknowledged
+/// don't-care pairs in canonical `(min, max)` order. `aggregate_access` is
+/// the union of every member's access, used for cross-workload conflict
+/// detection. `batches` caches the built plan.
 ///
 /// `pub` only so it can appear in [`IntoSystemTuple`]'s (public) plumbing
 /// method; `#[doc(hidden)]` with `pub(crate)` fields keeps it fully opaque
 /// — there is nothing a downstream crate can build or read.
 #[doc(hidden)]
 pub struct WorkloadData {
-    pub(crate) label: Option<WorkloadId>,
+    pub(crate) label: WorkloadId,
     pub(crate) name: &'static str,
     pub(crate) systems: Vec<BoxedSystem>,
     pub(crate) edges: Vec<(usize, usize)>,
-    pub(crate) ambiguous: Vec<(usize, usize)>,
+    pub(crate) any_order: Vec<(usize, usize)>,
     pub(crate) aggregate_access: Access,
     pub(crate) batches: Vec<Vec<SystemId>>,
 }
 
 impl WorkloadData {
     /// Creates an empty workload with the given label and display name.
-    pub(crate) fn new(label: Option<WorkloadId>, name: &'static str) -> Self {
+    pub(crate) fn new(label: WorkloadId, name: &'static str) -> Self {
         Self {
             label,
             name,
             systems: Vec::new(),
             edges: Vec::new(),
-            ambiguous: Vec::new(),
+            any_order: Vec::new(),
             aggregate_access: Access::new(),
             batches: Vec::new(),
         }
     }
 
     /// Appends `boxed`, folding its access into the workload aggregate.
-    /// Shared by the builder and by [`Schedule::add_system`] for the
-    /// anonymous workload.
-    ///
-    /// [`Schedule::add_system`]: crate::Schedule::add_system
+    /// The shared sink for [`WorkloadBuilder::add_system`] and
+    /// [`add_systems`](WorkloadBuilder::add_systems).
     pub(crate) fn push(&mut self, boxed: BoxedSystem) -> usize {
         self.aggregate_access.extend(&boxed.access);
         let idx = self.systems.len();
@@ -288,10 +302,38 @@ impl WorkloadData {
 /// systems and the ordering between them.
 ///
 /// [`add_system`](Self::add_system) registers one system and hands back a
-/// [`SystemOrderBuilder`] for `.after` / `.before` / `.label`;
-/// [`add_systems`](Self::add_systems) registers an unordered tuple. The
-/// builder is consumed by the closure — its `WorkloadData` is taken out
-/// afterwards by [`Schedule::add_workload`](crate::Schedule::add_workload).
+/// [`SystemOrderBuilder`] for `.after` / `.before` / `.any_order_with` /
+/// `.label`; [`add_systems`](Self::add_systems) registers an unordered
+/// tuple. The builder is consumed by the closure — its `WorkloadData` is
+/// taken out afterwards by
+/// [`Schedule::add_workload`](crate::Schedule::add_workload).
+///
+/// # Why interior mutability
+///
+/// Every method takes `&self`, not `&mut self`, and mutates through a
+/// [`RefCell`]. That is the price of the ergonomic the directive fixes —
+/// `add_system` returning a usable handle with no `.id()` step:
+///
+/// ```
+/// # use spark_ecs::{Schedule, WorkloadLabel};
+/// # #[derive(WorkloadLabel)] enum W { A }
+/// # fn setup() {} fn render() {} fn cleanup() {}
+/// # let mut schedule = Schedule::new();
+/// schedule.add_workload(W::A, |w| {
+///     let setup  = w.add_system(setup);              // store the handle…
+///     let render = w.add_system(render).after(setup); // …and reuse it later
+///     w.add_system(cleanup).after(render);
+/// });
+/// ```
+///
+/// If `add_system` borrowed `&mut self`, the stored `setup` would hold an
+/// *exclusive* borrow of `w` for as long as it lived — and the next
+/// `w.add_system(render)` could not borrow `w` again. With a `RefCell`,
+/// each [`SystemOrderBuilder`] holds only a *shared* `&WorkloadBuilder`, so
+/// any number of handles coexist and still record edges. The whole builder
+/// lives for one `add_workload` call at startup, so the runtime borrow
+/// check costs nothing that matters and can never alias (each method does
+/// one short `borrow_mut` and releases it before returning).
 ///
 /// # Examples
 ///
@@ -306,16 +348,21 @@ impl WorkloadData {
 ///
 /// let mut schedule = Schedule::new();
 /// schedule.add_workload(Boot::Load, |w| {
-///     let files = w.add_system(read_files).id();
+///     let files = w.add_system(read_files);
 ///     w.add_system(parse).after(files);
 /// });
 /// ```
 pub struct WorkloadBuilder {
-    data: WorkloadData,
+    /// The workload under construction, behind a [`RefCell`] so the
+    /// `&self` ordering methods can record into it while shared
+    /// [`SystemOrderBuilder`] handles are live (see *Why interior
+    /// mutability* above).
+    data: RefCell<WorkloadData>,
     /// The label this builder is for, stamped into every [`SystemRef`] it
     /// hands out so the ordering methods can reject a handle from a
     /// different workload. Held directly (not via `data.label`) so there is
-    /// no `Option` to unwrap.
+    /// no `Option` to unwrap — and outside the `RefCell`, so the
+    /// debug guard reads it without a borrow.
     id: WorkloadId,
 }
 
@@ -323,14 +370,16 @@ impl WorkloadBuilder {
     /// Starts an empty builder for a labelled workload.
     pub(crate) fn new(label: WorkloadId, name: &'static str) -> Self {
         Self {
-            data: WorkloadData::new(Some(label), name),
+            data: RefCell::new(WorkloadData::new(label, name)),
             id: label,
         }
     }
 
-    /// Registers `system` and returns a [`SystemOrderBuilder`] for
-    /// ordering it — chain `.after(handle)` / `.before(handle)`, then
-    /// `.id()` to keep the handle for later systems to depend on.
+    /// Registers `system` and hands back a [`SystemOrderBuilder`] — which
+    /// is both the chainable `.after(handle)` / `.before(handle)` /
+    /// `.any_order_with(handle)` / `.label(name)` builder *and*, directly,
+    /// the [`SystemRef`] handle later systems order against (it derefs and
+    /// converts to one — no `.id()` step).
     ///
     /// # Panics
     ///
@@ -352,16 +401,25 @@ impl WorkloadBuilder {
     ///
     /// let mut schedule = Schedule::new();
     /// schedule.add_workload(Startup::Init, |w| {
-    ///     let config = w.add_system(load_config).id();
+    ///     let config = w.add_system(load_config);
     ///     w.add_system(spawn_player).after(config);
     /// });
     /// ```
-    pub fn add_system<S, Marker>(&mut self, system: S) -> SystemOrderBuilder<'_>
+    pub fn add_system<S, Marker>(&self, system: S) -> SystemOrderBuilder<'_>
     where
         S: IntoSystem<Marker>,
     {
-        let idx = self.data.push(BoxedSystem::from_system(system));
-        SystemOrderBuilder { idx, builder: self }
+        let idx = self
+            .data
+            .borrow_mut()
+            .push(BoxedSystem::from_system(system));
+        SystemOrderBuilder {
+            system: SystemRef {
+                idx,
+                workload: self.id,
+            },
+            builder: self,
+        }
     }
 
     /// Registers a tuple of systems as an **unordered** group — no
@@ -388,24 +446,35 @@ impl WorkloadBuilder {
     ///     w.add_systems((step_ai, animate_sprites));   // run together, order unspecified
     /// });
     /// ```
-    pub fn add_systems<T, Marker>(&mut self, systems: T)
+    pub fn add_systems<T, Marker>(&self, systems: T)
     where
         T: IntoSystemTuple<Marker>,
     {
-        systems.register_into(&mut self.data);
+        systems.register_into(&mut self.data.borrow_mut());
     }
 
     /// Takes the built workload out of the consumed builder.
     pub(crate) fn into_data(self) -> WorkloadData {
-        self.data
+        self.data.into_inner()
     }
 }
 
-/// The chainable result of [`WorkloadBuilder::add_system`]: orders the
-/// just-added system and yields its [`SystemRef`] handle.
+/// What [`WorkloadBuilder::add_system`] returns: a system's [`SystemRef`]
+/// handle plus the `.after` / `.before` / `.any_order_with` / `.label`
+/// methods to order it — the two roles in one value.
+///
+/// It is [`Copy`] and holds only a *shared* `&WorkloadBuilder`, so it can
+/// be stored in a `let` and reused as a handle while later `add_system`
+/// calls run (see [`WorkloadBuilder`]'s *Why interior mutability*). It
+/// [`Deref`](std::ops::Deref)s to `SystemRef` and converts via
+/// `Into<SystemRef>`, which is how `.after(handle)` accepts it with no
+/// `.id()` step. The ordering methods take `self` and return `Self`: each
+/// records its edge eagerly and yields the same handle, so a chain like
+/// `add_system(f).after(a).before(b)` reads left to right and its result is
+/// still a usable handle.
 ///
 /// `.after` / `.before` **accumulate** — `.after(a).after(b)` means "after
-/// both". `.ambiguous_with(h)` acknowledges an intentional don't-care with
+/// both". `.any_order_with(h)` acknowledges an intentional don't-care with
 /// a conflicting peer (silencing the conflict-policy error for that pair).
 /// `.label(name)` overrides the system's diagnostic name — useful for a
 /// closure (whose `type_name` is noise) or a `fn` added twice.
@@ -425,68 +494,92 @@ impl WorkloadBuilder {
 ///
 /// let mut schedule = Schedule::new();
 /// schedule.add_workload(Assets::Load, |w| {
-///     let files  = w.add_system(read_files).id();
-///     let meshes = w.add_system(parse_meshes).after(files).id();
-///     let texs   = w.add_system(parse_textures).after(files).id();
+///     let files  = w.add_system(read_files);
+///     let meshes = w.add_system(parse_meshes).after(files);
+///     let texs   = w.add_system(parse_textures).after(files);
 ///     w.add_system(upload).after(meshes).after(texs);   // waits for both
 /// });
 /// ```
+#[derive(Clone, Copy)]
 pub struct SystemOrderBuilder<'b> {
-    idx: usize,
-    builder: &'b mut WorkloadBuilder,
+    /// The handle this builder represents — also what `Deref` / `From`
+    /// expose so the builder *is* the system's [`SystemRef`].
+    system: SystemRef,
+    /// Shared borrow of the parent builder, used to record edges. Shared
+    /// (not `&mut`) is what lets several of these coexist as live handles.
+    builder: &'b WorkloadBuilder,
 }
 
+#[allow(
+    clippy::return_self_not_must_use,
+    clippy::must_use_candidate,
+    reason = "these methods record their edge into the workload as a side \
+              effect and return the handle only so a chain can continue; the \
+              result is meant to be dropped at the end of a chain \
+              (`w.add_system(f).after(a);`), so #[must_use] would wrongly warn \
+              on every terminal call."
+)]
 impl SystemOrderBuilder<'_> {
     /// Orders this system **after** `other` (edge `other → self`).
     /// Accumulates: call repeatedly to depend on several systems.
     ///
-    /// Returns `&mut self` for chaining; the edge is recorded eagerly, so
-    /// ending the chain here (without [`id`](Self::id)) is the normal way
-    /// to say "done ordering this one".
-    pub fn after(&mut self, other: SystemRef) -> &mut Self {
+    /// Takes any handle (`other: impl Into<SystemRef>`) — a stored
+    /// [`SystemRef`] or another [`SystemOrderBuilder`] — and returns this
+    /// one for further chaining.
+    pub fn after(self, other: impl Into<SystemRef>) -> Self {
+        let other = other.into();
         self.assert_same_workload(other);
-        self.builder.data.edges.push((other.idx, self.idx));
+        self.builder
+            .data
+            .borrow_mut()
+            .edges
+            .push((other.idx, self.system.idx));
         self
     }
 
     /// Orders this system **before** `other` (edge `self → other`).
     /// Accumulates.
-    pub fn before(&mut self, other: SystemRef) -> &mut Self {
-        self.assert_same_workload(other);
-        self.builder.data.edges.push((self.idx, other.idx));
-        self
-    }
-
-    /// Acknowledges that this system and `other` conflict but their order
-    /// is intentionally undefined — silences the conflict-policy error for
-    /// exactly this pair. They still run in different batches (a conflict
-    /// can never share one); only the *requirement to declare an order* is
-    /// waived. With no edge between them, their relative batch order falls
-    /// out of their topo positions (registration index, here).
-    pub fn ambiguous_with(&mut self, other: SystemRef) -> &mut Self {
+    pub fn before(self, other: impl Into<SystemRef>) -> Self {
+        let other = other.into();
         self.assert_same_workload(other);
         self.builder
             .data
-            .ambiguous
-            .push(canonical(self.idx, other.idx));
+            .borrow_mut()
+            .edges
+            .push((self.system.idx, other.idx));
+        self
+    }
+
+    /// Asserts that this system and `other` may run in **any order** — the
+    /// observable result is independent of which runs first.
+    ///
+    /// They conflict (share a write), so they still land in separate
+    /// batches; this only waives the *requirement to declare which comes
+    /// first*, silencing the conflict-policy error for exactly this pair.
+    /// With no edge between them, their relative batch order falls out of
+    /// their topo positions (registration index, here).
+    ///
+    /// The scheduler **cannot verify** the commutativity you are asserting
+    /// — it does not see the system bodies. If the two are not actually
+    /// commutative under the conflict they share, you are introducing
+    /// nondeterminism the type system cannot catch. Reach for `.after` /
+    /// `.before` instead when in doubt.
+    pub fn any_order_with(self, other: impl Into<SystemRef>) -> Self {
+        let other = other.into();
+        self.assert_same_workload(other);
+        self.builder
+            .data
+            .borrow_mut()
+            .any_order
+            .push(canonical(self.system.idx, other.idx));
         self
     }
 
     /// Overrides this system's diagnostic name (for a closure or a `fn`
     /// added twice). Without it, the name is the function's `type_name`.
-    pub fn label(&mut self, name: &'static str) -> &mut Self {
-        self.builder.data.systems[self.idx].name = name;
+    pub fn label(self, name: &'static str) -> Self {
+        self.builder.data.borrow_mut().systems[self.system.idx].name = name;
         self
-    }
-
-    /// Returns this system's [`SystemRef`] handle so later systems can
-    /// `.after`/`.before` it.
-    #[must_use]
-    pub fn id(&self) -> SystemRef {
-        SystemRef {
-            idx: self.idx,
-            workload: self.builder.id,
-        }
     }
 
     /// Guards against a handle minted in a different workload (a stashed
@@ -498,6 +591,26 @@ impl SystemOrderBuilder<'_> {
             "a SystemRef was used to order a system in a different workload than the \
              one that produced it"
         );
+    }
+}
+
+/// The builder *is* its system's handle: `*w.add_system(f)` is the
+/// [`SystemRef`], and a `&SystemOrderBuilder` coerces to `&SystemRef`
+/// wherever one is wanted.
+impl std::ops::Deref for SystemOrderBuilder<'_> {
+    type Target = SystemRef;
+    fn deref(&self) -> &SystemRef {
+        &self.system
+    }
+}
+
+/// Lets `.after(handle)` / `.before(handle)` / `.any_order_with(handle)`
+/// accept a builder straight off `add_system`, and lets a builder be
+/// stored as a plain [`SystemRef`] (`let h: SystemRef = w.add_system(f).into();`)
+/// to escape the closure — the form the cross-workload guard test relies on.
+impl From<SystemOrderBuilder<'_>> for SystemRef {
+    fn from(builder: SystemOrderBuilder<'_>) -> Self {
+        builder.system
     }
 }
 
@@ -708,7 +821,7 @@ pub(crate) fn cycle_path(leftover: &[usize], edges: &[(usize, usize)]) -> Vec<us
 ///
 /// 1. **Linearise** the explicit `(before, after)` edges with
 ///    [`topo_sort`]. This is the *only* graph a cycle can come from —
-///    `.ambiguous_with` adds no edges — so it is the one honest place to
+///    `.any_order_with` adds no edges — so it is the one honest place to
 ///    report "you declared a cyclic order".
 /// 2. **Rank** each system in that topological order. A system sits one
 ///    batch later than the latest of: its explicit predecessors, and any
@@ -734,7 +847,7 @@ pub(crate) fn cycle_path(leftover: &[usize], edges: &[(usize, usize)]) -> Vec<us
 /// access, exactly the invariant the M4 parallel executor needs to hand a
 /// batch to Rayon. Explicit edges are respected because topo order places
 /// every predecessor first, and the rank sweep lifts each system past
-/// them. `.ambiguous_with` adds no edge and plays no part here — it only
+/// them. `.any_order_with` adds no edge and plays no part here — it only
 /// silences the conflict-policy error in [`validate_system_conflicts`]. An
 /// acknowledged pair therefore reaches this point unordered, so topo order
 /// places them by registration index; the access-conflict arm of the rank
@@ -811,7 +924,7 @@ pub(crate) fn build_batches(
 
 /// Panics if any access-conflicting pair of systems in `data` has neither
 /// a declared order (a transitive `.after`/`.before` path) nor an
-/// `.ambiguous_with` acknowledgement — conflict policy (a) at the system
+/// `.any_order_with` acknowledgement — conflict policy (a) at the system
 /// level.
 ///
 /// Runs at schedule-build time, where every system and edge is known.
@@ -820,9 +933,8 @@ pub(crate) fn build_batches(
 ///
 /// # Panics
 ///
-/// With the system-conflict message (named-workload or tier-0 variant
-/// depending on whether `data` has a label), naming both systems and the
-/// clashing type.
+/// With the system-conflict message, naming both systems and the clashing
+/// type.
 pub(crate) fn validate_system_conflicts(data: &WorkloadData) {
     let n = data.systems.len();
     // Build the explicit-edge adjacency once, then reuse it for every
@@ -840,7 +952,7 @@ pub(crate) fn validate_system_conflicts(data: &WorkloadData) {
             }
             // They conflict — either an order is declared (transitively) or
             // it is acknowledged, or it is a registration error.
-            if has_declared_order(i, j, &successors) || data.ambiguous.contains(&canonical(i, j)) {
+            if has_declared_order(i, j, &successors) || data.any_order.contains(&canonical(i, j)) {
                 continue;
             }
             // The error path, and the only place the named conflict detail
@@ -869,10 +981,8 @@ pub(crate) fn first_conflict(a: &Access, b: &Access) -> (TypeId, ConflictKind) {
         .expect("incompatible accesses always have at least one conflict")
 }
 
-/// Builds the system-level conflict message — the named-workload variant
-/// pins the `.after(handle)` / `.ambiguous_with(handle)` advice; the
-/// anonymous tier-0 variant points the user at opening a workload, since
-/// bare `add_system` calls hand back no handle to order against.
+/// Builds the system-level conflict message, pinning the `.after(handle)` /
+/// `.any_order_with(handle)` advice.
 fn system_conflict_message(
     data: &WorkloadData,
     i: usize,
@@ -893,20 +1003,11 @@ fn system_conflict_message(
             format!("conflict on {domain} `{type_name}` (one writes what the other reads)")
         }
     };
-    if data.label.is_some() {
-        format!(
-            "Systems `{a}` and `{b}` {clash} but no order is declared. \
-             Add .after(handle) to one, or .ambiguous_with(handle) if order \
-             is intentionally undefined."
-        )
-    } else {
-        format!(
-            "Systems `{a}` and `{b}` {clash} but no order is declared. They were \
-             registered with add_system/add_systems, which return no handle to order \
-             against — group them in a workload (add_workload) and use .after/.before, \
-             or .ambiguous_with if the order is intentionally undefined."
-        )
-    }
+    format!(
+        "Systems `{a}` and `{b}` {clash} but no order is declared. \
+         Add .after(handle) to one, or .any_order_with(handle) if order \
+         is intentionally undefined."
+    )
 }
 
 /// Builds the workload-level conflict message — pinned in #34.
@@ -922,7 +1023,7 @@ pub(crate) fn workload_conflict_message(
     };
     format!(
         "Workloads `{a}` and `{b}` conflict on {kind_str} of `{type_name}` but no order \
-         is declared between them. Add .after(WorkloadLabel) or .ambiguous_with(WorkloadLabel)."
+         is declared between them. Add .after(WorkloadLabel) or .any_order_with(WorkloadLabel)."
     )
 }
 

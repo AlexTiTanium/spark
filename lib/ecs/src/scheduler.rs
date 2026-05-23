@@ -1,21 +1,31 @@
-//! The sequential scheduler: a [`Schedule`] groups systems into
-//! **workloads**, orders them, and runs them batch by batch.
+//! The sequential-batch scheduler: a [`Schedule`] is one stage's worth of
+//! **workloads**, ordered and run batch by batch.
 //!
-//! A [`Schedule`] is one stage's worth of work. Inside it, systems live in
-//! workloads — named bundles a plugin registers with
-//! [`add_workload`](Schedule::add_workload), plus an *anonymous* workload
-//! that holds bare [`add_system`](Schedule::add_system) /
-//! [`add_systems`](Schedule::add_systems) calls. Workloads are ordered
-//! against each other by [`WorkloadLabel`](crate::WorkloadLabel); systems
-//! inside a workload are ordered against each other by handle
-//! ([`SystemRef`](crate::SystemRef)). Both use the same `.after`/`.before`
-//! verb — see [`crate::workload`].
+//! Spark registers work two ways, by intent, through two separate
+//! mechanisms that share only the frame `Stage` they sit in:
 //!
-//! At run time each workload partitions its systems into **batches** —
-//! each batch a set whose [`Access`] sets are pairwise disjoint, so
-//! nothing in a batch reads what another member writes. Today the executor
-//! walks the batches one system at a time; the batch *structure* is the
-//! plan the M4 parallel executor will hand to Rayon unchanged.
+//! - **Sequential systems** live on `spark_core::Application`
+//!   (`app.add_system(stage, fn)`): they run in the calling thread, in
+//!   registration order, with no batching and no parallelism. A `Schedule`
+//!   knows nothing about them.
+//! - **Parallel-capable workloads** live here. A [`Schedule`] is a
+//!   *container for named workloads* —
+//!   [`add_workload(label, |w| { … })`](Schedule::add_workload) is its only
+//!   entry point. The scheduler partitions each workload's systems into
+//!   access-disjoint batches (Rayon-backed in M4; a sequential batch walk
+//!   today). Reach for a workload when you want the scheduler to extract
+//!   parallelism.
+//!
+//! Workloads are ordered against each other by
+//! [`WorkloadLabel`](crate::WorkloadLabel); systems inside a workload are
+//! ordered against each other by handle ([`SystemRef`](crate::SystemRef)).
+//! Both use the same `.after`/`.before` verb — see [`crate::workload`].
+//!
+//! Inside a workload, systems partition into **batches** — each batch a set
+//! whose [`Access`](crate::Access) sets are pairwise disjoint, so nothing
+//! in a batch reads what another member writes. Today the executor walks
+//! the batches one system at a time; the batch *structure* is the plan the
+//! M4 parallel executor will hand to Rayon unchanged.
 //!
 //! One caveat to that promise: [`Commands`](crate::Commands) declares no
 //! access, so two command-queuing systems may share a batch. Running
@@ -29,29 +39,31 @@
 //! Two systems — or two workloads — whose access *conflicts* with no
 //! order declared between them is a **registration error**
 //! ([`validate_system_conflicts`](crate::workload::validate_system_conflicts)),
-//! not a silent fallthrough. Declare `.after`/`.before`, or acknowledge an
-//! intentional don't-care with `.ambiguous_with`. A conflicting pair is
+//! not a silent fallthrough. Declare `.after`/`.before`, or assert the two
+//! may run in any order with `.any_order_with`. A conflicting pair is
 //! always placed in separate batches; a declared edge fixes which runs
-//! first, while an acknowledged pair simply takes its topological position
+//! first, while an any-order pair simply takes its topological position
 //! (registration index when no edge constrains it).
 
-use crate::system::IntoSystem;
 use crate::workload::{
-    BoxedSystem, EdgeKind, IntoSystemTuple, SystemId, WorkloadBuilder, WorkloadData, WorkloadId,
-    WorkloadLabel, cycle_message, cycle_path, first_conflict, has_declared_order, successors_of,
-    topo_sort, unknown_label_message, workload_conflict_message,
+    EdgeKind, SystemId, WorkloadBuilder, WorkloadData, WorkloadId, WorkloadLabel, cycle_message,
+    cycle_path, first_conflict, has_declared_order, successors_of, topo_sort,
+    unknown_label_message, workload_conflict_message,
 };
 use crate::world::World;
 
-/// A runnable group of workloads — one stage's worth of work, batched by
-/// access conflicts and ordered by explicit `.after`/`.before`.
+/// One stage's worth of **workloads** — named, parallel-capable groups,
+/// batched by access conflicts and ordered by explicit `.after`/`.before`.
+///
+/// A `Schedule` is purely a container for named workloads:
+/// [`add_workload(label, |w| { … })`](Self::add_workload) is its **only**
+/// entry point, returning a [`WorkloadOrderBuilder`] for `.after(label)` /
+/// `.before(label)`. Sequential systems are a *separate* mechanism living on
+/// `spark_core::Application` (`app.add_system(stage, fn)`); a `Schedule`
+/// never sees them.
 ///
 /// # Logic
 ///
-/// A fresh `Schedule` holds one **anonymous** workload at index 0.
-/// [`add_system`](Self::add_system) / [`add_systems`](Self::add_systems)
-/// feed it; [`add_workload`](Self::add_workload) appends a named one and
-/// returns a [`WorkloadOrderBuilder`] for `.after(label)` / `.before(label)`.
 /// The plan is rebuilt lazily on the next [`run`](Self::run) /
 /// [`batches`](Self::batches): workloads topo-sort by their label edges,
 /// then each workload's systems topo-sort by their handle edges and
@@ -61,11 +73,11 @@ use crate::world::World;
 ///
 /// ```text
 /// Schedule
-/// ├── workloads: [ <anonymous>, "Grid::Supply", "Grid::Distribute" ]
-/// │                   │              │                 │
-/// │                   └─ systems + intra-workload edges + cached batches
-/// ├── workload_edges: [ WorkloadEdge { subject: 2, kind: After, target: Grid::Supply } ]
-/// └── order: Some([0, 1, 2])    ← None until first run, then cached
+/// ├── workloads: [ "Grid::Supply", "Grid::Distribute" ]
+/// │                     │                 │
+/// │                     └─ systems + intra-workload edges + cached batches
+/// ├── workload_edges: [ WorkloadEdge { subject: 1, kind: After, target: Grid::Supply } ]
+/// └── order: Some([0, 1])    ← None until first run, then cached
 /// ```
 ///
 /// # How NOT to use
@@ -81,7 +93,10 @@ use crate::world::World;
 /// # Examples
 ///
 /// ```
-/// use spark_ecs::{ResMut, Resource, Schedule, World};
+/// use spark_ecs::{ResMut, Resource, Schedule, WorkloadLabel, World};
+///
+/// #[derive(WorkloadLabel)]
+/// enum Sim { Tick }
 ///
 /// #[derive(Resource)]
 /// struct Counter(u32);
@@ -94,19 +109,23 @@ use crate::world::World;
 /// world.add_resource(Counter(0));
 ///
 /// let mut schedule = Schedule::new();
-/// schedule.add_system(tick);
+/// schedule.add_workload(Sim::Tick, |w| {
+///     w.add_system(tick);
+/// });
 /// schedule.run(&mut world);
 /// schedule.run(&mut world);
 /// assert_eq!(world.resource::<Counter>().0, 2);
 /// ```
 pub struct Schedule {
-    /// Every workload; index 0 is always the anonymous tier-0 workload.
+    /// Every registered workload, each carrying a label. Indices are
+    /// assigned in registration order and used as graph node ids.
     workloads: Vec<WorkloadData>,
     /// Workload-level ordering edges, resolved to indices lazily at build
     /// (so forward references work).
     workload_edges: Vec<WorkloadEdge>,
-    /// Acknowledged don't-care workload pairs.
-    workload_ambiguous: Vec<WorkloadAmbiguity>,
+    /// Acknowledged any-order workload pairs (the workload-level
+    /// `.any_order_with`).
+    workload_any_order: Vec<WorkloadAnyOrder>,
     /// Topo-sorted workload execution order. `None` means "stale" — rebuilt
     /// lazily so a burst of registrations costs one rebuild, not one each.
     order: Option<Vec<usize>>,
@@ -125,10 +144,9 @@ struct WorkloadEdge {
     target_name: &'static str,
 }
 
-/// A workload acknowledging that its conflict with another (`other`, by
-/// label) has no declared order on purpose — the workload-level
-/// `.ambiguous_with`.
-struct WorkloadAmbiguity {
+/// A workload asserting that it and another (`other`, by label) may run in
+/// any order despite their conflict — the workload-level `.any_order_with`.
+struct WorkloadAnyOrder {
     subject: usize,
     other: WorkloadId,
 }
@@ -140,7 +158,7 @@ impl Default for Schedule {
 }
 
 impl Schedule {
-    /// Creates an empty schedule — just the anonymous workload.
+    /// Creates an empty schedule — no workloads yet.
     ///
     /// # Examples
     ///
@@ -152,82 +170,17 @@ impl Schedule {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            workloads: vec![WorkloadData::new(None, "<anonymous>")],
+            workloads: Vec::new(),
             workload_edges: Vec::new(),
-            workload_ambiguous: Vec::new(),
+            workload_any_order: Vec::new(),
             order: None,
         }
     }
 
-    /// Registers `system` in the anonymous workload, unordered.
-    ///
-    /// Returns `&mut Self` for chaining — bare `add_system` hands back no
-    /// handle, because tier-0 systems are not ordered. To order systems,
-    /// open a workload with [`add_workload`](Self::add_workload) and use
-    /// `w.add_system(..).after(handle)`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the system's own parameters conflict — see
-    /// [`Access::assert_no_self_conflict`](crate::Access::assert_no_self_conflict).
-    /// A *cross-system* conflict with another tier-0 system (no order
-    /// possible) instead surfaces as a registration error at
-    /// [`run`](Self::run) / [`batches`](Self::batches).
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use spark_ecs::{Res, Resource, Schedule};
-    ///
-    /// #[derive(Resource)]
-    /// struct Config(u32);
-    ///
-    /// fn read_config(_c: Res<Config>) {}
-    ///
-    /// let mut schedule = Schedule::new();
-    /// schedule.add_system(read_config);
-    /// ```
-    pub fn add_system<S, Marker>(&mut self, system: S) -> &mut Self
-    where
-        S: IntoSystem<Marker>,
-    {
-        self.workloads[0].push(BoxedSystem::from_system(system));
-        self.order = None;
-        self
-    }
-
-    /// Registers a tuple of systems in the anonymous workload as an
-    /// **unordered** group.
-    ///
-    /// The plural form to [`add_system`](Self::add_system)'s singular: no
-    /// order is implied between the tuple's members. If two of them
-    /// conflict, that is a registration error at build (tier-0 systems
-    /// can't be ordered or acknowledged) — open a workload instead.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use spark_ecs::Schedule;
-    ///
-    /// fn movement() {}
-    /// fn ai() {}
-    /// fn animate() {}
-    ///
-    /// let mut schedule = Schedule::new();
-    /// schedule.add_systems((movement, ai, animate));
-    /// ```
-    pub fn add_systems<T, Marker>(&mut self, systems: T) -> &mut Self
-    where
-        T: IntoSystemTuple<Marker>,
-    {
-        systems.register_into(&mut self.workloads[0]);
-        self.order = None;
-        self
-    }
-
-    /// Registers a named workload, building its contents in the closure,
-    /// and returns a [`WorkloadOrderBuilder`] for ordering it against other
-    /// workloads by label.
+    /// Registers a named, **parallel-capable** workload — the scheduler
+    /// partitions its systems into access-disjoint batches — building its
+    /// contents in the closure, and returns a [`WorkloadOrderBuilder`] for
+    /// ordering it against other workloads by label.
     ///
     /// Inside `build`, use [`w.add_system(..)`](WorkloadBuilder::add_system)
     /// (handle-ordered) and [`w.add_systems((..))`](WorkloadBuilder::add_systems)
@@ -257,7 +210,7 @@ impl Schedule {
     /// });
     /// schedule
     ///     .add_workload(Grid::Distribute, |w| {
-    ///         let demand = w.add_system(compute_demand).id();
+    ///         let demand = w.add_system(compute_demand);
     ///         w.add_system(route_power).after(demand);
     ///     })
     ///     .after(Grid::Supply); // workload ordering, by label
@@ -270,7 +223,7 @@ impl Schedule {
     pub fn add_workload<L, F>(&mut self, label: L, build: F) -> WorkloadOrderBuilder<'_>
     where
         L: WorkloadLabel,
-        F: FnOnce(&mut WorkloadBuilder),
+        F: FnOnce(&WorkloadBuilder),
     {
         // Each label names exactly one workload; a second registration
         // would make `.after(label)` ambiguous (it resolves to the first),
@@ -280,8 +233,8 @@ impl Schedule {
             "WorkloadLabel `{}` is registered twice in the same schedule — each label names one workload",
             label.name(),
         );
-        let mut builder = WorkloadBuilder::new(label.id(), label.name());
-        build(&mut builder);
+        let builder = WorkloadBuilder::new(label.id(), label.name());
+        build(&builder);
         let idx = self.workloads.len();
         self.workloads.push(builder.into_data());
         self.order = None;
@@ -291,38 +244,52 @@ impl Schedule {
         }
     }
 
-    /// Returns the **anonymous** workload's batch plan, rebuilding the
-    /// schedule if a registration happened since the last call.
+    /// Returns the batch plan of the workload labelled `label`, rebuilding
+    /// the schedule if a registration happened since the last call. An
+    /// unregistered label yields `&[]`.
     ///
     /// Each inner slice is one batch — systems with pairwise-disjoint
-    /// [`Access`](crate::Access), safe to run together. Named workloads run
-    /// too (see [`run`](Self::run)) but are not surfaced here; this window
-    /// stays focused on the tier-0 systems most call sites register.
+    /// [`Access`](crate::Access), safe to run together. This is the
+    /// inspection window onto a workload's computed plan, for tests and
+    /// diagnostics; [`run`](Self::run) executes every workload regardless.
     ///
     /// # Panics
     ///
     /// Panics if the build hits an undeclared conflict, an unknown
-    /// workload label, or a cycle — see [`run`](Self::run).
+    /// workload label in an ordering edge, or a cycle — see [`run`](Self::run).
     ///
     /// # Examples
     ///
     /// ```
-    /// use spark_ecs::Schedule;
+    /// use spark_ecs::{Schedule, WorkloadLabel};
+    ///
+    /// #[derive(WorkloadLabel)]
+    /// enum Frame { Tick }
     ///
     /// fn a() {}
     /// fn b() {}
     ///
     /// let mut schedule = Schedule::new();
-    /// schedule.add_systems((a, b));
+    /// schedule.add_workload(Frame::Tick, |w| {
+    ///     w.add_systems((a, b));
+    /// });
     /// // Disjoint (no params) → one batch of two.
-    /// assert_eq!(schedule.batches().len(), 1);
-    /// assert_eq!(schedule.batches()[0].len(), 2);
+    /// assert_eq!(schedule.batches(Frame::Tick).len(), 1);
+    /// assert_eq!(schedule.batches(Frame::Tick)[0].len(), 2);
     /// ```
-    pub fn batches(&mut self) -> &[Vec<SystemId>] {
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "the label is a throwaway unit-enum variant passed inline \
+                  (`Frame::Tick`); by-value matches the rest of the label API."
+    )]
+    pub fn batches<L: WorkloadLabel>(&mut self, label: L) -> &[Vec<SystemId>] {
         if self.order.is_none() {
             self.build();
         }
-        &self.workloads[0].batches
+        match self.index_of(label.id()) {
+            Some(idx) => &self.workloads[idx].batches,
+            None => &[],
+        }
     }
 
     /// Names of every registered system, across all workloads, in
@@ -331,11 +298,16 @@ impl Schedule {
     /// # Examples
     ///
     /// ```
-    /// use spark_ecs::Schedule;
+    /// use spark_ecs::{Schedule, WorkloadLabel};
+    ///
+    /// #[derive(WorkloadLabel)]
+    /// enum W { Tick }
     ///
     /// fn my_system() {}
     /// let mut schedule = Schedule::new();
-    /// schedule.add_system(my_system);
+    /// schedule.add_workload(W::Tick, |w| {
+    ///     w.add_system(my_system);
+    /// });
     /// assert!(schedule.system_names().next().unwrap().ends_with("my_system"));
     /// ```
     pub fn system_names(&self) -> impl Iterator<Item = &'static str> + '_ {
@@ -347,9 +319,9 @@ impl Schedule {
     /// Runs every workload in dependency order, each batch by batch, with
     /// a command flush at every workload boundary.
     ///
-    /// Workloads run in topo order (the anonymous one first); within a
-    /// workload, batches run in order and systems within a batch run
-    /// sequentially (M4 makes a batch parallel). After **each** workload,
+    /// Workloads run in topo order; within a workload, batches run in order
+    /// and systems within a batch run sequentially (M4 makes a batch
+    /// parallel). After **each** workload,
     /// [`World::flush_commands`] applies everything it queued via
     /// [`Commands`](crate::Commands) — the boundary that makes a workload
     /// the atomic unit.
@@ -363,7 +335,10 @@ impl Schedule {
     /// # Examples
     ///
     /// ```
-    /// use spark_ecs::{Commands, Component, Query, Schedule, World};
+    /// use spark_ecs::{Commands, Component, Query, Schedule, WorkloadLabel, World};
+    ///
+    /// #[derive(WorkloadLabel)]
+    /// enum Boot { Spawn }
     ///
     /// #[derive(Component)]
     /// struct Spawned;
@@ -374,7 +349,9 @@ impl Schedule {
     ///
     /// let mut world = World::new();
     /// let mut schedule = Schedule::new();
-    /// schedule.add_system(spawn_one);
+    /// schedule.add_workload(Boot::Spawn, |w| {
+    ///     w.add_system(spawn_one);
+    /// });
     /// schedule.run(&mut world);
     /// assert_eq!(Query::<&Spawned>::from_world(&world).iter().count(), 1);
     /// ```
@@ -458,14 +435,11 @@ impl Schedule {
 
     /// The index of the workload carrying `id`, if any.
     fn index_of(&self, id: WorkloadId) -> Option<usize> {
-        self.workloads.iter().position(|w| w.label == Some(id))
+        self.workloads.iter().position(|w| w.label == id)
     }
 
-    /// Rejects any pair of *named* workloads whose aggregate access
-    /// conflicts with no order declared and no `.ambiguous_with`.
-    ///
-    /// The anonymous workload is exempt: it carries no label, runs first,
-    /// and cannot be ordered against, so its position is never ambiguous.
+    /// Rejects any pair of workloads whose aggregate access conflicts with
+    /// no order declared and no `.any_order_with`.
     ///
     /// # Panics
     ///
@@ -477,17 +451,12 @@ impl Schedule {
         for i in 0..n {
             for j in (i + 1)..n {
                 let (a, b) = (&self.workloads[i], &self.workloads[j]);
-                // Only named-vs-named: the anonymous workload carries no
-                // label, runs first, and can't be ordered against — so its
-                // position is never ambiguous.
-                let (Some(id_i), Some(id_j)) = (a.label, b.label) else {
-                    continue;
-                };
                 // Gate on the cheap predicate; disjoint workloads short-circuit.
                 if a.aggregate_access.compatible_with(&b.aggregate_access) {
                     continue;
                 }
-                let acknowledged = self.workload_ambiguous.iter().any(|ack| {
+                let (id_i, id_j) = (a.label, b.label);
+                let acknowledged = self.workload_any_order.iter().any(|ack| {
                     (ack.subject == i && ack.other == id_j)
                         || (ack.subject == j && ack.other == id_i)
                 });
@@ -515,8 +484,8 @@ impl Schedule {
 ///
 /// `.after(label)` / `.before(label)` **accumulate** and resolve lazily at
 /// build, so a workload may be ordered against one registered later.
-/// `.ambiguous_with(label)` acknowledges an intentional don't-care with a
-/// conflicting workload. It is deliberately *not* `&mut Schedule`: a
+/// `.any_order_with(label)` asserts that this workload and a conflicting
+/// one may run in either order. It is deliberately *not* `&mut Schedule`: a
 /// workload's position is its own statement, separate from its contents.
 ///
 /// # Examples
@@ -578,11 +547,12 @@ impl WorkloadOrderBuilder<'_> {
         self
     }
 
-    /// Acknowledges that this workload and `label` conflict but their order
-    /// is intentionally undefined — silences the workload conflict-policy
-    /// error for that pair.
-    pub fn ambiguous_with<L: WorkloadLabel>(&mut self, label: L) -> &mut Self {
-        self.schedule.workload_ambiguous.push(WorkloadAmbiguity {
+    /// Asserts that this workload and the one labelled `label` may run in
+    /// **any order** despite their conflict — silences the workload
+    /// conflict-policy error for that pair. As at the system level, the
+    /// scheduler cannot verify the commutativity you are asserting.
+    pub fn any_order_with<L: WorkloadLabel>(&mut self, label: L) -> &mut Self {
+        self.schedule.workload_any_order.push(WorkloadAnyOrder {
             subject: self.idx,
             other: label.id(),
         });
@@ -620,18 +590,21 @@ mod tests {
         x: f32,
     }
 
-    // ── Schedule: tier-0 anonymous workload ─────────────────────────────
+    // ── Schedule: build, batch, run ─────────────────────────────────────
 
     #[test]
     fn empty_schedule_runs_and_flushes() {
         let mut world = World::new();
         let mut schedule = Schedule::new();
-        schedule.run(&mut world); // no panic, no systems
-        assert_eq!(schedule.batches().len(), 0);
+        schedule.run(&mut world); // no panic, no workloads
     }
 
     #[test]
     fn disjoint_systems_share_one_batch() {
+        #[derive(WorkloadLabel)]
+        enum W {
+            Tick,
+        }
         fn touch_score(mut s: ResMut<Score>) {
             s.value += 1;
         }
@@ -639,14 +612,20 @@ mod tests {
             f.n += 1;
         }
         let mut schedule = Schedule::new();
-        schedule.add_system(touch_score);
-        schedule.add_system(touch_frame);
-        assert_eq!(schedule.batches().len(), 1);
-        assert_eq!(schedule.batches()[0].len(), 2);
+        schedule.add_workload(W::Tick, |w| {
+            w.add_system(touch_score);
+            w.add_system(touch_frame);
+        });
+        assert_eq!(schedule.batches(W::Tick).len(), 1);
+        assert_eq!(schedule.batches(W::Tick)[0].len(), 2);
     }
 
     #[test]
     fn run_executes_every_system_once() {
+        #[derive(WorkloadLabel)]
+        enum W {
+            Tick,
+        }
         fn bump_score(mut s: ResMut<Score>) {
             s.value += 1;
         }
@@ -657,8 +636,10 @@ mod tests {
         world.add_resource(Score { value: 0 });
         world.add_resource(Frame { n: 0 });
         let mut schedule = Schedule::new();
-        schedule.add_system(bump_score);
-        schedule.add_system(bump_frame);
+        schedule.add_workload(W::Tick, |w| {
+            w.add_system(bump_score);
+            w.add_system(bump_frame);
+        });
         schedule.run(&mut world);
         assert_eq!(world.resource::<Score>().value, 1);
         assert_eq!(world.resource::<Frame>().n, 10);
@@ -666,6 +647,10 @@ mod tests {
 
     #[test]
     fn run_flushes_commands_after_the_workload() {
+        #[derive(WorkloadLabel)]
+        enum W {
+            Spawn,
+        }
         #[derive(Component)]
         struct Tag;
         fn spawn_two(mut commands: Commands) {
@@ -674,13 +659,20 @@ mod tests {
         }
         let mut world = World::new();
         let mut schedule = Schedule::new();
-        schedule.add_system(spawn_two);
+        schedule.add_workload(W::Spawn, |w| {
+            w.add_system(spawn_two);
+        });
         schedule.run(&mut world);
         assert_eq!(Query::<&Tag>::from_world(&world).iter().count(), 2);
     }
 
     #[test]
-    fn adding_a_system_rebuilds_the_batch_plan() {
+    fn registering_a_workload_rebuilds_the_plan() {
+        #[derive(WorkloadLabel)]
+        enum W {
+            A,
+            B,
+        }
         fn a(mut s: ResMut<Score>) {
             s.value += 1;
         }
@@ -688,31 +680,47 @@ mod tests {
             f.n += 1;
         }
         let mut schedule = Schedule::new();
-        schedule.add_system(a);
-        assert_eq!(schedule.batches().len(), 1); // builds + caches
-        schedule.add_system(b); // invalidates cache
-        assert_eq!(schedule.batches()[0].len(), 2); // rebuilt with both
+        schedule.add_workload(W::A, |w| {
+            w.add_system(a);
+        });
+        assert_eq!(schedule.batches(W::A)[0].len(), 1); // builds + caches
+        schedule.add_workload(W::B, |w| {
+            w.add_system(b);
+        }); // invalidates the cached plan
+        assert_eq!(schedule.batches(W::B)[0].len(), 1); // rebuilt with both workloads present
     }
 
     #[test]
     fn add_systems_registers_an_unordered_group() {
+        #[derive(WorkloadLabel)]
+        enum W {
+            Tick,
+        }
         fn a() {}
         fn b() {}
         fn c() {}
         let mut schedule = Schedule::new();
-        schedule.add_systems((a, b, c));
+        schedule.add_workload(W::Tick, |w| {
+            w.add_systems((a, b, c));
+        });
         // No params → no conflict → one batch of three.
-        assert_eq!(schedule.batches().len(), 1);
-        assert_eq!(schedule.batches()[0].len(), 3);
+        assert_eq!(schedule.batches(W::Tick).len(), 1);
+        assert_eq!(schedule.batches(W::Tick)[0].len(), 3);
     }
 
     #[test]
     fn system_names_track_registration() {
+        #[derive(WorkloadLabel)]
+        enum W {
+            Tick,
+        }
         fn alpha() {}
         fn beta() {}
         let mut schedule = Schedule::new();
-        schedule.add_system(alpha);
-        schedule.add_system(beta);
+        schedule.add_workload(W::Tick, |w| {
+            w.add_system(alpha);
+            w.add_system(beta);
+        });
         let names: Vec<&str> = schedule.system_names().collect();
         assert_eq!(names.len(), 2);
         assert!(names[0].ends_with("alpha"));
@@ -722,6 +730,10 @@ mod tests {
     #[test]
     #[should_panic(expected = "conflicting access to component")]
     fn registering_self_conflicting_query_system_panics() {
+        #[derive(WorkloadLabel)]
+        enum W {
+            Tick,
+        }
         fn weird(mut q1: Query<&mut Position>, mut q2: Query<&mut Position>) {
             for p in q1.iter_mut() {
                 p.x += 1.0;
@@ -730,39 +742,27 @@ mod tests {
                 p.x += 1.0;
             }
         }
-        Schedule::new().add_system(weird);
+        Schedule::new().add_workload(W::Tick, |w| {
+            w.add_system(weird);
+        });
     }
 
     #[test]
     #[should_panic(expected = "conflicting access to resource")]
     fn registering_resource_self_conflicting_system_panics() {
+        #[derive(WorkloadLabel)]
+        enum W {
+            Tick,
+        }
         fn weird(_r: Res<Score>, mut w: ResMut<Score>) {
             w.value += 1;
         }
-        Schedule::new().add_system(weird);
+        Schedule::new().add_workload(W::Tick, |w| {
+            w.add_system(weird);
+        });
     }
 
-    #[test]
-    #[should_panic(expected = "no order is declared")]
-    fn tier_0_conflict_is_a_registration_error() {
-        // Two top-level systems conflict on Score with no way to order them
-        // (tier-0 hands back no handle) — rejected at build, pointing the
-        // user to a workload.
-        fn writer(mut s: ResMut<Score>) {
-            s.value += 1;
-        }
-        fn reader(s: Res<Score>) {
-            let _ = s.value;
-        }
-        let mut world = World::new();
-        world.add_resource(Score { value: 0 });
-        let mut schedule = Schedule::new();
-        schedule.add_system(writer);
-        schedule.add_system(reader);
-        schedule.run(&mut world);
-    }
-
-    // ── Schedule: named workloads ───────────────────────────────────────
+    // ── Schedule: ordering & conflicts ──────────────────────────────────
 
     #[test]
     fn workload_systems_run_in_declared_order() {
@@ -780,7 +780,7 @@ mod tests {
         world.add_resource(Log { order: Vec::new() });
         let mut schedule = Schedule::new();
         schedule.add_workload(W::A, |w| {
-            let f = w.add_system(first).id();
+            let f = w.add_system(first);
             w.add_system(second).after(f);
         });
         schedule.run(&mut world);
@@ -788,7 +788,7 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_with_silences_a_conflicting_system_pair() {
+    fn any_order_with_silences_a_conflicting_system_pair() {
         #[derive(WorkloadLabel)]
         enum W {
             A,
@@ -803,8 +803,8 @@ mod tests {
         world.add_resource(Score { value: 0 });
         let mut schedule = Schedule::new();
         schedule.add_workload(W::A, |w| {
-            let s = w.add_system(sweep).id();
-            w.add_system(compact).ambiguous_with(s); // both write Score; OK
+            let s = w.add_system(sweep);
+            w.add_system(compact).any_order_with(s); // both write Score; OK
         });
         schedule.run(&mut world); // no panic
         assert_eq!(world.resource::<Score>().value, 2);

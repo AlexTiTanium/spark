@@ -1,6 +1,6 @@
 //! Integration coverage for the workload authoring layer (issue #34):
 //! the `#[derive(WorkloadLabel)]` macro, handle/label `.after`/`.before`
-//! ordering at both levels, `.ambiguous_with`, the conflict-policy and
+//! ordering at both levels, `.any_order_with`, the conflict-policy and
 //! cycle error messages, and lazy label resolution.
 //!
 //! These exercise only the public API, the way a plugin would.
@@ -93,7 +93,7 @@ fn after_orders_systems_within_a_workload() {
     world.add_resource(Log::default());
     let mut schedule = Schedule::new();
     schedule.add_workload(W::A, |w| {
-        let f = w.add_system(first).id();
+        let f = w.add_system(first);
         w.add_system(second).after(f);
     });
     schedule.run(&mut world);
@@ -119,7 +119,7 @@ fn before_orders_systems_against_registration_order() {
     schedule.add_workload(W::A, |w| {
         // `early` is registered first but ordered to run before `late`
         // via a `.before` declared on `late` itself.
-        let e = w.add_system(early).id();
+        let e = w.add_system(early);
         w.add_system(late).before(e); // late → early
     });
     schedule.run(&mut world);
@@ -149,13 +149,9 @@ fn diamond_join_waits_for_both_branches() {
     world.add_resource(Log::default());
     let mut schedule = Schedule::new();
     schedule.add_workload(Assets::Load, |w| {
-        let files = w.add_system(files).id();
-        let meshes = w.add_system(meshes).after(files).id();
-        let textures = w
-            .add_system(textures)
-            .after(files)
-            .ambiguous_with(meshes)
-            .id();
+        let files = w.add_system(files);
+        let meshes = w.add_system(meshes).after(files);
+        let textures = w.add_system(textures).after(files).any_order_with(meshes);
         // `.after(meshes).after(textures)` accumulates: upload waits on both.
         w.add_system(upload).after(meshes).after(textures);
     });
@@ -202,10 +198,10 @@ fn workloads_run_in_label_order_with_forward_reference() {
     assert_eq!(world.resource::<Log>().0, vec!["supply", "distribute"]);
 }
 
-// ── ambiguous_with silences a conflict ──────────────────────────────────
+// ── any_order_with silences a conflict ───────────────────────────────────
 
 #[test]
-fn ambiguous_with_silences_a_system_conflict() {
+fn any_order_with_silences_a_system_conflict() {
     #[derive(WorkloadLabel)]
     enum W {
         A,
@@ -221,15 +217,15 @@ fn ambiguous_with_silences_a_system_conflict() {
     world.add_resource(Shared(0));
     let mut schedule = Schedule::new();
     schedule.add_workload(W::A, |w| {
-        let sweep = w.add_system(sweep).id();
-        w.add_system(compact).ambiguous_with(sweep);
+        let sweep = w.add_system(sweep);
+        w.add_system(compact).any_order_with(sweep);
     });
     schedule.run(&mut world); // no panic
     assert_eq!(world.resource::<Shared>().0, 2);
 }
 
 #[test]
-fn ambiguous_with_silences_a_workload_conflict() {
+fn any_order_with_silences_a_workload_conflict() {
     #[derive(WorkloadLabel)]
     enum W {
         Grid,
@@ -252,7 +248,7 @@ fn ambiguous_with_silences_a_workload_conflict() {
         .add_workload(W::Workers, |w| {
             w.add_system(workers_tick);
         })
-        .ambiguous_with(W::Grid); // both write Shared; order acknowledged
+        .any_order_with(W::Grid); // both write Shared; any order is fine
     schedule.run(&mut world); // no panic
     assert_eq!(world.resource::<Shared>().0, 11);
 }
@@ -284,7 +280,7 @@ fn undeclared_system_conflict_is_a_registration_error() {
     });
     assert!(message.contains("both write resource"), "{message}");
     assert!(message.contains("no order is declared"), "{message}");
-    assert!(message.contains(".ambiguous_with(handle)"), "{message}");
+    assert!(message.contains(".any_order_with(handle)"), "{message}");
 }
 
 #[test]
@@ -319,30 +315,9 @@ fn undeclared_workload_conflict_is_a_registration_error() {
         "{message}"
     );
     assert!(
-        message.contains(".ambiguous_with(WorkloadLabel)"),
+        message.contains(".any_order_with(WorkloadLabel)"),
         "{message}"
     );
-}
-
-#[test]
-fn tier_0_conflict_points_user_to_a_workload() {
-    fn writer(mut s: ResMut<Shared>) {
-        s.0 += 1;
-    }
-    fn reader(mut s: ResMut<Shared>) {
-        s.0 += 1;
-    }
-
-    let message = panic_message(|| {
-        let mut world = World::new();
-        world.add_resource(Shared(0));
-        let mut schedule = Schedule::new();
-        schedule.add_system(writer);
-        schedule.add_system(reader); // tier-0 conflict — no handle to order
-        schedule.run(&mut world);
-    });
-    assert!(message.contains("no order is declared"), "{message}");
-    assert!(message.contains("add_workload"), "{message}");
 }
 
 // ── cycle detection (pinned) ────────────────────────────────────────────
@@ -391,7 +366,7 @@ fn system_cycle_is_reported() {
         let mut world = World::new();
         let mut schedule = Schedule::new();
         schedule.add_workload(W::A, |w| {
-            let first = w.add_system(one).id();
+            let first = w.add_system(one);
             w.add_system(two).after(first).before(first); // first → two → first
         });
         schedule.run(&mut world);
@@ -433,12 +408,12 @@ fn ordering_against_an_unregistered_label_is_an_error() {
 // ── regression: review-found edge cases ─────────────────────────────────
 
 #[test]
-fn ambiguous_pairs_with_a_backward_edge_resolve_to_a_valid_order() {
+fn any_order_pairs_with_a_backward_edge_resolve_to_a_valid_order() {
     // Three systems all write Shared (pairwise conflict). One explicit
-    // backward edge (`s2.before(s0)`) plus two `.ambiguous_with`
+    // backward edge (`s2.before(s0)`) plus two `.any_order_with`
     // acknowledgements. There IS a consistent order (s2 before s0, the
-    // ambiguous pairs in any order), so this must run cleanly — the
-    // declared `.after`/`.before` graph is acyclic, and `.ambiguous_with`
+    // any-order pairs in either order), so this must run cleanly — the
+    // declared `.after`/`.before` graph is acyclic, and `.any_order_with`
     // adds no edges that could contradict it.
     #[derive(WorkloadLabel)]
     enum Cleanup {
@@ -458,9 +433,9 @@ fn ambiguous_pairs_with_a_backward_edge_resolve_to_a_valid_order() {
     world.add_resource(Shared(0));
     let mut schedule = Schedule::new();
     schedule.add_workload(Cleanup::Sweep, |w| {
-        let a = w.add_system(s0).id();
-        let b = w.add_system(s1).ambiguous_with(a).id();
-        w.add_system(s2).before(a).ambiguous_with(b); // s2 before s0
+        let a = w.add_system(s0);
+        let b = w.add_system(s1).any_order_with(a);
+        w.add_system(s2).before(a).any_order_with(b); // s2 before s0
     });
     schedule.run(&mut world); // no panic — a valid order exists
     assert_eq!(world.resource::<Shared>().0, 3); // all three ran exactly once
@@ -469,6 +444,8 @@ fn ambiguous_pairs_with_a_backward_edge_resolve_to_a_valid_order() {
 #[test]
 #[cfg(debug_assertions)] // the cross-workload guard is debug-only
 fn a_handle_used_in_another_workload_panics_in_debug() {
+    use spark_ecs::SystemRef; // only this debug-only test needs the bare handle type
+
     #[derive(WorkloadLabel)]
     enum A {
         First,
@@ -482,9 +459,11 @@ fn a_handle_used_in_another_workload_panics_in_debug() {
 
     let message = panic_message(|| {
         let mut schedule = Schedule::new();
-        let mut stolen = None;
+        // Detach the builder to a plain `SystemRef` (via `into`) so the
+        // handle outlives the closure — the only way to smuggle it out.
+        let mut stolen: Option<SystemRef> = None;
         schedule.add_workload(A::First, |w| {
-            stolen = Some(w.add_system(one).id());
+            stolen = Some(w.add_system(one).into());
         });
         schedule.add_workload(B::Second, |w| {
             // `stolen` belongs to A::First — feeding it here is the footgun.

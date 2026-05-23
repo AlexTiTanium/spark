@@ -98,29 +98,40 @@ do not refile it. Originally filed as #25 and closed as stale.
     growing `Schedule` into a per-stage workload container, `SystemRef`
     handle ordering (`w.add_system(s).after(h)`) and label ordering
     (`add_workload(...).after(label)`) sharing one `.after`/`.before` verb,
-    `.ambiguous_with` at both levels, the conflict-policy registration
-    errors (system + workload + tier-0), two-level topo-sort with lazy
+    `.any_order_with` at both levels, the conflict-policy registration
+    errors (system + workload), two-level topo-sort with lazy
     label resolution, `add_systems((..))` unordered tuples, and
     `Access::find_conflicts` + `ConflictKind`. Commands now flush at every
     workload boundary. See *Workload labels* below for the as-shipped
-    deviations from the original sketch.
+    deviations from the original sketch. **Final design directives
+    (2026-05-23)** then settled the public shape: `.ambiguous_with` →
+    `.any_order_with`; `add_system` returns the handle directly (no `.id()`);
+    and the two registration mechanisms were **split apart** — sequential
+    systems stay on `Application` (`app.add_system(stage, fn)`), while
+    `Schedule` became a *workloads-only container* (no `add_system` /
+    `add_systems`, no anonymous workload). `App` gained
+    `add_workload(label, stage, |w| …)` + a per-`Stage` `Schedule` map, and
+    `run_stage` now runs sequential systems then the stage's workloads —
+    folded into the same section below.
   - *Batching algorithm (post-rework):* `build_batches` (now in
     `workload.rs`) `topo_sort`s the explicit `.after`/`.before` edges, then
     longest-path-ranks each system in that order — a system's rank is one
     past the latest of its explicit predecessors and any earlier
     *conflicting* system. A cycle can only come from the explicit edges
     (conflicts add none), so it is reported as an honest system-ordering
-    cycle. `.ambiguous_with` adds no edge: an acknowledged conflicting pair
+    cycle. `.any_order_with` adds no edge: an acknowledged conflicting pair
     is separated by the rank sweep's access check and ordered by topo
     position. (This replaced an earlier "effective edge set" formulation
     that could fabricate a contradictory cycle when a backward explicit
-    edge met `.ambiguous_with` tiebreaks; that case now resolves to a valid
+    edge met `.any_order_with` tiebreaks; that case now resolves to a valid
     order instead of panicking.) System code (`BoxedSystem`, `SystemId`,
     `build_batches`) lives in `workload.rs`, leaving `Schedule` a thin
     cross-workload orchestrator — the module dependency is one-directional.
-  - ⬜ **remaining:** `Plugin` `&mut World` + `App` registration +
-    per-frame run loop wiring each `Stage` to a `Schedule` (child 4, #35);
-    `Events` (child 5, #36); `FixedUpdate` accumulator (child 6, #37).
+  - ⬜ **remaining:** `Plugin::run(&mut World)` + the full per-frame run
+    loop (child 4, #35 — the `App ↔ Schedule` wiring, `add_workload`, and
+    `run_stage` running workloads landed early with the 2026-05-23
+    architecture split); `Events` (child 5, #36); `FixedUpdate`
+    accumulator (child 6, #37).
 - *Stage-shape migration:* **✅ shipped with #32.** Replaced the M1–M3
   stand-in (`pub mod stages { pub const STARTUP: &str = "startup"; … }`)
   with the canonical, **closed** `pub enum Stage { Startup, First,
@@ -153,32 +164,45 @@ do not refile it. Originally filed as #25 and closed as stale.
   `WorkloadLabel` for workloads (`add_workload(...).after(label)`, on the
   returned ordering builder, resolved lazily at build). An undeclared order
   between two conflicting systems *or* workloads is a registration error
-  (the conflict-policy decision below); `.ambiguous_with(handle | label)` is
+  (the conflict-policy decision below); `.any_order_with(handle | label)` is
   the per-pair escape hatch. No `.chain()` / `.after_all_prior()` — fragile
   `fn`-identity and registration-order coupling, both rejected. `add_systems((..))`
   is the unordered-tuple form, `add_system` the orderable singular (#41 resolved).
   **✅ shipped with #34**, with these as-built refinements (the sketch above
   was directional, not literal):
-  - *Lives on `Schedule`, not `Application`.* The builder grows the
-    existing `spark-ecs::Schedule` into a per-stage workload container —
-    `schedule.add_workload(label, |w| …)`, **no `Stage` argument** (a
-    `Schedule` *is* one stage). The `app.add_workload(label, Stage, |w| …)`
-    ergonomic wrapper, and routing each `Stage` to a `Schedule`, are child
-    4 (#35); this child stays entirely within `spark-ecs`.
-  - *Handle extraction is `.id()`.* `w.add_system(s)` returns a chainable
-    `SystemOrderBuilder` (so `.after`/`.before`/`.ambiguous_with`/`.label`
-    accumulate by `&mut self`); `.id()` extracts the `SystemRef` to store
-    for a later `.after(handle)`.
+  - *Two mechanisms, not one (final architecture, 2026-05-23).* `Schedule`
+    is a **workloads-only container** — `schedule.add_workload(label, |w| …)`
+    is its only entry point, **no `Stage` argument** (a `Schedule` *is* one
+    stage), and it has **no `add_system` / `add_systems` and no anonymous
+    workload**. Sequential systems are a separate mechanism on `Application`
+    (`app.add_system(stage, fn)`), unchanged. `Application` now also owns a
+    `schedules: HashMap<Stage, Schedule>` and an
+    `add_workload(label, stage, |w| …)` wrapper that forwards to the stage's
+    `Schedule`; `run_stage` runs the stage's sequential systems first, then
+    its workloads, then one command flush. (The remaining #35 work is
+    `Plugin::run(&mut World)` + the full per-frame loop.)
+  - *`add_system` returns the handle directly* (no `.id()` — settled by the
+    final design directive, 2026-05-23). `w.add_system(s)` hands back a
+    `Copy` `SystemOrderBuilder` that both chains
+    `.after`/`.before`/`.any_order_with`/`.label` (by value, returning
+    itself) and *is* the `SystemRef` (via `Deref` + `Into`), so a stored
+    handle needs no extra step. To make that compile, the builder takes
+    `&WorkloadBuilder` and records through a `RefCell`: a shared borrow is
+    what lets a stored handle coexist with later `add_system` calls (an
+    `&mut self` builder could not). The earlier `.id()`-extraction shape
+    (chained by `&mut self`) is gone.
   - *`name()` is qualified* (`"Grid::Distribute"`, not the bare variant) so
     the workload-conflict and cycle messages disambiguate labels from
     different enums — this is what the pinned error strings require.
   - *"Declared order" = transitive reachability* over the explicit edges:
     a conflict is satisfied if *any* directed `.after`/`.before` path
     relates the pair, so a declared chain need not be restated edge-by-edge.
-  - *The anonymous tier-0 workload runs first* and is exempt from
-    *cross-workload* conflict declaration (it has no label to order against,
-    so its position is never ambiguous); its *intra*-group conflicts are
-    still registration errors, pointing the user to open a workload.
+  - *Every workload is named; there is no anonymous workload.*
+    `WorkloadData.label` is a plain `WorkloadId` (not `Option`), and every
+    pair of workloads is conflict-checked alike. Sequential systems (on
+    `Application`) are **not** conflict-checked against each other — they run
+    strictly in registration order, so there is no parallelism to protect
+    against and nothing to declare.
   - *Errors surface at schedule-build* (first `run`/`batches`) as panics,
     matching the existing `assert_no_self_conflict` style — not a `Result`.
   - *Message wording follows the crate's house style* — system/workload
@@ -189,9 +213,10 @@ do not refile it. Originally filed as #25 and closed as stale.
     `WorkloadLabel` registration is also a panic (each label names one
     workload).
 - *Decisions:* **B2** (explicit ordering + topo-sort, not registration order);
-  the **conflict-policy decision** (#34 — an undeclared write-overlap is a
-  registration error at system *and* workload level, escape hatch
-  `.ambiguous_with`; viable because `Commands` declares zero access, so it
+  the **conflict-policy decision** (#34 — an undeclared write-overlap
+  between two systems *inside a workload*, or two workloads, is a
+  registration error; escape hatch
+  `.any_order_with`; viable because `Commands` declares zero access, so it
   never false-positives); **C1** (`Access` + DAG now, parallel executor
   committed for M4).
 - *Warnings:* `Access` is the **safety proof** for M4 lockless parallelism, not

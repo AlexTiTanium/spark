@@ -4,7 +4,9 @@
 
 use std::collections::HashMap;
 
-use spark_ecs::{IntoSystem, Resource, World};
+use spark_ecs::{
+    IntoSystem, Resource, Schedule, WorkloadBuilder, WorkloadLabel, WorkloadOrderBuilder, World,
+};
 
 use crate::error::EngineError;
 use crate::plugin::Plugin;
@@ -51,7 +53,13 @@ type Runner = Box<dyn FnOnce(Application) -> Result<(), EngineError>>;
 pub struct Application {
     world: World,
     startup: Vec<StartupSystem>,
+    /// **Sequential** systems per stage: run in registration order, in the
+    /// calling thread, no batching. Fed by [`add_system`](Self::add_system).
     stages: HashMap<Stage, Vec<StageSystem>>,
+    /// **Parallel-capable** workloads per stage, lazily created — a stage
+    /// with no workloads has no [`Schedule`]. Fed by
+    /// [`add_workload`](Self::add_workload).
+    schedules: HashMap<Stage, Schedule>,
     runner: Option<Runner>,
 }
 
@@ -252,20 +260,94 @@ impl Application {
         self
     }
 
-    /// Runs every system registered to `stage` once, in registration
-    /// order, then [flushes pending
+    /// Registers a **parallel-capable workload** on `stage` — a named group
+    /// of systems the scheduler batches by access disjointness. Gets-or-
+    /// inserts the per-stage [`Schedule`](spark_ecs::Schedule) and forwards
+    /// to [`Schedule::add_workload`](spark_ecs::Schedule::add_workload),
+    /// returning its [`WorkloadOrderBuilder`](spark_ecs::WorkloadOrderBuilder)
+    /// so workloads order against each other by label (`.after(Label)` /
+    /// `.before(Label)`).
+    ///
+    /// This is the parallel-capable sibling of
+    /// [`add_system`](Self::add_system). `add_system` is **sequential** —
+    /// runs in registration order, in the calling thread; a workload lets
+    /// the scheduler extract parallelism (a sequential batch walk today,
+    /// Rayon at M4). Within a stage, sequential systems run first, then the
+    /// stage's workloads — see [`run_stage`](Self::run_stage). Inside the
+    /// closure, `w.add_system(..)` hands back a handle for `.after` /
+    /// `.before` / `.any_order_with`; `w.add_systems((..))` adds an
+    /// unordered group.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `label` is already registered on `stage` (each label names
+    /// one workload). Conflict / unknown-label / cycle errors surface on the
+    /// first [`run_stage`](Self::run_stage) for `stage`, when the schedule
+    /// builds.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use spark_core::{Application, Stage};
+    /// use spark_ecs::{ResMut, Resource, WorkloadLabel};
+    ///
+    /// #[derive(WorkloadLabel)]
+    /// enum Grid { Supply, Distribute }
+    ///
+    /// #[derive(Resource)]
+    /// struct Power(u32);
+    ///
+    /// fn collect(mut p: ResMut<Power>) { p.0 += 1; }
+    /// fn route(mut p: ResMut<Power>) { p.0 += 1; }
+    ///
+    /// let mut app = Application::new();
+    /// app.add_resource(Power(0));
+    /// app.add_workload(Grid::Supply, Stage::Update, |w| {
+    ///     w.add_system(collect);
+    /// });
+    /// // Both write Power, so declare the order.
+    /// app.add_workload(Grid::Distribute, Stage::Update, |w| {
+    ///     w.add_system(route);
+    /// })
+    /// .after(Grid::Supply);
+    /// app.run_stage(Stage::Update);
+    /// assert_eq!(app.world().resource::<Power>().0, 2);
+    /// ```
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "the label is a throwaway unit-enum variant passed inline; \
+                  by-value matches spark-ecs's workload-label API."
+    )]
+    pub fn add_workload<L, F>(
+        &mut self,
+        label: L,
+        stage: Stage,
+        build: F,
+    ) -> WorkloadOrderBuilder<'_>
+    where
+        L: WorkloadLabel,
+        F: FnOnce(&WorkloadBuilder),
+    {
+        self.schedules
+            .entry(stage)
+            .or_default()
+            .add_workload(label, build)
+    }
+
+    /// Runs `stage`: every **sequential** system first (registration order,
+    /// in-thread), then the stage's **workload** [`Schedule`](spark_ecs::Schedule)
+    /// if one exists, then [flushes pending
     /// commands](spark_ecs::World::flush_commands) into the world.
     ///
-    /// The flush is what makes [`Commands`](spark_ecs::Commands)
-    /// usable across stages: a system that runs in
-    /// [`Stage::Startup`] and queues a `spawn().insert(Position)` has
-    /// the resulting entity visible to systems in
-    /// [`Stage::PreUpdate`] (and every later stage) — but *not* to
-    /// later systems within the same `Startup` pass. One flush per
-    /// stage boundary.
+    /// The flush is what makes [`Commands`](spark_ecs::Commands) usable
+    /// across stages: a system that runs in [`Stage::Startup`] and queues a
+    /// `spawn().insert(Position)` has the resulting entity visible to systems
+    /// in [`Stage::PreUpdate`] (and every later stage) — but *not* to later
+    /// systems within the same `Startup` pass. Workloads additionally flush
+    /// at every workload boundary inside [`Schedule::run`](spark_ecs::Schedule::run).
     ///
-    /// No-op for stages that have no registered systems (the flush
-    /// still runs, but it's cheap when the queue is empty).
+    /// No-op for stages with neither systems nor workloads (the trailing
+    /// flush still runs, but it's cheap when the queue is empty).
     ///
     /// # Examples
     ///
@@ -292,6 +374,9 @@ impl Application {
             for system in systems {
                 system(&self.world);
             }
+        }
+        if let Some(schedule) = self.schedules.get_mut(&stage) {
+            schedule.run(&mut self.world);
         }
         self.world.flush_commands();
     }
@@ -368,7 +453,7 @@ impl Application {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use spark_ecs::{ResMut, Resource};
+    use spark_ecs::{ResMut, Resource, WorkloadLabel};
 
     #[derive(Resource)]
     struct Counter(u32);
@@ -433,5 +518,38 @@ mod tests {
         app.add_resource(Counter(0))
             .add_system(Stage::Startup, bump);
         app.run().unwrap();
+    }
+
+    #[test]
+    fn run_stage_runs_sequential_systems_then_workloads() {
+        #[derive(WorkloadLabel)]
+        enum W {
+            Tick,
+        }
+        let mut app = Application::new();
+        app.add_resource(Counter(0));
+        // Sequential system runs first (sets to 10), then the workload (+1).
+        app.add_system(Stage::Update, |mut c: ResMut<Counter>| c.0 = 10);
+        app.add_workload(W::Tick, Stage::Update, |w| {
+            w.add_system(|mut c: ResMut<Counter>| c.0 += 1);
+        });
+        app.run_stage(Stage::Update);
+        assert_eq!(app.world.resource::<Counter>().0, 11);
+    }
+
+    #[test]
+    fn run_stage_with_only_a_workload_runs_it() {
+        #[derive(WorkloadLabel)]
+        enum W {
+            Tick,
+        }
+        let mut app = Application::new();
+        app.add_resource(Counter(0));
+        app.add_workload(W::Tick, Stage::Update, |w| {
+            w.add_system(bump);
+        });
+        app.run_stage(Stage::Update);
+        app.run_stage(Stage::Update);
+        assert_eq!(app.world.resource::<Counter>().0, 2);
     }
 }
