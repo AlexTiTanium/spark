@@ -1,0 +1,21 @@
+# Input layer. Owns the input vocabulary (`KeyCode`, `MouseButton`, and the raw
+# input events) and turns the events the window forwards into queryable
+# `KeyboardState` / `MouseState` resources. Sits *below* `spark-window`: window
+# depends on this crate to emit its events; this crate depends on neither
+# `spark-window` nor `winit`, so no windowing type leaks into its public API.
+
+[package]
+name = "spark-input"
+version = "0.1.0"
+readme = "README.md"
+
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+spark-core = { path = "../core" }
+spark-ecs = { path = "../ecs" }

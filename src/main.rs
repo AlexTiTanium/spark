@@ -1,6 +1,6 @@
 //! Spark binary entry point.
 //!
-//! Composes five plugins:
+//! Composes six plugins:
 //!
 //! - `LogPlugin` installs the `tracing` subscriber as a startup
 //!   closure.
@@ -8,13 +8,17 @@
 //!   frame in `PreUpdate`. Registered before `WindowPlugin`, whose
 //!   runner reads `Time::fixed_steps_this_frame()` to drive
 //!   `FixedUpdate` dispatch.
+//! - `InputPlugin` inserts `KeyboardState` / `MouseState` and the
+//!   collection systems on `Stage::Input`. `WindowPlugin` forwards OS
+//!   input into the events those systems read, so registering it here
+//!   makes the state available to every later stage.
 //! - `SandboxPlugin` (in `crate::sandbox`) is the umbrella demo
 //!   plugin. It inserts the shared resources every sub-sandbox uses
 //!   (`TickCount`), then nests each sub-sandbox plugin via
-//!   `app.add_plugin(...)`. Today that's just `EcsSandboxPlugin`
-//!   (queues demo entities via `Commands` in Startup and registers
-//!   `physics_step` / `decay_health` / `player_regen` / …); future
-//!   render or input sub-sandboxes plug in next to it.
+//!   `app.add_plugin(...)`: `EcsSandboxPlugin` (queues demo entities
+//!   via `Commands` in Startup and registers `physics_step` /
+//!   `decay_health` / `player_regen` / …) and `InputSandboxPlugin`
+//!   (logs live `KeyboardState` / `MouseState`).
 //! - `WindowPlugin` opens the OS window and installs the runner that
 //!   ticks `Input → PreUpdate → (FixedUpdate × N) → Update → PostUpdate`
 //!   on every winit `RedrawRequested`, reading
@@ -28,6 +32,7 @@ mod sandbox;
 
 use spark_common::TimePlugin;
 use spark_core::{Application, EngineError};
+use spark_input::InputPlugin;
 use spark_log::LogPlugin;
 use spark_window::{WindowConfig, WindowPlugin};
 
@@ -37,6 +42,7 @@ fn main() -> Result<(), EngineError> {
     Application::new()
         .add_plugin(LogPlugin)
         .add_plugin(TimePlugin)
+        .add_plugin(InputPlugin)
         .add_plugin(SandboxPlugin)
         .add_plugin(WindowPlugin {
             config: WindowConfig::default()

@@ -38,5 +38,6 @@ needless_pass_by_value = "allow"
 spark-common = { path = "../lib/common" }
 spark-core = { path = "../lib/core" }
 spark-ecs = { path = "../lib/ecs" }
+spark-input = { path = "../lib/input" }
 spark-log = { path = "../lib/log" }
 spark-window = { path = "../lib/window" }

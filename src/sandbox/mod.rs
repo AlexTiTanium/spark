@@ -26,6 +26,7 @@
 //! `TickCount` without redefining them.
 
 pub mod ecs;
+pub mod input;
 
 mod components;
 mod plugin;

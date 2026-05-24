@@ -18,6 +18,7 @@
 use spark_core::{Application, Plugin};
 
 use super::ecs::EcsSandboxPlugin;
+use super::input::InputSandboxPlugin;
 use super::resources::TickCount;
 
 /// The umbrella sandbox plugin — adds shared resources, then
@@ -44,5 +45,6 @@ impl Plugin for SandboxPlugin {
         // systems. They share resources / components defined at the
         // `crate::sandbox` level (above) and add their own locally.
         app.add_plugin(EcsSandboxPlugin);
+        app.add_plugin(InputSandboxPlugin);
     }
 }

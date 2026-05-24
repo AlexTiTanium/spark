@@ -93,6 +93,7 @@ see most of them; `trace` for the noisy ones.
 | `debug` | `keyboard input` | Each press / release. Fields: `state`, `key`. |
 | `debug` | `mouse input` | Each press / release. Fields: `state`, `button`. |
 | `trace` | `cursor moved` | High-frequency cursor position updates. Hidden unless you ask for `trace`. |
+| `trace` | `mouse wheel` | Scroll-wheel movement, normalized to pixels. Fields: `x`, `y`. |
 
 Lifecycle bookends surface at `info` too:
 
@@ -107,6 +108,38 @@ If you only want to see this crate's logs, scope the filter:
 ```bash
 RUST_LOG=spark_window=debug cargo run -p spark
 ```
+
+## Forwarding input into the world
+
+Logging is for you, the developer. The window *also* turns each input event
+into a typed [`spark-input`] event and forwards it into the ECS world, so other
+systems can react to it:
+
+| OS event | Forwarded as (`spark_input`) |
+|-|-|
+| keyboard press / release | `KeyboardInput { key, pressed }` |
+| mouse press / release | `MouseButtonInput { button, pressed }` |
+| cursor move | `CursorMoved { x, y }` |
+| scroll wheel | `MouseWheel { x, y }` (normalized to pixels) |
+| focus lost | `FocusLost` |
+
+Two things to know:
+
+- **The window doesn't assume anyone reads these.** It sends each event
+  *only if* something already registered the matching `Events<T>` buffer (via
+  `add_event::<T>()`) — normally [`spark-input`]'s `InputPlugin`. With no such
+  consumer, the send is a silent no-op. The window depends on `spark-input`
+  only to *name* the event types it emits; `spark-input` never depends back on
+  the window.
+- **Keys are physical and de-repeated.** A `KeyboardInput` carries a
+  `spark_core::KeyCode` (position-based, so WASD is WASD on any layout), and OS
+  auto-repeat is filtered out — a held key produces exactly one
+  `pressed: true`. Keys outside the curated `KeyCode` set are dropped.
+
+To consume these as queryable state (`is_pressed`, cursor position, scroll),
+add [`spark-input`]'s `InputPlugin`; see that crate's README.
+
+[`spark-input`]: ../spark_input/index.html
 
 ## The event loop and the per-frame tick
 
@@ -258,10 +291,13 @@ What's different from today:
   `Poll` it relocates from the `RedrawRequested` handler to
   `about_to_wait`, so simulation steps independently of when the GPU is
   ready to draw.
-- **Per-frame `KeyboardInput` / `MouseInput` events** drain into an
-  `InputState` resource — collected in `Stage::Input`, which today already
-  exists and hosts the event-buffer swap — before any sim runs, instead of
-  being consumed inline as `tracing` events.
+- **Input collection already shipped, decoupled from the loop.** Keyboard,
+  mouse, cursor, wheel, and focus events are forwarded as `spark_core` ECS
+  events (see *Forwarding input into the world* above) and turned into
+  `KeyboardState` / `MouseState` by [`spark-input`]'s systems on `Stage::Input`
+  — no longer just `tracing` lines. The remaining `Poll`-related change is only
+  about *when* OS events are drained relative to sim, not *whether* they reach
+  the world.
 
 Each piece grows into its own crate as the milestones land:
 

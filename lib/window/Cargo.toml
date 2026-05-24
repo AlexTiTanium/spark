@@ -17,6 +17,12 @@ workspace = true
 [dependencies]
 spark-core = { path = "../core" }
 spark-common = { path = "../common" }   # Time resource — owns the 60 Hz clock the runner reads
+# Window forwards OS input into the world as `spark-input`'s events: it depends
+# on `spark-input` to name those event types, and on `spark-ecs` to reach the
+# `Events<T>` buffers it sends them into. The dependency points only this way —
+# `spark-input` never depends back on the window.
+spark-input = { path = "../input" }
+spark-ecs = { path = "../ecs" }
 
 winit.workspace = true
 tracing.workspace = true
