@@ -259,6 +259,11 @@ impl Time {
     /// This frame's real delta in seconds — for profilers and UI animation that
     /// must keep moving while the game is paused.
     ///
+    /// Per-frame deltas are `f32`-only by design: you multiply by one once and
+    /// never accumulate it, so `f32` precision is correct. (The fixed step *is*
+    /// accumulated, which is why only it gets an
+    /// [`f64` variant](Self::fixed_delta_secs_f64).)
+    ///
     /// # Examples
     ///
     /// ```
