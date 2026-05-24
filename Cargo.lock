@@ -1173,6 +1173,7 @@ dependencies = [
  "spark-common",
  "spark-core",
  "spark-ecs",
+ "spark-input",
  "spark-log",
  "spark-window",
 ]
@@ -1210,6 +1211,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "spark-input"
+version = "0.1.0"
+dependencies = [
+ "spark-core",
+ "spark-ecs",
+]
+
+[[package]]
 name = "spark-log"
 version = "0.1.0"
 dependencies = [
@@ -1225,6 +1234,8 @@ version = "0.1.0"
 dependencies = [
  "spark-common",
  "spark-core",
+ "spark-ecs",
+ "spark-input",
  "thiserror 2.0.18",
  "tracing",
  "winit",

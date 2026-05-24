@@ -43,7 +43,7 @@ Guiding rule: **build the engine the game needs, not a general-purpose engine.**
 │   ├── core/                   # plugin harness (Application, Plugin, EngineError, Stage), math, ids
 │   ├── ecs/                    # roll-your-own ECS (see ECS_DESIGN.md)
 │   ├── window/                 # winit integration, surface lifecycle
-│   ├── input/                  # input collection → Resource each frame
+│   ├── input/                  # input events + KeyboardState/MouseState resources
 │   ├── render/                 # wgpu pipelines, sprite batcher, tilemap renderer
 │   ├── assets/                 # texture/atlas/mesh loading, hot reload
 │   ├── ui/                     # egui + wgpu plumbing, EguiContext Resource
@@ -74,8 +74,8 @@ Guiding rule: **build the engine the game needs, not a general-purpose engine.**
 ecs     ── (stdlib only — deepest foundation crate; no external ECS dep)
 core    ── ecs + (glam, thiserror, tracing)
 common  ── core + ecs                   (engine-wide shared resources: Time)
-window  ── core + common + (winit)
-input   ── core + window + (gilrs)
+input   ── core + ecs                   (input vocabulary + KeyboardState/MouseState; gamepad/gilrs deferred)
+window  ── core + common + ecs + input + (winit)
 render  ── core + window + (wgpu, image)
 assets  ── core + render + (notify)
 ui      ── core + window + input + render + (egui, egui-wgpu, egui-winit)
@@ -83,6 +83,17 @@ editor  ── core + ui                    (feature-flagged, dev-only)
 audio   ── core + (kira)
 game    ── all of the above
 ```
+
+**`input` sits *below* `window`, not above it.** The two are decoupled
+through the ECS event system: `spark-input` owns the input vocabulary
+(`KeyCode`, `MouseButton`, and the raw `KeyboardInput` / `MouseButtonInput` /
+`CursorMoved` / `MouseWheel` / `FocusLost` events) plus the `KeyboardState` /
+`MouseState` resources and the `Stage::Input` collection systems. `spark-window`
+*emits* those events (translating `winit`, guarded so it's a no-op without a
+consumer) and therefore depends on `spark-input` to name them — but
+`spark-input` never depends on `spark-window` and pulls in no `winit`. A future
+gamepad backend would be another emitter of the same events; `gilrs` is
+deferred.
 
 `spark-ecs` is the deepest crate so `Application` (in `spark-core`) can
 embed a `World` without inverting Cargo's no-cycle rule. `spark-core`
@@ -242,6 +253,7 @@ The migration is additive on the engine side — `Application` and its helpers s
 - Set up workspace, `core`, `window`, `input` crates
 - `spark_core::Application` boot harness: owns config + boot order (tracing init, root `EngineError`, window startup). Pre-ECS stand-in for the canonical `App` arriving in M4 — same API surface, extended additively as later crates land.
 - Window opens, logs input events
+- Input layer shipped (`spark-input`): OS input is forwarded by `spark-window` as ECS events and collected into `KeyboardState` / `MouseState` on `Stage::Input`. `input` sits below `window` (see *Module dependency graph*); gamepad/`gilrs` deferred.
 - No render, no ECS yet
 
 #### M2 — Hello triangle

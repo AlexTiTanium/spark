@@ -19,7 +19,7 @@ use std::num::NonZeroU32;
 
 use spark_common::Time;
 use spark_core::{Application, Stage};
-use tracing::{debug, info, trace};
+use tracing::info;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::WindowEvent;
@@ -139,7 +139,10 @@ impl ApplicationHandler for EventLoopRunner {
     ///   the loop alive.
     /// - Lifecycle / input events: logged at appropriate `tracing`
     ///   levels (cursor at `trace`, input at `debug`, focus/resize at
-    ///   `info`).
+    ///   `info`). Device input (keyboard, mouse-button, cursor, wheel)
+    ///   and focus-loss are handed to [`crate::input`], which logs them
+    ///   and forwards the matching [`spark_input`] events into the world
+    ///   (guarded, so a no-op unless a consumer registered the buffers).
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
@@ -194,18 +197,29 @@ impl ApplicationHandler for EventLoopRunner {
             }
             WindowEvent::Focused(focused) => {
                 info!(focused, "window focus changed");
+                // Losing focus: the OS delivers the matching key-up / button-up
+                // events to whatever window took focus, not to us. Signal
+                // consumers to clear held state so nothing appears stuck.
+                if !focused {
+                    crate::input::forward_focus_lost(&self.app);
+                }
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 info!(scale_factor, "window scale factor changed");
             }
+            // Device input: logged and forwarded by `crate::input`, keeping the
+            // winit→`spark-input` translation out of this loop.
             WindowEvent::KeyboardInput { event, .. } => {
-                debug!(state = ?event.state, key = ?event.logical_key, "keyboard input");
+                crate::input::forward_keyboard(&self.app, &event);
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                debug!(?state, ?button, "mouse input");
+                crate::input::forward_mouse_button(&self.app, state, button);
             }
             WindowEvent::CursorMoved { position, .. } => {
-                trace!(x = position.x, y = position.y, "cursor moved");
+                crate::input::forward_cursor(&self.app, position);
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                crate::input::forward_wheel(&self.app, delta);
             }
             _ => {}
         }
