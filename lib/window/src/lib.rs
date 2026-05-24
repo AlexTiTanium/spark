@@ -3,6 +3,7 @@
 mod config;
 mod error;
 mod event_loop;
+mod input;
 mod plugin;
 
 pub use config::WindowConfig;

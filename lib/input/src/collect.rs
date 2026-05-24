@@ -2,15 +2,22 @@
 //!
 //! Each runs after the event-buffer swap (see [`InputPlugin`](crate::InputPlugin)),
 //! so it reads the events the window forwarded since last frame and applies
-//! them to [`KeyboardState`] / [`MouseState`]. Keyboard is one system; the
-//! mouse is split into two — folding all mouse input into one would need five
-//! [`SystemParam`](spark_ecs::SystemParam)s (buttons, cursor, wheel, focus,
-//! state), and `IntoSystem` tops out at four.
+//! them to [`KeyboardState`] / [`MouseState`].
 //!
-//! All three follow the same shape: clear this frame's edge sets, react to
-//! [`FocusLost`] by releasing everything held, then apply the per-event deltas.
-//! The held sets persist across frames; the edge sets and the scroll delta do
-//! not — they describe only the frame just collected.
+//! Mouse handling is **two** systems because buttons and motion have different
+//! update shapes: buttons track press/release *edges* (a [`PressSet`], like the
+//! keyboard), while cursor and scroll are plain *accumulations*. The split also
+//! happens to sidestep the 4-param [`IntoSystem`](spark_ecs::IntoSystem) cap —
+//! one mouse system would need five params (buttons, cursor, wheel, focus,
+//! state). Both write [`MouseState`], so they must stay **sequential**: they
+//! cannot become parallel workloads on this stage unless `MouseState` is first
+//! split into independently-borrowed sub-resources.
+//!
+//! The button-bearing systems share a shape via
+//! [`PressSet`](crate::press_set::PressSet): begin the frame (clear edges),
+//! release everything on [`FocusLost`], then apply each event. The held sets
+//! persist across frames; the edges and the scroll delta describe only the
+//! frame just collected.
 
 use spark_ecs::{EventReader, ResMut};
 
@@ -18,11 +25,6 @@ use crate::event::{CursorMoved, FocusLost, KeyboardInput, MouseButtonInput, Mous
 use crate::state::{KeyboardState, MouseState};
 
 /// Folds [`KeyboardInput`] (and [`FocusLost`]) into [`KeyboardState`].
-///
-/// Clears the press/release edges, releases all held keys on focus loss, then
-/// applies each key event. A press already in the held set is ignored (so OS
-/// auto-repeat that slipped past the window filter can't double-register);
-/// every genuine press/release records the matching edge.
 #[allow(
     clippy::needless_pass_by_value,
     reason = "EventReader<T> / ResMut<T> are SystemParams — IntoSystem hands them in by \
@@ -33,33 +35,21 @@ pub(crate) fn collect_keyboard(
     focus: EventReader<FocusLost>,
     mut kb: ResMut<KeyboardState>,
 ) {
-    kb.just_pressed.clear();
-    kb.just_released.clear();
-
-    // Focus loss: the OS routed the key-ups elsewhere, so treat every held key
-    // as released. `mem::take` empties `pressed` in one move (a `drain` loop
-    // that pushed into another field wouldn't borrow-check through `ResMut`).
-    for _ in focus.read() {
-        let released = std::mem::take(&mut kb.pressed);
-        kb.just_released.extend(released);
+    kb.keys.begin_frame();
+    // `EventReader` reads the frozen `previous` buffer and is stateless, so this
+    // system and `collect_mouse_buttons` each independently observe the same
+    // `FocusLost` — it's a broadcast read, not a consume-once queue.
+    if focus.read().next().is_some() {
+        kb.keys.release_all();
     }
-
     for event in keys.read() {
-        if event.pressed {
-            if !kb.pressed.contains(&event.key) {
-                kb.pressed.push(event.key);
-                kb.just_pressed.push(event.key);
-            }
-        } else if let Some(i) = kb.pressed.iter().position(|k| *k == event.key) {
-            kb.pressed.swap_remove(i);
-            kb.just_released.push(event.key);
-        }
+        kb.keys.set(event.key, event.pressed);
     }
 }
 
 /// Folds [`MouseButtonInput`] (and [`FocusLost`]) into [`MouseState`]'s button
-/// fields. Mirrors [`collect_keyboard`] for buttons; leaves cursor and scroll
-/// to [`collect_mouse_motion`].
+/// fields. Mirrors [`collect_keyboard`]; cursor and scroll are
+/// [`collect_mouse_motion`]'s job.
 #[allow(
     clippy::needless_pass_by_value,
     reason = "EventReader<T> / ResMut<T> are SystemParams — IntoSystem hands them in by \
@@ -70,24 +60,12 @@ pub(crate) fn collect_mouse_buttons(
     focus: EventReader<FocusLost>,
     mut mouse: ResMut<MouseState>,
 ) {
-    mouse.buttons_just_pressed.clear();
-    mouse.buttons_just_released.clear();
-
-    for _ in focus.read() {
-        let released = std::mem::take(&mut mouse.buttons);
-        mouse.buttons_just_released.extend(released);
+    mouse.buttons.begin_frame();
+    if focus.read().next().is_some() {
+        mouse.buttons.release_all();
     }
-
     for event in buttons.read() {
-        if event.pressed {
-            if !mouse.buttons.contains(&event.button) {
-                mouse.buttons.push(event.button);
-                mouse.buttons_just_pressed.push(event.button);
-            }
-        } else if let Some(i) = mouse.buttons.iter().position(|b| *b == event.button) {
-            mouse.buttons.swap_remove(i);
-            mouse.buttons_just_released.push(event.button);
-        }
+        mouse.buttons.set(event.button, event.pressed);
     }
 }
 

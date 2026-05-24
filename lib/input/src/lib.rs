@@ -6,6 +6,7 @@
 mod collect;
 mod event;
 mod plugin;
+mod press_set;
 mod state;
 
 pub use event::{

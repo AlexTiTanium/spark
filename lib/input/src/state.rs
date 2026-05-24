@@ -1,20 +1,21 @@
 //! The queryable input state — [`KeyboardState`] and [`MouseState`].
 //!
 //! These are the resources gameplay reads. They're *built* from the raw events
-//! by the `collect_*` systems (see [`crate::collect`]); the fields are
-//! `pub(crate)` so those systems can mutate them, while the public surface is
-//! read-only accessors. Held sets and per-frame edge sets are `Vec`s, not
-//! `HashSet`s — lookups go through `is_pressed` / `just_*`, and nothing iterates
-//! a hashed collection, so iteration order can never make a simulation
-//! non-deterministic.
+//! by the `collect_*` systems (see [`crate::collect`]). The held-plus-edges
+//! bookkeeping common to keys and buttons lives in
+//! [`PressSet`](crate::press_set::PressSet); each state type wraps one and
+//! exposes read-only accessors over it. `PressSet` uses `Vec`s, not
+//! `HashSet`s, so iteration is deterministic — Spark's simulation determinism
+//! rule forbids hashed iteration.
 
 use spark_ecs::Resource;
 
 use crate::event::{KeyCode, MouseButton};
+use crate::press_set::PressSet;
 
 /// Which keys are held, plus this frame's press/release *edges*.
 ///
-/// "Held" persists across frames until a release arrives; the edge sets
+/// "Held" persists across frames until a release arrives; the edges
 /// (`just_pressed` / `just_released`) describe **only the current frame** and
 /// are cleared at the top of every `collect_keyboard` run. That split is the
 /// whole point: `is_pressed` answers "is W down right now?" (movement), while
@@ -34,12 +35,7 @@ use crate::event::{KeyCode, MouseButton};
 /// ```
 #[derive(Resource, Default, Debug)]
 pub struct KeyboardState {
-    /// Keys currently held. Persists across frames; insertion order, no dupes.
-    pub(crate) pressed: Vec<KeyCode>,
-    /// Keys that went down this frame. Cleared at the top of `collect_keyboard`.
-    pub(crate) just_pressed: Vec<KeyCode>,
-    /// Keys that went up this frame. Cleared at the top of `collect_keyboard`.
-    pub(crate) just_released: Vec<KeyCode>,
+    pub(crate) keys: PressSet<KeyCode>,
 }
 
 impl KeyboardState {
@@ -53,7 +49,7 @@ impl KeyboardState {
     /// ```
     #[must_use]
     pub fn is_pressed(&self, key: KeyCode) -> bool {
-        self.pressed.contains(&key)
+        self.keys.is_held(key)
     }
 
     /// Whether `key` went down *this frame* (true for exactly the frame the
@@ -67,7 +63,7 @@ impl KeyboardState {
     /// ```
     #[must_use]
     pub fn just_pressed(&self, key: KeyCode) -> bool {
-        self.just_pressed.contains(&key)
+        self.keys.just_pressed(key)
     }
 
     /// Whether `key` went up *this frame*.
@@ -80,10 +76,10 @@ impl KeyboardState {
     /// ```
     #[must_use]
     pub fn just_released(&self, key: KeyCode) -> bool {
-        self.just_released.contains(&key)
+        self.keys.just_released(key)
     }
 
-    /// Iterates the currently-held keys.
+    /// Iterates the currently-held keys, in insertion order.
     ///
     /// # Examples
     ///
@@ -92,7 +88,7 @@ impl KeyboardState {
     /// assert_eq!(KeyboardState::default().pressed().count(), 0);
     /// ```
     pub fn pressed(&self) -> impl Iterator<Item = KeyCode> + '_ {
-        self.pressed.iter().copied()
+        self.keys.iter_held()
     }
 }
 
@@ -116,12 +112,7 @@ impl KeyboardState {
 /// ```
 #[derive(Resource, Default, Debug)]
 pub struct MouseState {
-    /// Buttons currently held. Persists across frames; insertion order, no dupes.
-    pub(crate) buttons: Vec<MouseButton>,
-    /// Buttons that went down this frame. Cleared at the top of `collect_mouse_buttons`.
-    pub(crate) buttons_just_pressed: Vec<MouseButton>,
-    /// Buttons that went up this frame. Cleared at the top of `collect_mouse_buttons`.
-    pub(crate) buttons_just_released: Vec<MouseButton>,
+    pub(crate) buttons: PressSet<MouseButton>,
     /// Last known cursor position, window pixels, top-left origin.
     pub(crate) position: (f32, f32),
     /// This frame's accumulated scroll delta (pixels). Reset each frame.
@@ -139,7 +130,7 @@ impl MouseState {
     /// ```
     #[must_use]
     pub fn is_pressed(&self, button: MouseButton) -> bool {
-        self.buttons.contains(&button)
+        self.buttons.is_held(button)
     }
 
     /// Whether `button` went down *this frame*.
@@ -152,7 +143,7 @@ impl MouseState {
     /// ```
     #[must_use]
     pub fn just_pressed(&self, button: MouseButton) -> bool {
-        self.buttons_just_pressed.contains(&button)
+        self.buttons.just_pressed(button)
     }
 
     /// Whether `button` went up *this frame*.
@@ -165,11 +156,11 @@ impl MouseState {
     /// ```
     #[must_use]
     pub fn just_released(&self, button: MouseButton) -> bool {
-        self.buttons_just_released.contains(&button)
+        self.buttons.just_released(button)
     }
 
-    /// Iterates the currently-held buttons. Mirrors
-    /// [`KeyboardState::pressed`](crate::KeyboardState::pressed).
+    /// Iterates the currently-held buttons, in insertion order. Mirrors
+    /// [`KeyboardState::pressed`].
     ///
     /// # Examples
     ///
@@ -178,7 +169,7 @@ impl MouseState {
     /// assert_eq!(MouseState::default().buttons().count(), 0);
     /// ```
     pub fn buttons(&self) -> impl Iterator<Item = MouseButton> + '_ {
-        self.buttons.iter().copied()
+        self.buttons.iter_held()
     }
 
     /// Cursor position in window pixels, top-left origin.

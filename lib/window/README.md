@@ -258,8 +258,8 @@ into distinct slots driven by two different winit hooks:
    │                                                   │
    │  about_to_wait  ┐    (ControlFlow::Poll)          │
    │                 │                                 │
-   │   1. drain queued WindowEvents into an            │  ◀── Input
-   │      `InputState` resource                        │       collection
+   │   1. drain queued WindowEvents into the           │  ◀── Input
+   │      KeyboardState / MouseState resources         │       collection
    │                                                   │
    │   2. run the Stage::FixedUpdate stage N times     │  ◀── Simulation
    │      (60 Hz fixed timestep — deterministic)       │       (60 Hz)
@@ -292,7 +292,7 @@ What's different from today:
   `about_to_wait`, so simulation steps independently of when the GPU is
   ready to draw.
 - **Input collection already shipped, decoupled from the loop.** Keyboard,
-  mouse, cursor, wheel, and focus events are forwarded as `spark_core` ECS
+  mouse, cursor, wheel, and focus events are forwarded as [`spark-input`]
   events (see *Forwarding input into the world* above) and turned into
   `KeyboardState` / `MouseState` by [`spark-input`]'s systems on `Stage::Input`
   — no longer just `tracing` lines. The remaining `Poll`-related change is only
@@ -303,7 +303,7 @@ Each piece grows into its own crate as the milestones land:
 
 | Capability | Where it'll live | Milestone |
 |-|-|-|
-| Input collection — drain `KeyboardInput` / `MouseInput` into an `InputState` resource | `spark-input` | M3 follow-up |
+| ✅ Input collection — forward OS input as events into `KeyboardState` / `MouseState` | `spark-input` | **shipped** |
 | ✅ `Stage::FixedUpdate` driver — reads `Time::fixed_steps_this_frame()` (accumulator owned by `Time`) | `spark-window` runner + `spark-common` | **shipped** |
 | `ControlFlow::Wait → Poll` flip + `about_to_wait` driver (relocates `FixedUpdate`) | `spark-window` | M3 follow-up |
 | `Stage::Render` driver that pushes a frame to the GPU | `spark-render` (`wgpu` + WGSL) | M5 |
