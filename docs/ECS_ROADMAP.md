@@ -33,7 +33,7 @@ expanded into full drafts in the project's `#10–#12` format below.
 
 ### To create — in order
 
-> **Status legend** — ✅ Done in main · 🟡 Filed (in flight) · ⬜ Not yet filed.
+> **Status legend** — ✅ Done in main · 🟡 Filed (in flight) · ❌ Rejected · ⬜ Not yet filed.
 
 **1. ~~Finish `&mut` query iteration~~ — ✅ DONE in main (PR #22).**
 The `QueryData` shared/exclusive split, `ReadOnlyQueryData` gate,
@@ -301,10 +301,20 @@ mechanism (monomorphisation cost doubles per step).
   `Changed<T>` filter itself is a fast-follow after render, do not implement it
   here. Needs a `World`-level tick counter.
 
-**8. Bundles — ⬜ not filed.**
-- *Work:* `Bundle` trait; tuple impl via `macro_rules!`; `#[derive(Bundle)]`.
-- *Warnings:* define overwrite semantics — inserting a bundle component an
-  entity already has should overwrite (consistent with `World::insert`).
+**8. Bundles — ❌ rejected 2026-05-26 (see #57); spawn-ergonomics need deferred.**
+- *Disposition:* in-code `Bundle` (trait + tuple impl + `#[derive(Bundle)]`) is
+  **rejected** as the wrong abstraction for Spark — for a city-builder full of
+  similar archetypes, data-driven prefabs are the eventual right answer, not
+  compile-time tuple sugar. No game system spawns entities today, so there is
+  also no consumer to validate it against. The underlying *need* (spawn
+  ergonomics) is deferred, not the trait.
+- *If it resurfaces:* file a fresh issue under the right framing (likely
+  data-driven prefabs), not a revival of Bundle as written. #57 records the full
+  design space (six options, factory functions → reflection-based prefabs) and
+  the conditions that would reopen the question.
+- *Warnings (kept for reference):* whatever ships must define overwrite
+  semantics — inserting a component an entity already has should overwrite
+  (consistent with `World::insert`).
 
 **9. ~~`IntoIterator` for `&Query` / `&mut Query` (loop sugar)~~ — ✅ shipped with #58.**
 - *Shipped:* `impl IntoIterator for &Query<'_, D, F>` (yields `D::Item`
