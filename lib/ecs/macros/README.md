@@ -1,7 +1,7 @@
 # spark-ecs-macros
 
 The derive macros behind [`spark-ecs`](../README.md): `#[derive(Component)]`,
-`#[derive(Resource)]`, and `#[derive(WorkloadLabel)]`.
+`#[derive(Resource)]`, `#[derive(Event)]`, and `#[derive(WorkloadLabel)]`.
 
 > **Why a separate crate?** Rust forces every procedural macro into its
 > own `proc-macro = true` crate — such a crate can export *only* macros,
@@ -19,13 +19,16 @@ there and never names this crate:
 // cycle — the macro crate is a build-time artefact of `spark-ecs`, not
 // the reverse), so its own doctests can't import the traits. Runnable
 // versions of these examples live in `lib/ecs/README.md`.
-use spark_ecs::{Component, Resource, WorkloadLabel};
+use spark_ecs::{Component, Event, Resource, WorkloadLabel};
 
 #[derive(Component)]
 struct Position { x: f32, y: f32 }
 
 #[derive(Resource)]
 struct FrameCount(u64);
+
+#[derive(Event)]
+struct TileClicked { x: i32, y: i32 }
 
 #[derive(WorkloadLabel)]            // applies to an enum — one variant per label
 enum Grid { Supply, Distribute }
@@ -37,7 +40,7 @@ every package to be a member, and that can't be elided.
 
 ## What the derives generate
 
-`Component` and `Resource` each emit one empty marker `impl`:
+`Component`, `Resource`, and `Event` each emit one empty marker `impl`:
 
 ```text
 #[derive(Component)] struct Position { … }
@@ -45,11 +48,12 @@ every package to be a member, and that can't be elided.
 impl ::spark_ecs::Component for Position {}
 ```
 
-The trait does the real work. `Component` is declared
+The trait does the real work. `Component` and `Event` are both declared
 `Send + Sync + 'static`, so the generated impl only compiles when the
 type is genuinely thread-safe — a field holding an `Rc`, `RefCell`, or
 raw pointer is rejected at the derive site. That is the compile-time
-proof the M4 parallel scheduler will lean on. `Resource` carries only a
+proof the M4 parallel scheduler will lean on (it moves component storages
+and event buffers across worker threads). `Resource` carries only a
 `'static` bound, so non-`Send` resources (GPU handles, OS state) still
 derive cleanly; their thread-safety is handled at the scheduler, not the
 type system.

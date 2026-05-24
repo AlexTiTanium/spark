@@ -23,18 +23,21 @@
 ///
 /// [`Startup`](Self::Startup) fires once, inside
 /// [`Application::run`](crate::Application::run), after every
-/// `add_startup_system` closure. The per-frame trio
-/// [`PreUpdate`](Self::PreUpdate) → [`Update`](Self::Update) →
+/// `add_startup_system` closure. The per-frame sequence
+/// [`Input`](Self::Input) → [`PreUpdate`](Self::PreUpdate) →
+/// ([`FixedUpdate`](Self::FixedUpdate) × N) → [`Update`](Self::Update) →
 /// [`PostUpdate`](Self::PostUpdate) is driven every frame by
-/// [`WindowPlugin`](../../spark_window/struct.WindowPlugin.html)'s
-/// runner. [`First`](Self::First), [`FixedUpdate`](Self::FixedUpdate),
-/// [`Render`](Self::Render), and [`Last`](Self::Last) are reserved
-/// labels — defined now so call sites (and the editor's future stage
-/// view) can name them, but not yet auto-driven; their executors land
-/// with the scheduler (see `docs/ECS_ROADMAP.md`).
+/// [`WindowPlugin`](../../spark_window/struct.WindowPlugin.html)'s runner:
+/// `Input` swaps double-buffered event queues (and, later, collects input
+/// state), and `FixedUpdate` runs N times off a 60 Hz accumulator.
+/// [`First`](Self::First), [`Render`](Self::Render), and
+/// [`Last`](Self::Last) are reserved labels — defined now so call sites
+/// (and the editor's future stage view) can name them, but not yet
+/// auto-driven; their executors land with the scheduler (see
+/// `docs/ECS_ROADMAP.md`).
 ///
 /// Per-frame order:
-/// `First → PreUpdate → (FixedUpdate × N) → Update → PostUpdate → Render → Last`.
+/// `First → Input → PreUpdate → (FixedUpdate × N) → Update → PostUpdate → Render → Last`.
 ///
 /// # Examples
 ///
@@ -52,6 +55,7 @@
 /// let name = match stage {
 ///     Stage::Startup => "startup",
 ///     Stage::First => "first",
+///     Stage::Input => "input",
 ///     Stage::PreUpdate => "pre_update",
 ///     Stage::FixedUpdate => "fixed_update",
 ///     Stage::Update => "update",
@@ -69,11 +73,15 @@ pub enum Stage {
     Startup,
     /// Very first thing each frame. Reserved label; not yet auto-driven.
     First,
-    /// Input poll, time tick — prepares the state the rest of the frame
-    /// consumes.
+    /// Top of each frame, before [`PreUpdate`](Self::PreUpdate): swaps the
+    /// double-buffered event queues (and, later, collects input state).
+    /// Driven by `WindowPlugin`'s runner, pumped first in the frame.
+    Input,
+    /// Time tick and per-frame setup — prepares the state the rest of the
+    /// frame consumes.
     PreUpdate,
-    /// Fixed-timestep simulation; runs N times per frame off an
-    /// accumulator (60 Hz). Reserved label; not yet auto-driven.
+    /// Fixed-timestep simulation; runs N times per frame off a real-time
+    /// accumulator (60 Hz). Driven by `WindowPlugin`'s runner.
     FixedUpdate,
     /// Main game logic at display rate — movement, AI, spawn/despawn.
     Update,

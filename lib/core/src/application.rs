@@ -5,7 +5,8 @@
 use std::collections::HashMap;
 
 use spark_ecs::{
-    IntoSystem, Resource, Schedule, WorkloadBuilder, WorkloadLabel, WorkloadOrderBuilder, World,
+    Event, Events, IntoSystem, Resource, Schedule, WorkloadBuilder, WorkloadLabel,
+    WorkloadOrderBuilder, World, swap_events,
 };
 
 use crate::error::EngineError;
@@ -119,6 +120,62 @@ impl Application {
     /// ```
     pub fn add_resource<T: Resource>(&mut self, value: T) -> &mut Self {
         self.world.add_resource(value);
+        self
+    }
+
+    /// Registers event type `T`: inserts an [`Events<T>`](spark_ecs::Events)
+    /// buffer into the [`World`] and the per-frame
+    /// [`swap_events::<T>`](spark_ecs::swap_events) system on
+    /// [`Stage::Input`]. Chainable.
+    ///
+    /// After this, systems can take an
+    /// [`EventWriter<T>`](spark_ecs::EventWriter) to send and an
+    /// [`EventReader<T>`](spark_ecs::EventReader) to read; the swap on
+    /// `Stage::Input` (pumped first each frame by `WindowPlugin`'s runner)
+    /// rotates the buffers so an event sent on frame N is readable on N+1.
+    ///
+    /// **Idempotent.** A second call for the same `T` is a no-op — it does
+    /// *not* register a second swap system. That matters: two swaps per
+    /// frame would both rotate the buffers before any reader runs, leaving
+    /// `previous` empty and silently dropping every event. Two plugins may
+    /// each register the same event type, so the guard is load-bearing.
+    ///
+    /// # Precondition
+    ///
+    /// This method assumes it is the **only** path that puts an `Events<T>`
+    /// resource into the world. The idempotency guard keys off that
+    /// resource's presence, so the resource and its swap system are a
+    /// managed pair. If you instead insert `Events::<T>::default()` by hand
+    /// via [`add_resource`](Self::add_resource) and *then* call
+    /// `add_event::<T>()`, the guard sees the resource and skips registering
+    /// the swap system — so the buffers never rotate: `previous` stays empty
+    /// (readers see nothing) and `current` grows unbounded (events are never
+    /// cleared). Always register event types through `add_event`, never by
+    /// inserting `Events<T>` directly. (A registry-backed guard that removes
+    /// this coupling is a deferred follow-up — see `docs/ECS_ROADMAP.md`.)
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use spark_core::Application;
+    /// use spark_ecs::{Event, Events};
+    ///
+    /// #[derive(Event)]
+    /// struct Tick;
+    ///
+    /// let mut app = Application::new();
+    /// app.add_event::<Tick>().add_event::<Tick>(); // second call is a no-op
+    /// assert!(app.world().get_resource::<Events<Tick>>().is_some());
+    /// ```
+    pub fn add_event<T: Event>(&mut self) -> &mut Self {
+        // Idempotency guard — see the `# Precondition` section above. The
+        // temporary `Ref` from `get_resource` is dropped at the end of this
+        // `if`, before the `&mut self.world` borrows below.
+        if self.world.get_resource::<Events<T>>().is_some() {
+            return self;
+        }
+        self.world.add_resource(Events::<T>::default());
+        self.add_system(Stage::Input, swap_events::<T>);
         self
     }
 
@@ -460,15 +517,48 @@ impl Application {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "SystemParam values like EventReader<T> are taken by value because \
+              that is how systems receive them — `&EventReader<T>` is not itself \
+              a SystemParam, so the by-reference suggestion does not apply."
+)]
 mod tests {
     use super::*;
-    use spark_ecs::{Commands, Component, Query, ResMut, Resource, WorkloadLabel};
+    use spark_ecs::{
+        Commands, Component, Event, EventReader, EventWriter, Events, Query, ResMut, Resource,
+        WorkloadLabel,
+    };
 
     #[derive(Resource)]
     struct Counter(u32);
 
     fn bump(mut c: ResMut<Counter>) {
         c.0 += 1;
+    }
+
+    #[derive(Event)]
+    struct Pulse(u32);
+
+    /// Records every event payload a reader system observed, so a test can
+    /// assert what was read after running frames.
+    #[derive(Resource)]
+    struct Log(Vec<u32>);
+
+    /// Reader system reused across the event tests: appends this frame's
+    /// readable events to [`Log`].
+    fn record(reader: EventReader<Pulse>, mut log: ResMut<Log>) {
+        log.0.extend(reader.read().map(|p| p.0));
+    }
+
+    /// Pumps one full frame in the runner's order, minus the reserved
+    /// stages: `Input → PreUpdate → Update → PostUpdate`. `Input` is where
+    /// the per-event swap runs, so this is what advances the event clock.
+    fn run_frame(app: &mut Application) {
+        app.run_stage(Stage::Input);
+        app.run_stage(Stage::PreUpdate);
+        app.run_stage(Stage::Update);
+        app.run_stage(Stage::PostUpdate);
     }
 
     #[test]
@@ -650,5 +740,111 @@ mod tests {
         });
         app.run_stage(Stage::Update);
         assert_eq!(app.world().resource::<Seen>().0, 1);
+    }
+
+    #[test]
+    fn add_event_inserts_buffer_and_registers_swap_on_input() {
+        let mut app = Application::new();
+        app.add_event::<Pulse>();
+        assert!(app.world().get_resource::<Events<Pulse>>().is_some());
+
+        // The swap system landed on Stage::Input: a queued send becomes
+        // readable after exactly one Input pump.
+        app.world_mut()
+            .resource_mut::<Events<Pulse>>()
+            .send(Pulse(1));
+        app.run_stage(Stage::Input);
+        assert_eq!(
+            app.world()
+                .resource::<Events<Pulse>>()
+                .iter_previous()
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn add_event_is_idempotent() {
+        // Two plugins each registering the same event type must not stack a
+        // second swap system: two swaps per frame would rotate the buffers
+        // twice before any reader runs, dropping the event to zero.
+        let mut app = Application::new();
+        app.add_event::<Pulse>().add_event::<Pulse>(); // registered twice
+        app.add_resource(Log(Vec::new()));
+        app.add_system(Stage::Update, record);
+
+        app.world_mut()
+            .resource_mut::<Events<Pulse>>()
+            .send(Pulse(7));
+        // Advance one frame. A double swap would empty `previous` here.
+        app.run_stage(Stage::Input);
+        app.run_stage(Stage::Update);
+
+        assert_eq!(app.world().resource::<Log>().0, vec![7]); // exactly one, not zero
+    }
+
+    #[test]
+    fn event_written_frame_n_is_readable_next_frame_then_gone() {
+        let mut app = Application::new();
+        app.add_event::<Pulse>();
+        app.add_resource(Log(Vec::new()));
+        app.add_system(Stage::Update, record);
+
+        // Frame 0 send (into `current`).
+        app.world_mut()
+            .resource_mut::<Events<Pulse>>()
+            .send(Pulse(7));
+
+        // Frame 1: Input swap rotates the send into `previous`; Update reads it.
+        run_frame(&mut app);
+        assert_eq!(app.world().resource::<Log>().0, vec![7]);
+
+        // Frame 2: Input swap again (nothing newly sent) ages the event out.
+        run_frame(&mut app);
+        assert_eq!(app.world().resource::<Log>().0, vec![7]); // unchanged: nothing new read
+    }
+
+    #[test]
+    fn reader_on_earlier_stage_than_writer_still_sees_event_next_frame() {
+        // Order-independence: the reader runs on PreUpdate (early), the
+        // writer on PostUpdate (late). Read-previous makes the event visible
+        // the *next* frame regardless of intra-frame ordering.
+        let mut app = Application::new();
+        app.add_event::<Pulse>();
+        app.add_resource(Log(Vec::new()));
+        app.add_system(Stage::PostUpdate, |mut w: EventWriter<Pulse>| {
+            w.send(Pulse(3));
+        });
+        app.add_system(Stage::PreUpdate, record);
+
+        // Frame 1: PreUpdate reader sees nothing (previous empty); the late
+        // writer then sends.
+        run_frame(&mut app);
+        assert_eq!(app.world().resource::<Log>().0, Vec::<u32>::new());
+
+        // Frame 2: Input swap rotates frame-1's send in; the early reader sees it.
+        run_frame(&mut app);
+        assert_eq!(app.world().resource::<Log>().0, vec![3]);
+    }
+
+    #[test]
+    fn fixed_update_burst_reads_the_same_previous_snapshot() {
+        // A multi-step FixedUpdate burst within one frame reads the identical
+        // frozen `previous` on every step — the swap only runs on Input.
+        let mut app = Application::new();
+        app.add_event::<Pulse>();
+        app.add_resource(Log(Vec::new()));
+        app.add_system(Stage::FixedUpdate, record);
+
+        app.world_mut()
+            .resource_mut::<Events<Pulse>>()
+            .send(Pulse(5));
+
+        // Frame N+1: one Input pump, then three FixedUpdate steps.
+        app.run_stage(Stage::Input);
+        app.run_stage(Stage::FixedUpdate);
+        app.run_stage(Stage::FixedUpdate);
+        app.run_stage(Stage::FixedUpdate);
+        assert_eq!(app.world().resource::<Log>().0, vec![5, 5, 5]);
     }
 }

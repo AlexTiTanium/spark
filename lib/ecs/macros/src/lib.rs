@@ -57,6 +57,33 @@ pub fn derive_resource(input: TokenStream) -> TokenStream {
     impl_marker(input, &quote!(::spark_ecs::Resource))
 }
 
+/// Derives `Event` — the explicit opt-in that lets a type flow through an
+/// `Events<T>` queue and be read/written with `EventReader<T>` /
+/// `EventWriter<T>`.
+///
+/// Emits an empty `impl ::spark_ecs::Event for YourType {}`. Like the
+/// `Component` derive, the `Event` trait is `Send + Sync + 'static`, so a
+/// type holding an `Rc`, `RefCell`, or raw pointer is rejected right at the
+/// derive site — the bound exists so the M4 parallel executor can move
+/// event buffers across worker threads without a breaking change.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// // `ignore` for the same cycle reason as `Component` above.
+/// use spark_ecs::Event;
+///
+/// #[derive(Event)]
+/// struct TileClicked {
+///     x: i32,
+///     y: i32,
+/// }
+/// ```
+#[proc_macro_derive(Event)]
+pub fn derive_event(input: TokenStream) -> TokenStream {
+    impl_marker(input, &quote!(::spark_ecs::Event))
+}
+
 /// Derives `WorkloadLabel` for an enum — one variant, one workload label.
 ///
 /// Matches over the enum's unit variants to generate `id()` (the enum's
