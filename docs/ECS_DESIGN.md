@@ -208,7 +208,7 @@ fn movement(
     mut q: Query<(&mut Position, &Velocity)>,
 ) {
     for (mut pos, vel) in q.iter_mut() {
-        pos.0 += vel.0 * time.delta;
+        pos.0 += vel.0 * time.delta_secs();
     }
 }
 ```
@@ -955,7 +955,7 @@ pub fn integrate_motion(
     mut q: Query<(&mut Position, &Velocity)>,
 ) {
     for (mut pos, vel) in q.iter_mut() {
-        pos.0 += vel.0 * time.delta;
+        pos.0 += vel.0 * time.delta_secs();
     }
 }
 
@@ -1086,12 +1086,12 @@ pub fn city_growth(
     for (entity, mut city) in cities.iter_mut() {
         let met = if city.demand_mw > 0.0 { city.supply_mw / city.demand_mw } else { 1.0 };
         if met > 0.95 {
-            city.population += (time.fixed_delta * 2.0) as u32;
+            city.population += (time.fixed_delta_secs() * 2.0) as u32;
             if city.population >= 1000 {
                 events.write(CityTierUp { city: entity, new_tier: 2 });
             }
         } else if met < 0.5 {
-            city.population = city.population.saturating_sub((time.fixed_delta * 1.0) as u32);
+            city.population = city.population.saturating_sub((time.fixed_delta_secs() * 1.0) as u32);
         }
     }
 }

@@ -726,6 +726,20 @@ mod tests {
     }
 
     #[test]
+    fn clamp_and_scale_compose() {
+        // The safety property MAX_DELTA promises: a 1 s frame is clamped to
+        // 250 ms in the *real* domain, then scaled — so a 2× clock advances
+        // 500 ms of virtual time, never 2 s. (This is also what keeps the
+        // post-clamp `mul_f32` input bounded.)
+        let mut t = Time::default();
+        t.set_scale(2.0);
+        t.tick(Duration::from_secs(1));
+        assert_eq!(t.real_delta(), MAX_DELTA);
+        let expected = MAX_DELTA.mul_f32(2.0);
+        assert!((t.delta_secs() - expected.as_secs_f32()).abs() < 1e-6);
+    }
+
+    #[test]
     fn set_paused_round_trips() {
         // `set_paused(false)` is the half `pause()`/`unpause()` don't cover.
         let mut t = Time::default();
