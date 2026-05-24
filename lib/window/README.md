@@ -142,9 +142,9 @@ The loop is built once inside [`run`], then handed to winit via
 handed to it from the
 [`set_runner`](../spark_core/struct.Application.html#method.set_runner)
 closure. On every `WindowEvent::RedrawRequested`, the runner banks the
-frame's elapsed real time, ticks the per-frame stages — draining the
-fixed-timestep accumulator in the middle — then asks winit for the next
-redraw:
+frame's elapsed real time, then ticks the per-frame stages — swapping
+event buffers in `Input` first, draining the fixed-timestep accumulator
+in the middle — then asks winit for the next redraw:
 
 ```text
    ┌──────────────────────────────────────────────────────┐
@@ -152,20 +152,23 @@ redraw:
    │                                                      │
    │   accumulator += min(elapsed, 250ms)                 │  ◀── real-time clock
    │                                                      │
-   │   1. app.run_stage(Stage::PreUpdate)                 │  ◀── input / time
+   │   1. app.run_stage(Stage::Input)                     │  ◀── event-buffer
+   │      → flush queued commands                         │       swap
+   │                                                      │
+   │   2. app.run_stage(Stage::PreUpdate)                 │  ◀── time tick
    │      → flush queued commands                         │
    │                                                      │
-   │   2. while accumulator ≥ 1/60 s:                     │  ◀── fixed-timestep
+   │   3. while accumulator ≥ 1/60 s:                     │  ◀── fixed-timestep
    │        app.run_stage(Stage::FixedUpdate)             │       simulation
    │        accumulator -= 1/60 s                          │       (0..N steps)
    │                                                      │
-   │   3. app.run_stage(Stage::Update)                    │  ◀── game logic
+   │   4. app.run_stage(Stage::Update)                    │  ◀── game logic
    │      → flush queued commands                         │       (movement,
    │                                                      │        spawning)
-   │   4. app.run_stage(Stage::PostUpdate)                │  ◀── settled-state
+   │   5. app.run_stage(Stage::PostUpdate)                │  ◀── settled-state
    │      → flush queued commands                         │       bookkeeping
    │                                                      │
-   │   5. window.request_redraw()                         │  ◀── queue next
+   │   6. window.request_redraw()                         │  ◀── queue next
    │                                                      │       frame
    └──────────────────────────────────────────────────────┘
 ```
@@ -176,6 +179,13 @@ into the [`spark_ecs::World`]. So a system that calls
 `commands.spawn().insert(Position { … })` in `Update` has its entity
 visible in `PostUpdate` of the same frame, and to every system in
 every later frame.
+
+**`Stage::Input` runs first.** It pumps the per-event swap systems that
+[`Application::add_event`](../spark_core/struct.Application.html#method.add_event)
+registers, rotating each `spark_ecs::Events<T>` double-buffer so this
+frame's readers see last frame's sends before any other stage touches
+them. It's also the future home of input-state collection (see *Where
+we're headed*) — keeping the swap and input concerns in one named phase.
 
 **The fixed-timestep loop.** `Stage::FixedUpdate` runs off a real-time
 *accumulator*: each frame banks the elapsed wall-clock time, and the
@@ -243,8 +253,9 @@ What's different from today:
   `about_to_wait`, so simulation steps independently of when the GPU is
   ready to draw.
 - **Per-frame `KeyboardInput` / `MouseInput` events** drain into an
-  `InputState` resource before any sim runs, instead of being
-  consumed inline as `tracing` events.
+  `InputState` resource — collected in `Stage::Input`, which today already
+  exists and hosts the event-buffer swap — before any sim runs, instead of
+  being consumed inline as `tracing` events.
 
 Each piece grows into its own crate as the milestones land:
 

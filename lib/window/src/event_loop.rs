@@ -5,10 +5,11 @@
 //! internal `EventLoopRunner` that implements
 //! [`ApplicationHandler`](winit::application::ApplicationHandler), and
 //! hands the loop to winit. On every `RedrawRequested`, the runner
-//! ticks the per-frame stages — `PreUpdate → (FixedUpdate × N) →
-//! Update → PostUpdate` — then asks winit for the next redraw.
-//! `FixedUpdate` runs off a real-time accumulator so the simulation
-//! advances in fixed 60 Hz steps regardless of display frame rate.
+//! ticks the per-frame stages — `Input → PreUpdate → (FixedUpdate × N) →
+//! Update → PostUpdate` — then asks winit for the next redraw. `Input`
+//! runs first and swaps the double-buffered event queues; `FixedUpdate`
+//! runs off a real-time accumulator so the simulation advances in fixed
+//! 60 Hz steps regardless of display frame rate.
 
 use std::num::NonZeroU32;
 use std::time::{Duration, Instant};
@@ -143,10 +144,10 @@ impl ApplicationHandler for EventLoopRunner {
     /// Routes each OS event to the right handler.
     ///
     /// - `CloseRequested`: exits the loop so [`run`] returns.
-    /// - `RedrawRequested`: ticks `PreUpdate → (FixedUpdate × N) →
-    ///   Update → PostUpdate`, draining the fixed-timestep accumulator
-    ///   between `PreUpdate` and `Update`, then requests the next redraw
-    ///   to keep the loop alive.
+    /// - `RedrawRequested`: ticks `Input → PreUpdate → (FixedUpdate × N) →
+    ///   Update → PostUpdate`, swapping event buffers in `Input`, draining
+    ///   the fixed-timestep accumulator between `PreUpdate` and `Update`,
+    ///   then requests the next redraw to keep the loop alive.
     /// - Lifecycle / input events: logged at appropriate `tracing`
     ///   levels (cursor at `trace`, input at `debug`, focus/resize at
     ///   `info`).
@@ -174,6 +175,12 @@ impl ApplicationHandler for EventLoopRunner {
 
                 // Per-frame tick. Each stage flushes its pending commands at
                 // the end of its run via `Application::run_stage`.
+                //
+                // `Input` runs first: it pumps the per-event swap systems
+                // registered by `Application::add_event`, rotating each
+                // `Events<T>` buffer so this frame's readers observe last
+                // frame's sends before any other stage touches them.
+                self.app.run_stage(Stage::Input);
                 self.app.run_stage(Stage::PreUpdate);
                 // Fixed-timestep simulation: run one `FixedUpdate` per whole
                 // step the accumulator covers, carrying the remainder into the

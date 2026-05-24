@@ -33,9 +33,10 @@ The non-negotiable rule: **all memory management is ECS-based**. The window hand
                        │                │
               ┌────────┼────────┐       │
           Entities  Components  Resources
-                       │              Stages (Startup, First, PreUpdate,
-                       │                          FixedUpdate, Update,
-                       │                          PostUpdate, Render, Last)
+                       │              Stages (Startup, First, Input,
+                       │                          PreUpdate, FixedUpdate,
+                       │                          Update, PostUpdate,
+                       │                          Render, Last)
                        │                │
                        │              Each Stage contains Workloads
                        │                │
@@ -46,7 +47,7 @@ The non-negotiable rule: **all memory management is ECS-based**. The window hand
                    Commands ──── deferred mutations, flushed between Workloads
 ```
 
-Per frame, the App calls the Scheduler. The Scheduler runs each Schedule in order, each Workload in dependency order, each System extracts its params from the World, mutations queue into Commands, command queues flush between Workloads, events drain at end of frame.
+Per frame, the App calls the Scheduler. The Scheduler runs each Schedule in order, each Workload in dependency order, each System extracts its params from the World, mutations queue into Commands, command queues flush between Workloads, and event buffers swap at the top of the frame (`Stage::Input`), so readers see the previous frame's events.
 
 ## Core types — schema reference
 
@@ -139,7 +140,15 @@ The `#[derive(Resource)]` macro registers the type for editor inspection just li
 
 ### Event
 
-Typed messages between systems. Double-buffered across frames so readers don't miss them.
+> ⚠️ **2026-05-24 — design revised.** Original spec was Bevy-style same-frame
+> reads with per-system cursors (`Local<T>`-backed). Revised to a cursorless
+> read-previous double-buffer with the swap in a new `Stage::Input` (pumped
+> before `PreUpdate`). Rationale: the `Local<T>` dependency was unbuildable in
+> roadmap order (events Stage 14 < Local Stage 20), and read-previous serves the
+> determinism mandate by removing intra-frame ordering as a variable. See the
+> PR closing #36 for the as-shipped design.
+
+Typed messages between systems. `Events<T>` is **double-buffered**: writers push to `current`, readers iterate `previous`, and a per-type swap system on `Stage::Input` rotates the two once per frame. A reader sees **last frame's** events — and every reader in a frame sees the same set, exactly once, regardless of intra-frame system order. `EventReader` is **stateless** (no per-system cursor): it always reads the previous-frame snapshot, so same-frame reads are deferred until `Local<T>` lands. `Application::add_event::<T>()` inserts the buffer and registers the swap.
 
 ```rust
 #[derive(Event, Debug, Clone)]
@@ -205,8 +214,8 @@ fn movement(
 | `Query<D>` | Read entities (data shape `D`) |
 | `Query<D, F>` | Same with filter `F` |
 | `Commands` | Defer entity spawn/despawn/insert/remove |
-| `EventReader<E>` | Read events from this frame and last |
-| `EventWriter<E>` | Send events |
+| `EventReader<E>` | Read last frame's events (stateless, read-previous) |
+| `EventWriter<E>` | Send events (readable next frame) |
 | `Local<T>` | Per-system local state, persists between calls |
 | `Entities` | Direct access to the entity allocator (rare) |
 | `&World` / `&mut World` | Escape hatch — system runs alone, no parallelism |
@@ -321,7 +330,8 @@ Why workloads on top of stages? Stages define the broad frame structure; workloa
 pub enum Stage {
     Startup,        // once, before main loop begins
     First,          // very first thing each frame
-    PreUpdate,      // input poll, time tick
+    Input,          // top of frame: event-buffer swap, (later) input state
+    PreUpdate,      // time tick, frame setup
     FixedUpdate,    // runs N times per frame based on accumulator (60 Hz)
     Update,         // main game logic at display rate
     PostUpdate,     // cleanup
@@ -330,11 +340,11 @@ pub enum Stage {
 }
 ```
 
-Per-frame order: `First → PreUpdate → (FixedUpdate × N) → Update → PostUpdate → Render → Last`.
+Per-frame order: `First → Input → PreUpdate → (FixedUpdate × N) → Update → PostUpdate → Render → Last`.
 
 Inside a stage, workloads run in the order their explicit `.after`/`.before` constraints (by label) dictate. Within a workload, systems run in the order their explicit `.after`/`.before` constraints (by handle) dictate; an undeclared order between two conflicting systems is a registration error, not an implicit choice.
 
-Commands flush between every workload. Events double-buffer between `Last` (frame N) and `First` (frame N+1).
+Commands flush between every workload. Events double-buffer via a swap system on `Stage::Input` (pumped first each frame), so a send in frame N is readable in frame N+1.
 
 **Why a closed enum, and why `Stage` not `Schedule`.** There is exactly one frame timeline, so there is one shared set of phases. An enum makes that set typo-proof and exhaustively `match`-able, and encodes the order in its variant declaration order — no runtime ordering structure needed. The name `Stage` keeps `Schedule` free for a possible future runnable system-graph container, and avoids a four-way clash with the `Scheduler` / `StageData` machinery.
 
@@ -808,7 +818,7 @@ Test: ordering respected (incl. a diamond); undeclared conflict errors and `.any
 Test: spawn inside a system → entity visible to next workload.
 
 **Stage 14 — `Events<T>` + readers/writers + `Plugin`/`App` + `FixedUpdate`** (2 days)
-`Events<T>` resource (double-buffered ring). `EventReader<T>` (cursor per system), `EventWriter<T>`. `Plugin` trait. `App::add_plugin`, `add_system`, `add_workload`, `init_resource`, `add_event`, `run`. `FixedUpdate` accumulator.
+`Events<T>` resource (double-buffered). `EventReader<T>` (**revised: stateless read-previous, not a per-system cursor** — see the Event design note above; the cursor is deferred with `Local<T>`), `EventWriter<T>`, swap on `Stage::Input`. `Plugin` trait. `App::add_plugin`, `add_system`, `add_workload`, `init_resource`, `add_event`, `run`. `FixedUpdate` accumulator.
 Test: end-to-end app with 1 plugin, 1 workload, 1 event round-trip; 100 ms simulated time = 6 fixed updates at 60 Hz.
 
 **After Phase 1: the ECS is feature-complete for shipping Spark.**

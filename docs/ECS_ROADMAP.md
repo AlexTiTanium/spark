@@ -127,12 +127,32 @@ do not refile it. Originally filed as #25 and closed as stale.
     order instead of panicking.) System code (`BoxedSystem`, `SystemId`,
     `build_batches`) lives in `workload.rs`, leaving `Schedule` a thin
     cross-workload orchestrator — the module dependency is one-directional.
+  - ✅ **shipped with #36 (epic child 5/6):** the events layer — an `Event`
+    marker trait (`Send + Sync + 'static`) + `#[derive(Event)]`, the
+    double-buffered `Events<T>` resource (`send` / `iter_previous` / `swap`),
+    the stateless `EventReader<T>` (resource read) / `EventWriter<T>`
+    (resource write) `SystemParam`s, the `swap_events::<T>` system, a new
+    `Stage::Input` variant (pumped first each frame, before `PreUpdate`),
+    `Application::add_event::<T>()` (inserts the buffer + registers the swap
+    on `Stage::Input`, **idempotent** against double registration), and the
+    window runner pumping `Stage::Input` first. **Design revised from the
+    original Stage 14 spec:** a cursorless **read-previous** double-buffer
+    (every reader sees *last* frame's events, no per-system cursor) instead
+    of Bevy-style same-frame reads — the `Local<T>`-backed cursor was
+    unbuildable in roadmap order (events precede `Local<T>`), and
+    read-previous removes intra-frame ordering as a determinism variable.
+    *Deferred:* same-frame reads / per-system cursors (gated on `Local<T>`);
+    split-access event params for reader ∥ writer concurrency (M4); a
+    registry-backed `add_event` guard that decouples swap registration from
+    `Events<T>` resource presence (follow-up #48).
   - ⬜ **remaining (#35):** `Plugin::run(&mut World)` + the full per-frame
     run loop. *(The App↔Schedule wiring proper — `Application::schedules`,
     `add_workload(label, stage, |w|)`, and `run_stage` running sequential
     systems, then a flush, then workloads — landed early with the 2026-05-23
-    architecture split, so it is no longer part of #35.)* `Events` (child 5,
-    #36); `FixedUpdate` accumulator (child 6, #37).
+    architecture split, so it is no longer part of #35.)* Sibling children:
+    events ✅ shipped with #36 (above); `FixedUpdate` accumulator (child 6)
+    ✅ shipped with #46 (the runner drives `Stage::FixedUpdate` off a
+    real-time 60 Hz accumulator).
 - *Stage-shape migration:* **✅ shipped with #32.** Replaced the M1–M3
   stand-in (`pub mod stages { pub const STARTUP: &str = "startup"; … }`)
   with the canonical, **closed** `pub enum Stage { Startup, First,

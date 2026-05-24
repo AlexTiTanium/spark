@@ -41,10 +41,12 @@ use crate::{Access, Resource, World};
 /// the concrete value passed to the user's fn, with its lifetime tied
 /// to the world borrow. Today's implementors are [`Res<T>`] (shared
 /// resource borrow), [`ResMut<T>`] (exclusive resource borrow),
-/// [`Query`](crate::Query) (entity iteration), and [`Commands`] (deferred structural
-/// mutation); events and locals land in later milestones. Each also
-/// declares its reads and writes via [`collect_access`], which the
-/// scheduler folds into a per-system [`Access`].
+/// [`Query`](crate::Query) (entity iteration), [`Commands`] (deferred structural
+/// mutation), and [`EventReader`](crate::EventReader) /
+/// [`EventWriter`](crate::EventWriter) (frame-decoupled events); per-system
+/// `Local<T>` state lands in a later milestone. Each also declares its reads
+/// and writes via [`collect_access`], which the scheduler folds into a
+/// per-system [`Access`].
 ///
 /// [`Commands`]: crate::Commands
 /// [`collect_access`]: SystemParam::collect_access

@@ -297,16 +297,20 @@ workload API lives in [`spark-ecs`](../spark_ecs/).
 
 A **stage** is one phase of the frame. The stages are the variants of a
 single closed enum, [`Stage`], and the engine runs them in a fixed
-order. Spark defines eight; four are driven automatically today:
+order. Spark defines nine; six are driven automatically today — one
+during startup, five every frame:
 
 - `Stage::Startup` — fires once during `Application::run`, after every
   `add_startup_system` closure has finished.
 - `Stage::First` — the very first per-frame stage. *(Reserved — defined
   now, nothing drives it yet.)*
-- `Stage::PreUpdate` — input gather, time tick, anything that prepares
-  state the rest of the frame consumes.
-- `Stage::FixedUpdate` — fixed-timestep simulation, meant to run N
-  times per frame off an accumulator. *(Reserved — not yet auto-driven.)*
+- `Stage::Input` — pumped first each frame: swaps the double-buffered
+  event queues registered by `add_event` (and, later, collects input
+  state).
+- `Stage::PreUpdate` — time tick, anything that prepares state the rest
+  of the frame consumes.
+- `Stage::FixedUpdate` — fixed-timestep simulation, run N times per frame
+  off a real-time 60 Hz accumulator.
 - `Stage::Update` — main per-frame stage. The bulk of game logic
   (movement, AI, spawning, despawning) lives here.
 - `Stage::PostUpdate` — cleanup and bookkeeping that should run after
@@ -316,13 +320,14 @@ order. Spark defines eight; four are driven automatically today:
 - `Stage::Last` — the very last per-frame stage. *(Reserved — not yet
   auto-driven.)*
 
-`WindowPlugin`'s runner ticks `PreUpdate → Update → PostUpdate` on every
+`WindowPlugin`'s runner ticks
+`Input → PreUpdate → (FixedUpdate × N) → Update → PostUpdate` on every
 `RedrawRequested`; `Startup` runs once inside `run()`. The reserved
-stages are defined so call sites (and the editor's future stage view)
-can name them — their automatic drivers land with the scheduler. With no
-window driver you can tick any stage yourself with `app.run_stage(...)`
-— useful for headless tests, and the only way the reserved stages run
-today:
+stages (`First`, `Render`, `Last`) are defined so call sites (and the
+editor's future stage view) can name them — their automatic drivers land
+with the scheduler. With no window driver you can tick any stage yourself
+with `app.run_stage(...)` — useful for headless tests, and the only way
+the reserved stages run today:
 
 ```rust
 use spark_core::{Application, Stage};
@@ -361,6 +366,58 @@ sequential system in `Update` is visible to that stage's workloads, to
 > its own internal ordering groups related systems into a *workload* inside
 > a stage (via [`add_workload`](struct.Application.html#method.add_workload)),
 > not by inventing a new global stage.
+
+## Events: cross-system messages
+
+`add_event::<T>()` registers an event type — it inserts a double-buffered
+`Events<T>` queue and a swap system on `Stage::Input`. Systems then send
+with [`EventWriter<T>`](../spark_ecs/struct.EventWriter.html) and read with
+[`EventReader<T>`](../spark_ecs/struct.EventReader.html), never naming each
+other. Because the swap runs at the top of the frame, a reader sees **last
+frame's** sends, and every reader sees the same set exactly once — the
+buffer mechanics live in [`spark-ecs`](../spark_ecs/).
+
+`add_event` is **idempotent**: calling it twice for the same `T` registers
+one buffer and one swap, so two plugins can each declare the same event type
+without one double-swapping it away.
+
+```rust
+use spark_core::{Application, Stage};
+use spark_ecs::{Event, EventReader, EventWriter, ResMut, Resource};
+
+#[derive(Event)]
+struct Damaged { amount: u32 }
+
+#[derive(Resource)]
+struct TotalDamage(u32);
+
+fn deal_damage(mut writer: EventWriter<Damaged>) {
+    writer.send(Damaged { amount: 5 });
+}
+
+fn tally(reader: EventReader<Damaged>, mut total: ResMut<TotalDamage>) {
+    for ev in reader.read() {
+        total.0 += ev.amount;
+    }
+}
+
+let mut app = Application::new();
+app.add_event::<Damaged>()
+    .add_resource(TotalDamage(0))
+    .add_system(Stage::Update, deal_damage)
+    .add_system(Stage::Update, tally);
+
+// Frame 1: deal_damage sends, but the swap hasn't rotated it in, so tally
+// reads nothing yet.
+app.run_stage(Stage::Input);
+app.run_stage(Stage::Update);
+assert_eq!(app.world().resource::<TotalDamage>().0, 0);
+
+// Frame 2: Input swaps frame 1's send into `previous`; tally reads it.
+app.run_stage(Stage::Input);
+app.run_stage(Stage::Update);
+assert_eq!(app.world().resource::<TotalDamage>().0, 5);
+```
 
 ## The `run()` lifecycle
 

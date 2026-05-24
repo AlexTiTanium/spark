@@ -9,6 +9,7 @@ extern crate self as spark_ecs;
 mod access;
 mod commands;
 mod entity;
+mod events;
 mod filter;
 mod query;
 mod scheduler;
@@ -20,6 +21,7 @@ mod world;
 pub use access::{Access, ConflictKind, QueryAccess};
 pub use commands::{CommandQueue, Commands, EntityCommands};
 pub use entity::{Entity, EntityAllocator};
+pub use events::{EventReader, EventWriter, Events, swap_events};
 pub use filter::{And, Or, QueryFilter, With, Without};
 pub use query::{Query, QueryData, ReadOnlyQueryData};
 pub use scheduler::{Schedule, WorkloadOrderBuilder};
@@ -36,8 +38,9 @@ pub use world::{EntityMut, World};
 // re-exported below). They live in different namespaces — type vs macro
 // — so one `use spark_ecs::Component;` pulls in both, exactly like
 // `serde::Serialize`. `WorkloadLabel` follows the same dual-name pattern:
-// the trait lives in `workload`, the derive in `spark-ecs-macros`.
-pub use spark_ecs_macros::{Component, Resource, WorkloadLabel};
+// the trait lives in `workload`, the derive in `spark-ecs-macros`; `Event`
+// pairs the trait below with its derive.
+pub use spark_ecs_macros::{Component, Event, Resource, WorkloadLabel};
 
 /// Marker trait for types that attach to entities as components and are
 /// matched by [`Query`].
@@ -138,3 +141,38 @@ pub trait Component: Send + Sync + 'static {}
 /// }
 /// ```
 pub trait Resource: 'static {}
+
+/// Marker trait for types that flow through an [`Events<T>`] queue and are
+/// read/written with [`EventReader<T>`] / [`EventWriter<T>`].
+///
+/// # Explicit membership, by derive
+///
+/// Like [`Component`] and [`Resource`], a type is an event only if it opts
+/// in with `#[derive(Event)]` — there is no blanket impl.
+///
+/// # Why `Send + Sync + 'static`
+///
+/// The same bound as [`Component`], and for the same reason: event buffers
+/// live in storages the M4 parallel executor will hand to worker threads,
+/// so events must be safe to send and share. Requiring `Send + Sync` now —
+/// when it costs event authors essentially nothing — means M4 needs no
+/// breaking change; relaxing the bound later would instead break every
+/// event type at once. (A [`Resource`] is only `'static`; an `Events<T>`
+/// being stricter than the resource it is stored as is fine.)
+///
+/// # Examples
+///
+/// ```
+/// use spark_ecs::Event;
+///
+/// #[derive(Event)]
+/// struct TileClicked {
+///     x: i32,
+///     y: i32,
+/// }
+///
+/// // Zero-sized "something happened" events are events too.
+/// #[derive(Event)]
+/// struct ConstructionCompleted;
+/// ```
+pub trait Event: Send + Sync + 'static {}

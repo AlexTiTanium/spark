@@ -17,10 +17,10 @@ other engine crate (including `spark-core`) sits on top.
 > **Today vs tomorrow.** Code blocks tagged ` ```rust ` compile and
 > run today — they're doc tests, kept honest by
 > `cargo test --doc -p spark-ecs`. Code blocks tagged ` ```rust,ignore `
-> show types that don't exist yet (e.g. `Event`, `EventReader` /
-> `EventWriter`); they're the spec of what's coming, not what's runnable.
-> (`Commands` and the workload API — `WorkloadLabel` / `Schedule` /
-> `add_workload` — ship today.) `Query`
+> show types that don't exist yet; they're the spec of what's coming,
+> not what's runnable. (`Commands`, the events API — `Event` / `Events`
+> / `EventReader` / `EventWriter` — and the workload API —
+> `WorkloadLabel` / `Schedule` / `add_workload` — ship today.) `Query`
 > exists today for `&T` / `&mut T`, every `&` / `&mut` combination
 > of 2-/3-/4-/5-tuples (including multi-mut at any arity, e.g.
 > `(&mut A, &mut B, &mut C)`), and the filter generic `Query<D, F>`
@@ -1425,7 +1425,7 @@ fn city_growth(
     for (id, mut city) in cities.iter_mut() {
         // ... update city.population based on grid.ratio ...
         if city.population >= 1000 {
-            events.write(CityTierUp { city: id, new_tier: 2 });
+            events.send(CityTierUp { city: id, new_tier: 2 });
         }
         if city.population == 0 {
             cmd.despawn(id);                          // queued, applied later
@@ -1540,7 +1540,7 @@ commands.
 | `commands.spawn((A, B, C))` | Bundle insert — `spawn` with a tuple of components. | ⏳ Bundle PR |
 | `commands.entity(e).insert(c)` / `.remove::<T>()` | Mutate an existing entity. | ⏳ EntityCommands-for-existing-entity PR |
 | `commands.insert_resource(r)` / `.update_resource::<T>(\|t\| …)` | Resource touches via commands. | ⏳ additive |
-| `commands.send_event(e)` | Equivalent to `EventWriter<E>::write(e)`. | ⏳ Events PR |
+| `commands.send_event(e)` | Convenience for `EventWriter<E>::send(e)` from a command. | ⏳ follow-up |
 
 ### Why disjoint cells make this work
 
@@ -1579,28 +1579,64 @@ assert_eq!(Query::<&Position>::from_world(&world).iter().count(), 2);
 ## `Events<T>`: messages between systems
 
 Events are how systems talk without depending on each other. A system
-emits a `CityTierUp` event; any number of systems may read it. The
-emitter and reader never reference each other directly.
+emits a `CityTierUp`; any number of systems read it. Emitter and reader
+never reference each other directly.
 
-```rust,ignore
+`Events<T>` is **double-buffered**: writers push into a `current` buffer,
+readers iterate the `previous` one, and a per-type swap rotates the two
+once per frame. So a reader sees **last frame's** writes — and every
+reader in a frame sees the same set, exactly once, no matter what order
+the systems run in. That one-frame delay buys determinism: nothing a
+reader observes depends on intra-frame scheduling, which is exactly what
+the save/replay mandate needs.
+
+```rust
+use spark_ecs::{Event, Events, EventReader, EventWriter, IntoSystem, ResMut, Resource, World};
+
 #[derive(Event)]
-pub struct CityTierUp { pub city: Entity, pub new_tier: u32 }
+struct CityTierUp { new_tier: u32 }
 
-fn emit_tierups(mut writer: EventWriter<CityTierUp>, /* … */) {
-    writer.write(CityTierUp { city, new_tier: 2 });
+#[derive(Resource)]
+struct Banner { last_tier: u32 }
+
+fn emit_tierups(mut writer: EventWriter<CityTierUp>) {
+    writer.send(CityTierUp { new_tier: 2 });
 }
 
-fn react_to_tierups(mut reader: EventReader<CityTierUp>) {
+fn react_to_tierups(reader: EventReader<CityTierUp>, mut banner: ResMut<Banner>) {
     for ev in reader.read() {
-        // … play sound, animate banner, etc.
+        banner.last_tier = ev.new_tier; // … play sound, animate a banner, etc.
     }
 }
+
+let mut world = World::new();
+world.add_resource(Events::<CityTierUp>::default());
+world.add_resource(Banner { last_tier: 0 });
+
+// Frame N: emit. The write lands in `current`, invisible to readers so far.
+IntoSystem::into_system(emit_tierups)(&world);
+IntoSystem::into_system(react_to_tierups)(&world);
+assert_eq!(world.resource::<Banner>().last_tier, 0); // reader saw nothing yet
+
+// Frame boundary: the swap rotates `current` into `previous`.
+world.resource_mut::<Events<CityTierUp>>().swap();
+
+// Frame N+1: the reader now sees last frame's write.
+IntoSystem::into_system(react_to_tierups)(&world);
+assert_eq!(world.resource::<Banner>().last_tier, 2);
 ```
 
-Events are double-buffered: writes go into the "current" buffer;
-readers see *this frame's* and *last frame's* writes. The buffers
-swap at end of frame. That guarantees a reader registered after the
-event was written still picks it up exactly once.
+You rarely call `swap` by hand. In an app,
+`Application::add_event::<CityTierUp>()` (in `spark-core`) inserts the
+`Events<T>` buffer and registers the swap on `Stage::Input`, pumped first
+each frame by the window runner — so sending is just `EventWriter::send`
+and reading next frame is `EventReader::read`.
+
+`EventReader` is **stateless**: it holds no per-system cursor, so it always
+reads the previous-frame snapshot rather than "resuming where it left off."
+Same-frame reads (a writer and reader communicating *within* one frame)
+would need a per-system cursor (`Local<T>`), which lands later — see
+[`docs/ECS_ROADMAP.md`](../../docs/ECS_ROADMAP.md).
 
 ## Workloads and the schedule
 
@@ -1613,7 +1649,10 @@ and workloads are ordered inside **schedules** (frame-shape slots).
    │   First                                                        │
    │     │                                                          │
    │     ▼                                                          │
-   │   PreUpdate                       ◀── input poll, time tick    │
+   │   Input                           ◀── event swap, input state  │
+   │     │                                                          │
+   │     ▼                                                          │
+   │   PreUpdate                       ◀── time tick                │
    │     │                                                          │
    │     ▼                                                          │
    │   FixedUpdate × N                 ◀── 60 Hz deterministic sim  │
@@ -1631,7 +1670,7 @@ and workloads are ordered inside **schedules** (frame-shape slots).
    │   Last                                                         │
    │                                                                │
    │   Commands flush  ───── between every workload                 │
-   │   Events swap     ───── between Last(N) and First(N+1)         │
+   │   Events swap     ───── Input stage, top of frame              │
    └────────────────────────────────────────────────────────────────┘
 ```
 
@@ -1877,11 +1916,11 @@ workloads, everything stays sequential and deterministic.
 
 ## Derive macros
 
-`#[derive(Component)]`, `#[derive(Resource)]`, and `#[derive(WorkloadLabel)]`
-ship today, from a nested `spark-ecs-macros` crate at `lib/ecs/macros/`.
-Consumers depend only on `spark-ecs`, which re-exports the derives — so
-one `use spark_ecs::Component;` brings in both the trait and its derive.
-`#[derive(Event)]` joins them in a later PR.
+`#[derive(Component)]`, `#[derive(Resource)]`, `#[derive(Event)]`, and
+`#[derive(WorkloadLabel)]` ship today, from a nested `spark-ecs-macros`
+crate at `lib/ecs/macros/`. Consumers depend only on `spark-ecs`, which
+re-exports the derives — so one `use spark_ecs::Component;` brings in both
+the trait and its derive.
 
 `#[derive(WorkloadLabel)]` is the odd one out: it applies to an *enum*,
 not a struct, and generates real method bodies rather than an empty marker
@@ -1904,9 +1943,9 @@ parallel-safety for those is the scheduler's job (keep the touching
 system on the main thread), not a bound enforced at the type level.
 
 ```rust,ignore
-// `ignore`: forward-looking spec — uses `Vec2` (not in spark-ecs yet) and
-// `#[derive(Event)]` (⏳ not shipped). The Component/Resource derives are
-// real today; the rest shows the shape coming next.
+// `ignore`: forward-looking spec — uses `Vec2`, which isn't in spark-ecs
+// yet. Every derive shown here ships today; only the `Vec2` field type
+// keeps this snippet from compiling as a doctest.
 #[derive(Component, Debug, Clone, Copy)]
 pub struct Position(pub Vec2);
 
@@ -1920,7 +1959,7 @@ pub struct PowerNetwork {
     pub ratio: f32,
 }
 
-#[derive(Event)]                 // ⏳ derive not yet shipped
+#[derive(Event)]
 pub struct CityTierUp { pub city: Entity, pub new_tier: u32 }
 ```
 
@@ -1996,20 +2035,24 @@ bumps to 42, the renderer swaps frame buffers.
                               for c4: demand met → population += dt*2
                               for c5: demand met → population += dt*2
                               c5.population now 1001 →
-                                EventWriter<CityTierUp>::write(…)
+                                EventWriter<CityTierUp>::send(…)
      ↓
    [Commands flush]      no commands queued
-   [Events written]      queued for readers in remaining workloads
+   [Events written]      land in `current`; read next frame after the
+                         Stage::Input swap, not this frame
 ```
 
 **Step 4: `Update` workloads** — variable-rate game logic.
-`react_to_tierups` runs an `EventReader<CityTierUp>` over the writes
-from `CityTick`. It schedules a tile-banner animation via `Commands`.
+`react_to_tierups` runs an `EventReader<CityTierUp>`. Readers see the
+**previous** frame's events (the double-buffer swaps at the top of each
+frame, in `Stage::Input`), so this reacts to a tierup emitted on frame 41 —
+the one `CityTick` just emitted on frame 42 is read on frame 43. It
+schedules a tile-banner animation via `Commands`.
 
 ```text
    Workload::Reactions
      ↓
-   react_to_tierups      ◀── reads the CityTierUp emitted above
+   react_to_tierups      ◀── reads last frame's CityTierUp (read-previous)
                               cmd.spawn((TierUpAnimation { city: e5 }, …))
      ↓
    [Commands flush]      new entity e7 appears in storages
@@ -2023,10 +2066,11 @@ removes entities whose lifetime is up.
 `Query<(&Position, &Sprite)>`, writes a `RenderQueue` resource that
 the render plugin submits to the GPU.
 
-**Step 7: `Last`** — frame finalisation. The `Events<CityTierUp>`
-buffer rotates: this frame's writes move to the "previous frame"
-slot, the new "current" slot is empty. A reader registered next
-frame still picks up the tierup once before it falls off.
+**Step 7: `Last`** — frame finalisation. (Event buffers do **not** rotate
+here: the per-type swap runs at the *top* of each frame, in `Stage::Input`.
+So this frame's `CityTierUp` write becomes readable when the next frame's
+`Input` swap rotates `current` into `previous` — a reader then picks it up
+exactly once before it falls off.)
 
 End of frame. Back to Step 1 for frame 43.
 
