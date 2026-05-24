@@ -338,6 +338,22 @@ impl Time {
         self.fixed_delta.as_secs_f32()
     }
 
+    /// The fixed-timestep length in seconds (`f64`). Unlike the variable deltas,
+    /// the fixed step is what a deterministic sim accumulates over many steps, so
+    /// the `f64` form is offered to keep that accumulation precise.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use spark_common::Time;
+    /// let dt = Time::default().fixed_delta_secs_f64();
+    /// assert!((dt - 1.0 / 60.0).abs() < 1e-9);
+    /// ```
+    #[must_use]
+    pub fn fixed_delta_secs_f64(&self) -> f64 {
+        self.fixed_delta.as_secs_f64()
+    }
+
     /// Real time banked but not yet spent in whole fixed steps (debug/inspection).
     ///
     /// # Examples
