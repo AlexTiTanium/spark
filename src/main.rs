@@ -16,8 +16,9 @@
 //!   `physics_step` / `decay_health` / `player_regen` / …); future
 //!   render or input sub-sandboxes plug in next to it.
 //! - `WindowPlugin` opens the OS window and installs the runner that
-//!   ticks `PreUpdate → Update → PostUpdate` on every winit
-//!   `RedrawRequested`.
+//!   ticks `Input → PreUpdate → (FixedUpdate × N) → Update → PostUpdate`
+//!   on every winit `RedrawRequested`, reading
+//!   `Time::fixed_steps_this_frame()` to drive the `FixedUpdate` count.
 //!
 //! Run it: `cargo run -p spark`. Filter logs with `RUST_LOG=spark=info`
 //! (default — startup only) or `RUST_LOG=spark=debug` to see

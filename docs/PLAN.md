@@ -39,7 +39,8 @@ Guiding rule: **build the engine the game needs, not a general-purpose engine.**
 |   ├── ECS_DESIGN.md
 |   ├── UI_DESIGN.md
 ├── lib/
-│   ├── core/                   # math, time, error, log, ids
+│   ├── common/                 # engine-wide shared resources (Time, TimePlugin)
+│   ├── core/                   # plugin harness (Application, Plugin, EngineError, Stage), math, ids
 │   ├── ecs/                    # roll-your-own ECS (see ECS_DESIGN.md)
 │   ├── window/                 # winit integration, surface lifecycle
 │   ├── input/                  # input collection → Resource each frame
@@ -72,7 +73,8 @@ Guiding rule: **build the engine the game needs, not a general-purpose engine.**
 ```
 ecs     ── (stdlib only — deepest foundation crate; no external ECS dep)
 core    ── ecs + (glam, thiserror, tracing)
-window  ── core + (winit)
+common  ── core + ecs                   (engine-wide shared resources: Time)
+window  ── core + common + (winit)
 input   ── core + window + (gilrs)
 render  ── core + window + (wgpu, image)
 assets  ── core + render + (notify)
@@ -178,6 +180,7 @@ There's no ECS read-side yet (no `Res`/`ResMut` system params, no schedule drive
 fn main() -> Result<(), spark_core::EngineError> {
     spark_core::Application::new()
         .add_plugin(LogPlugin)
+        .add_plugin(TimePlugin) // before WindowPlugin: the runner reads Time each frame
         .add_plugin(WindowPlugin {
             config: WindowConfig::default()
                 .with_title("Spark")

@@ -25,8 +25,10 @@
 //! clock is sampled once per frame (one `Instant::now()`), the 60 Hz constants
 //! live in exactly one place, and `spark-window` carries no clock state — it
 //! reads `fixed_steps_this_frame()` and drives the stage. Storing every
-//! duration as a [`Duration`] (integer nanos) keeps accumulation exact: there
-//! is no floating-point drift to correct, and seconds are produced only on read.
+//! duration as a [`Duration`] (integer nanos) keeps the real clock's
+//! accumulation and the fixed accumulator exact — no floating-point drift to
+//! correct; the scaled virtual clock carries the small rounding inherent in
+//! `mul_f32`. Seconds are produced only on read.
 //!
 //! # How NOT to use
 //!
@@ -51,6 +53,13 @@ const FIXED_DELTA: Duration = Duration::from_nanos(1_000_000_000 / 60);
 /// frame to 250 ms caps catch-up at ~15 steps and lets the sim fall behind
 /// gracefully instead.
 const MAX_DELTA: Duration = Duration::from_millis(250);
+
+/// Upper bound on [`Time::scale`]. Keeps `real.mul_f32(scale)` in [`Time::tick`]
+/// from overflowing `Duration` — which would *panic* — on a wild input. Even at
+/// the 250 ms frame clamp, 1e6× is ~69 hours of virtual time banked in a single
+/// frame: astronomically beyond any speed control, yet far below `Duration`'s
+/// ~584-year ceiling. `NaN`/negative inputs clamp to `0` (see [`Time::set_scale`]).
+const MAX_SCALE: f32 = 1_000_000.0;
 
 /// The engine's single clock: real + virtual wall clocks plus the
 /// fixed-timestep accumulator and counters.
@@ -132,7 +141,7 @@ impl Time {
     /// The pure core of the clock — no `Instant`, no globals — so it is unit-
     /// tested directly with synthetic durations. It clamps `raw` to
     /// [`MAX_DELTA`], advances the real clock, derives the virtual clock from
-    /// the effective scale (`0` while paused), banks `raw` into the fixed
+    /// the effective scale (`0` while paused), banks the clamped delta into the fixed
     /// accumulator and drains it in whole [`fixed_delta`](Self::fixed_delta)
     /// chunks (carrying the remainder), and bumps the render-frame counter.
     ///
@@ -377,8 +386,11 @@ impl Time {
         self.scale
     }
 
-    /// Sets the virtual-clock speed multiplier. Negative inputs (and NaN) clamp
-    /// to `0`; pause is preferred over `set_scale(0.0)` as it is reversible.
+    /// Sets the virtual-clock speed multiplier, clamped to `[0, MAX_SCALE]`.
+    /// Negative inputs and `NaN` become `0`; absurdly large inputs cap at
+    /// `MAX_SCALE` (1e6) so [`tick`](Self::tick)'s `mul_f32` can never overflow
+    /// `Duration` and panic. Prefer [`pause`](Self::pause) over `set_scale(0.0)`
+    /// — it is reversible and preserves the chosen speed.
     ///
     /// # Examples
     ///
@@ -387,11 +399,15 @@ impl Time {
     /// let mut time = Time::default();
     /// time.set_scale(2.0);
     /// assert_eq!(time.scale(), 2.0);
-    /// time.set_scale(-1.0);          // clamped
+    /// time.set_scale(-1.0);          // clamped up to 0
     /// assert_eq!(time.scale(), 0.0);
     /// ```
     pub fn set_scale(&mut self, scale: f32) {
-        self.scale = scale.max(0.0);
+        // Fold NaN to 0 first — `f32::clamp` would *propagate* it, and a NaN
+        // scale makes `tick`'s `mul_f32` panic. Then bound to `[0, MAX_SCALE]`
+        // so `+inf` and overflow-inducing values can't reach the multiply.
+        let scale = if scale.is_nan() { 0.0 } else { scale };
+        self.scale = scale.clamp(0.0, MAX_SCALE);
     }
 
     /// Whether the virtual clock is frozen.
@@ -451,9 +467,10 @@ impl Time {
     }
 }
 
-/// First system in [`Stage::PreUpdate`]: samples the wall clock and advances
-/// [`Time`] for this frame, leaving
-/// [`fixed_steps_this_frame`](Time::fixed_steps_this_frame) for the runner.
+/// Samples the wall clock and advances [`Time`] for this frame, leaving
+/// [`fixed_steps_this_frame`](Time::fixed_steps_this_frame) for the runner. Runs
+/// in [`Stage::PreUpdate`]; its position among other `PreUpdate` systems follows
+/// registration order, so [`TimePlugin`] should be registered first (see there).
 ///
 /// Splitting the clock read from [`Time::tick`] keeps the math pure and testable;
 /// the first-frame delta is `0` because `last_instant` starts `None`.
@@ -682,5 +699,63 @@ mod tests {
         t.tick(STEP);
         assert_eq!(t.delta(), Duration::ZERO);
         assert_eq!(t.fixed_steps_this_frame(), 1);
+    }
+
+    #[test]
+    fn set_paused_round_trips() {
+        // `set_paused(false)` is the half `pause()`/`unpause()` don't cover.
+        let mut t = Time::default();
+        t.set_paused(true);
+        t.tick(STEP);
+        assert_eq!(t.delta(), Duration::ZERO);
+        t.set_paused(false);
+        t.tick(STEP);
+        assert_eq!(t.delta(), STEP); // virtual clock resumes
+        assert_eq!(t.elapsed(), STEP); // only the unpaused tick accumulated
+    }
+
+    #[test]
+    fn elapsed_accumulates_across_ticks() {
+        // Guards against an `elapsed`/`real_elapsed` assignment-instead-of-add bug
+        // that a single-tick test would miss.
+        let mut t = Time::default();
+        t.set_scale(2.0);
+        for _ in 0..4 {
+            t.tick(STEP);
+        }
+        assert_eq!(t.real_elapsed(), STEP * 4); // real is exact
+        assert_eq!(t.frame(), 4);
+        // Virtual elapsed is 2× real (within f32 scaling precision).
+        assert!((t.elapsed_secs_f64() - 2.0 * t.real_elapsed_secs_f64()).abs() < 1e-4);
+    }
+
+    #[test]
+    fn scale_persists_across_pause_unpause() {
+        // A bug where `unpause` reset scale to 1.0 would pass every other test.
+        let mut t = Time::default();
+        t.set_scale(3.0);
+        t.pause();
+        t.tick(STEP);
+        assert_eq!(t.delta(), Duration::ZERO);
+        t.unpause();
+        t.tick(STEP);
+        assert!((t.delta_secs() - 3.0 * STEP.as_secs_f32()).abs() < 1e-6);
+        assert!((t.scale() - 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn extreme_scale_clamps_and_does_not_panic() {
+        // `mul_f32` panics on overflow/non-finite; `set_scale` must cap so a wild
+        // input can't bring the engine down on the next tick.
+        let mut t = Time::default();
+        t.set_scale(f32::INFINITY);
+        assert!((t.scale() - super::MAX_SCALE).abs() < 1.0);
+        t.tick(STEP); // would panic without the cap
+        assert_eq!(t.real_delta(), STEP); // real clock untouched
+
+        t.set_scale(f32::NAN);
+        assert!(t.scale().abs() < 1e-6); // NaN → 0
+        t.tick(STEP);
+        assert_eq!(t.delta(), Duration::ZERO);
     }
 }
