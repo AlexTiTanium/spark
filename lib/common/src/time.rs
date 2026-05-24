@@ -45,6 +45,10 @@ use spark_ecs::{ResMut, Resource};
 
 /// Length of one fixed-timestep step: 1/60 s ≈ 16.667 ms. The single
 /// definition of the simulation rate — `spark-window` reads it via `Time`.
+///
+/// `1_000_000_000 / 60` truncates to `16_666_666` ns — 0.666 ns short per step,
+/// so ~40 ns/s is banked back into the accumulator. Negligible for any real
+/// session (≈3.5 ms after a full day), and the carry keeps the rate honest.
 const FIXED_DELTA: Duration = Duration::from_nanos(1_000_000_000 / 60);
 
 /// Upper bound on the real time a single frame may contribute. Without it, a
@@ -85,7 +89,7 @@ const MAX_SCALE: f32 = 1_000_000.0;
 /// time.pause();                      // virtual clock frozen
 /// assert!(time.is_paused());
 /// ```
-#[derive(Resource, Debug, Clone)]
+#[derive(Resource, Debug)]
 pub struct Time {
     /// Virtual (scaled, pausable) delta for this frame.
     delta: Duration,
@@ -210,7 +214,9 @@ impl Time {
         self.elapsed
     }
 
-    /// Virtual elapsed time in seconds (`f32`).
+    /// Virtual elapsed time in seconds (`f32`). For sessions over a few hours,
+    /// prefer [`elapsed_secs_f64`](Self::elapsed_secs_f64) — `f32` loses
+    /// sub-millisecond precision as elapsed grows.
     ///
     /// # Examples
     ///
@@ -277,6 +283,20 @@ impl Time {
         self.real_elapsed
     }
 
+    /// Real elapsed time in seconds (`f32`). Like [`elapsed_secs`](Self::elapsed_secs),
+    /// prefer the `f64` variant for long sessions.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use spark_common::Time;
+    /// assert_eq!(Time::default().real_elapsed_secs(), 0.0);
+    /// ```
+    #[must_use]
+    pub fn real_elapsed_secs(&self) -> f32 {
+        self.real_elapsed.as_secs_f32()
+    }
+
     /// Real elapsed time in seconds (`f64` — long sessions need the precision).
     ///
     /// # Examples
@@ -333,6 +353,10 @@ impl Time {
 
     /// Whole fixed steps this frame banked — the count the window runner reads
     /// to dispatch [`Stage::FixedUpdate`]. A peek, not a consume.
+    ///
+    /// Set once per frame by [`tick`](Self::tick); it does **not** count down as
+    /// the runner dispatches steps. Read from `Update`/`PostUpdate` it means "how
+    /// many sim steps ran this frame", not "steps remaining" inside a burst.
     ///
     /// # Examples
     ///

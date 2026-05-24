@@ -28,3 +28,27 @@ fn plugin_systems_advance_frame_and_fixed_step() {
     assert_eq!(time.fixed_step(), 3);
     assert_eq!(time.frame(), 2); // unchanged by FixedUpdate
 }
+
+/// Mirrors the `spark-window` runner loop: each frame, pump `PreUpdate`, read
+/// `fixed_steps_this_frame()`, then dispatch `FixedUpdate` that many times. Pins
+/// the read-and-dispatch contract — `fixed_step` must equal the running total of
+/// steps the count scheduled, whatever the (real-clock) counts happen to be.
+#[test]
+fn runner_dispatch_loop_keeps_fixed_step_in_sync() {
+    let mut app = Application::new();
+    app.add_plugin(TimePlugin);
+
+    let mut dispatched = 0u64;
+    for _ in 0..3 {
+        app.run_stage(Stage::PreUpdate);
+        let steps = app.world().resource::<Time>().fixed_steps_this_frame();
+        for _ in 0..steps {
+            app.run_stage(Stage::FixedUpdate);
+        }
+        dispatched += u64::from(steps);
+    }
+
+    let time = app.world().resource::<Time>();
+    assert_eq!(time.fixed_step(), dispatched); // every scheduled step was counted
+    assert_eq!(time.frame(), 3);
+}

@@ -148,6 +148,11 @@ assert!((dv - 9.81 / 60.0).abs() < 1e-6);
   `PreUpdate`); `fixed_step()` counts simulation steps (one per `FixedUpdate`
   invocation, which may be 0..N per frame). Index save/replay by `fixed_step()`,
   UI and animation by `frame()`.
+- **`set_scale` clamps; it never errors.** The argument is clamped to
+  `[0, 1_000_000]`: negative values and `NaN` become `0` (paused-equivalent),
+  and absurdly large values (including `f32::INFINITY`) cap at `1_000_000`. The
+  cap exists so the internal `delta × scale` multiply can't overflow and panic —
+  no game needs a million-times speed, so you'll never notice it.
 - **Pause does not stop the simulation (M1).** Pausing freezes the *virtual*
   clock (`delta_secs()` goes to `0`), but real time still banks fixed steps, so
   `Stage::FixedUpdate` keeps running. Making pause/speed gate the simulation
