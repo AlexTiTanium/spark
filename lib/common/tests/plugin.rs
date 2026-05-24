@@ -31,8 +31,10 @@ fn plugin_systems_advance_frame_and_fixed_step() {
 
 /// Mirrors the `spark-window` runner loop: each frame, pump `PreUpdate`, read
 /// `fixed_steps_this_frame()`, then dispatch `FixedUpdate` that many times. Pins
-/// the read-and-dispatch contract — `fixed_step` must equal the running total of
-/// steps the count scheduled, whatever the (real-clock) counts happen to be.
+/// the read-and-dispatch *invariant* — `fixed_step` equals the running total of
+/// steps dispatched. Back-to-back pumps elapse ~no wall time, so the counts are
+/// typically 0 here (the per-step increment for N>0 is covered by the sibling
+/// test and by `Time::tick`'s unit tests); this guards the loop wiring itself.
 #[test]
 fn runner_dispatch_loop_keeps_fixed_step_in_sync() {
     let mut app = Application::new();

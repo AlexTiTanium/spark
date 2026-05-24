@@ -315,7 +315,7 @@ There is no separate "create the material asset, get a handle, attach the handle
 ```rust
 fn pulse_selected(time: Res<Time>, mut q: Query<&mut GlowMaterial, With<Selected>>) {
     for mut glow in &mut q {
-        glow.intensity = 1.0 + (time.elapsed * 4.0).sin() * 0.5;
+        glow.intensity = 1.0 + (time.elapsed_secs() * 4.0).sin() * 0.5;
     }
 }
 ```
