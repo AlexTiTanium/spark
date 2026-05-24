@@ -306,28 +306,30 @@ mechanism (monomorphisation cost doubles per step).
 - *Warnings:* define overwrite semantics — inserting a bundle component an
   entity already has should overwrite (consistent with `World::insert`).
 
-**9. `IntoIterator` for `&Query` / `&mut Query` (loop sugar) — ⬜ not filed.**
-- *Work:* impl `IntoIterator` for `&Query<'_, D>` (yields `D::Item` via
-  `iter_ref`, bound `D: ReadOnlyQueryData`) and for `&mut Query<'_, D>`
-  (yields `D::Item` via `iter`, any `D: QueryData`). Lets systems write
-  `for x in &q` / `for (pos, vel) in &mut q` instead of
-  `for x in q.iter()` / `for (pos, vel) in q.iter_mut()`. Path B is
-  preserved — yielded items carry no `Entity` prefix, exactly matching
-  the existing `iter` / `iter_mut`.
-- *Decision:* **additive, not a replacement.** Keep `iter` / `iter_mut`
-  — they read clearer at call sites and are required for adapter chains
-  (`q.iter().map(…).filter(…)`). `IntoIterator` is sugar for the bare
-  `for` loop only. `IntoIter` is the same `Box<dyn Iterator<Item =
-  D::Item<'a>> + 'a>` the trait methods already return, so no new
-  iterator type is introduced.
-- *Warnings:* **do not** impl `IntoIterator for Query` by value — that
-  consumes the query and drops its `Ref` / `RefMut` storage guards
-  mid-iteration. Only the `&Query` / `&mut Query` reference forms are
-  sound. The `&Query` impl must carry the `D: ReadOnlyQueryData` bound
-  (same gate as `Query::iter`) so a `&mut`-containing shape can't be
-  iterated through a shared borrow. Small, self-contained, non-blocking
-  — can ride along with any query-touching PR rather than waiting in
-  line.
+**9. ~~`IntoIterator` for `&Query` / `&mut Query` (loop sugar)~~ — ✅ shipped with #58.**
+- *Shipped:* `impl IntoIterator for &Query<'_, D, F>` (yields `D::Item`
+  via `iter`, bound `D: ReadOnlyQueryData`) and for
+  `&mut Query<'_, D, F>` (yields `D::Item` via `iter_mut`, any
+  `D: QueryData`). Systems can now write `for x in &q` /
+  `for (pos, vel) in &mut q`. Path B preserved — no `Entity` prefix.
+- *Decision held:* **additive, not a replacement.** `iter` / `iter_mut`
+  stay — they read clearer at call sites and are required for adapter
+  chains (`q.iter().map(…).filter(…)`).
+- *Correction to the draft below:* `IntoIter` is **not** "the same `Box`
+  the trait methods already return" — `iter` / `iter_mut` return
+  `impl Iterator` (an unnameable `Map<Filter<…>>`), so `into_iter` boxes
+  that into `Box<dyn Iterator<Item = D::Item<'q>> + 'q>`. That adds one
+  alloc per loop + one extra indirect call per item over `iter`; the
+  impl rustdoc documents the trade and steers hot paths to `iter`. No
+  named iterator type was introduced (stable Rust can't put `impl Trait`
+  in an associated type). The `'w: 'q` outlives bound proved
+  unnecessary — the compiler infers it from the `&'q Query<'w, …>`
+  reference.
+- *Warning honoured:* no by-value `IntoIterator for Query` — it would
+  drop the `Ref` / `RefMut` storage guards mid-iteration. Only the
+  reference forms ship, and the `&Query` form carries the
+  `D: ReadOnlyQueryData` gate so a `&mut`-containing shape can't be
+  iterated through a shared borrow (compile-fail doctest proves it).
 
 **Then: Render milestone** — does not need parallelism.
 

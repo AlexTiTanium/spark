@@ -1009,6 +1009,114 @@ impl<D: QueryData, F: QueryFilter> SystemParam for Query<'_, D, F> {
     }
 }
 
+/// `for x in &q` — shared-iteration sugar over [`Query::iter`].
+///
+/// `for x in &q` desugars to `IntoIterator::into_iter(&q)`, which calls
+/// [`Query::iter`]. It therefore carries the same [`ReadOnlyQueryData`]
+/// gate: a shape containing `&mut T` is rejected at compile time, never
+/// walked through a shared borrow. Yielded items match `iter` exactly —
+/// the data shape, no `Entity` prefix (path B; see the module docs).
+///
+/// Boxes the iterator — use [`Query::iter`] directly for hot paths or
+/// adapter chains (`q.iter().map(…)`); the crate README covers the cost.
+/// By-value `IntoIterator for Query` is deliberately absent — consuming
+/// the query would drop its [`Ref`] storage guards mid-walk.
+///
+/// # Examples
+///
+/// ```
+/// use spark_ecs::{Component, Query, World};
+///
+/// #[derive(Component)]
+/// struct Position { x: f32, y: f32 }
+/// #[derive(Component)]
+/// struct Velocity { x: f32, y: f32 }
+///
+/// let mut world = World::new();
+/// world.spawn()
+///     .insert(Position { x: 0.0, y: 0.0 })
+///     .insert(Velocity { x: 1.0, y: 0.5 });
+///
+/// let q = Query::<(&Position, &Velocity)>::from_world(&world);
+/// for (pos, vel) in &q {
+///     assert_eq!(pos.x + vel.x, 1.0);
+/// }
+/// ```
+///
+/// The gate is compile-time, mirroring [`Query::iter`]: a `&mut` shape
+/// cannot be iterated through `&q`.
+///
+/// ```compile_fail
+/// use spark_ecs::{Component, Query, World};
+///
+/// // `Position` is a component, so `insert` compiles and the failure
+/// // lands on `for _ in &q` — the `ReadOnlyQueryData` bound this
+/// // example is about.
+/// #[derive(Component)]
+/// struct Position(f32, f32);
+///
+/// let mut world = World::new();
+/// world.spawn().insert(Position(0.0, 0.0));
+/// let q = Query::<&mut Position>::from_world(&world);
+/// // error[E0277]: `&mut Position: ReadOnlyQueryData` is not satisfied.
+/// for _ in &q {}
+/// ```
+impl<'q, 'w, D: ReadOnlyQueryData + 'w, F: QueryFilter> IntoIterator for &'q Query<'w, D, F> {
+    type Item = D::Item<'q>;
+    type IntoIter = Box<dyn Iterator<Item = D::Item<'q>> + 'q>;
+    fn into_iter(self) -> Self::IntoIter {
+        Box::new(self.iter())
+    }
+}
+
+/// `for x in &mut q` — exclusive-iteration sugar over [`Query::iter_mut`].
+///
+/// `for x in &mut q` desugars to `IntoIterator::into_iter(&mut q)`, which
+/// calls [`Query::iter_mut`]. It works for any `D: QueryData`, including
+/// `&mut T` shapes, and yields the data shape directly (path B).
+///
+/// Boxes the iterator — use [`Query::iter_mut`] directly for hot paths or
+/// adapter chains; the crate README covers the cost.
+///
+/// # Examples
+///
+/// ```
+/// use spark_ecs::{Component, Query, World};
+///
+/// #[derive(Component)]
+/// struct Position { x: f32, y: f32 }
+/// #[derive(Component)]
+/// struct Velocity { x: f32, y: f32 }
+///
+/// let mut world = World::new();
+/// world.spawn()
+///     .insert(Position { x: 0.0, y: 0.0 })
+///     .insert(Velocity { x: 1.0, y: 0.5 });
+///
+/// {
+///     let mut q = Query::<(&mut Position, &Velocity)>::from_world(&world);
+///     for (pos, vel) in &mut q {
+///         pos.x += vel.x;
+///         pos.y += vel.y;
+///     }
+/// }
+///
+/// let (x, y) = Query::<&Position>::from_world(&world)
+///     .iter()
+///     .map(|p| (p.x, p.y))
+///     .next()
+///     .unwrap();
+/// assert!((x - 1.0).abs() < f32::EPSILON);
+/// assert!((y - 0.5).abs() < f32::EPSILON);
+/// ```
+impl<'q, 'w, D: QueryData + 'w, F: QueryFilter> IntoIterator for &'q mut Query<'w, D, F> {
+    type Item = D::Item<'q>;
+    type IntoIter = Box<dyn Iterator<Item = D::Item<'q>> + 'q>;
+    fn into_iter(self) -> Self::IntoIter {
+        Box::new(self.iter_mut())
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::items_after_statements,
@@ -1069,6 +1177,36 @@ mod tests {
         {
             let mut q = Query::<&mut Position>::from_world(&world);
             for p in q.iter_mut() {
+                p.0 += 100;
+            }
+        }
+        let after: Vec<i32> = Query::<&Position>::from_world(&world)
+            .iter()
+            .map(|p| p.0)
+            .collect();
+        assert_eq!(after, vec![100, 110, 120]);
+    }
+
+    #[test]
+    fn into_iter_ref_sugar_walks_every_entity() {
+        let (world, _) = world_with_three_movers();
+        let q = Query::<&Position>::from_world(&world);
+        // `for … in &q` is the `IntoIterator for &Query` sugar — same
+        // result as `q.iter()`, just without the explicit call.
+        let mut xs = Vec::new();
+        for p in &q {
+            xs.push(p.0);
+        }
+        assert_eq!(xs, vec![0, 10, 20]);
+    }
+
+    #[test]
+    fn into_iter_mut_sugar_mutates_in_place() {
+        let (world, _) = world_with_three_movers();
+        {
+            let mut q = Query::<&mut Position>::from_world(&world);
+            // `for … in &mut q` is the `IntoIterator for &mut Query` sugar.
+            for p in &mut q {
                 p.0 += 100;
             }
         }
