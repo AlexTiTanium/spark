@@ -97,12 +97,27 @@ The `#[derive(Component)]` macro:
 Singletons. Exactly one per type per world. Anything "engine-global" lives here.
 
 ```rust
+// Lives in `spark-common` (not `spark-ecs`): the engine's single wall-clock +
+// fixed-timestep clock. Durations are stored internally and the `*_secs`
+// accessors convert on read (exact, drift-free). Gameplay reads the scaled
+// "virtual" clock (`delta`/`elapsed`), which honours pause + speed; `real_*`
+// is the unscaled wall clock; `fixed_delta` is the constant 1/60 s used in
+// `FixedUpdate`. The window runner reads `fixed_steps_this_frame()` to dispatch
+// `Stage::FixedUpdate`. See `lib/common/README.md`.
 #[derive(Resource)]
 pub struct Time {
-    pub delta: f32,
-    pub fixed_delta: f32,
-    pub elapsed: f32,
-    pub frame: u64,
+    delta: Duration,              // virtual (scaled, pausable) — default gameplay clock
+    elapsed: Duration,
+    real_delta: Duration,         // unscaled wall clock
+    real_elapsed: Duration,
+    fixed_delta: Duration,        // constant 1/60 s
+    fixed_accumulator: Duration,  // banks real delta, drains in fixed_delta chunks
+    fixed_steps_this_frame: u32,  // read by the window runner
+    frame: u64,                   // render frames (++ in PreUpdate)
+    fixed_step: u64,              // sim steps (++ per FixedUpdate)
+    scale: f32,                   // 1.0 realtime; clamped >= 0
+    paused: bool,
+    last_instant: Option<Instant>,
 }
 
 #[derive(Resource)]

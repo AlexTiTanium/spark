@@ -141,26 +141,26 @@ The loop is built once inside [`run`], then handed to winit via
 `run_app(&mut runner)`. The runner owns the [`Application`] that was
 handed to it from the
 [`set_runner`](../spark_core/struct.Application.html#method.set_runner)
-closure. On every `WindowEvent::RedrawRequested`, the runner banks the
-frame's elapsed real time, then ticks the per-frame stages — swapping
-event buffers in `Input` first, draining the fixed-timestep accumulator
-in the middle — then asks winit for the next redraw:
+closure. On every `WindowEvent::RedrawRequested`, the runner ticks the
+per-frame stages — swapping event buffers in `Input` first, advancing the
+[`Time`](../spark_common/struct.Time.html) clock in `PreUpdate`, then
+reading `Time::fixed_steps_this_frame()` to drive the simulation — then
+asks winit for the next redraw:
 
 ```text
    ┌──────────────────────────────────────────────────────┐
    │  one frame (on RedrawRequested) — TODAY              │
    │                                                      │
-   │   accumulator += min(elapsed, 250ms)                 │  ◀── real-time clock
-   │                                                      │
    │   1. app.run_stage(Stage::Input)                     │  ◀── event-buffer
    │      → flush queued commands                         │       swap
    │                                                      │
-   │   2. app.run_stage(Stage::PreUpdate)                 │  ◀── time tick
-   │      → flush queued commands                         │
+   │   2. app.run_stage(Stage::PreUpdate)                 │  ◀── advance_time:
+   │      → advance_time updates Time                     │       sample clock,
+   │      → flush queued commands                         │       bank accumulator
    │                                                      │
-   │   3. while accumulator ≥ 1/60 s:                     │  ◀── fixed-timestep
-   │        app.run_stage(Stage::FixedUpdate)             │       simulation
-   │        accumulator -= 1/60 s                          │       (0..N steps)
+   │   3. steps = time.fixed_steps_this_frame()           │  ◀── fixed-timestep
+   │      for _ in 0..steps:                              │       simulation
+   │        app.run_stage(Stage::FixedUpdate)             │       (0..N steps)
    │                                                      │
    │   4. app.run_stage(Stage::Update)                    │  ◀── game logic
    │      → flush queued commands                         │       (movement,
@@ -187,21 +187,21 @@ frame's readers see last frame's sends before any other stage touches
 them. It's also the future home of input-state collection (see *Where
 we're headed*) — keeping the swap and input concerns in one named phase.
 
-**The fixed-timestep loop.** `Stage::FixedUpdate` runs off a real-time
-*accumulator*. The policy is a pure helper — `drain_fixed_steps(&mut
-accumulator, frame_dt) -> u32` — that banks each frame's elapsed
-wall-clock time and returns how many whole 1/60 s steps to run, carrying
-the sub-step remainder to the next frame; the runner then ticks
-`Stage::FixedUpdate` exactly that many times. A fast frame runs zero
-steps; a slow one runs several — so simulation advances at a steady 60 Hz
-no matter the display rate, which is what keeps it deterministic across
-hardware. The per-frame time is clamped to 250 ms *inside the helper*
-first: without that cap, one long stall (a breakpoint, a dragged title
-bar) would bank seconds and fire hundreds of catch-up steps at once — the
-"spiral of death". Keeping the math in a `Duration`-only helper (no
-window, no OS clock) is what lets it be unit-tested directly: carry-over
-across frames, the clamp, and the inclusive step boundary all have
-table-driven tests.
+**The fixed-timestep loop.** The 60 Hz accumulator lives in the
+[`Time`](../spark_common/struct.Time.html) resource, not in this crate. In
+`PreUpdate`, `spark-common`'s `advance_time` system samples the wall clock,
+banks the elapsed time, and computes how many whole 1/60 s steps this frame
+covers — carrying the sub-step remainder to the next frame. The runner reads
+that count with `Time::fixed_steps_this_frame()` and ticks `Stage::FixedUpdate`
+exactly that many times. A fast frame runs zero steps; a slow one runs several
+— so simulation advances at a steady 60 Hz no matter the display rate, which is
+what keeps it deterministic across hardware. The per-frame time is clamped to
+250 ms inside `Time::tick` first: without that cap, one long stall (a
+breakpoint, a dragged title bar) would bank seconds and fire hundreds of
+catch-up steps at once — the "spiral of death". Keeping the math in a
+`Duration`-only method (no window, no OS clock) is what lets it be unit-tested
+directly: carry-over across frames, the clamp, and the inclusive step boundary
+all have table-driven tests in `spark-common`.
 
 The control-flow mode is `ControlFlow::Wait`: the OS thread sleeps
 between frames and `window.request_redraw()` is what wakes it for
@@ -268,7 +268,7 @@ Each piece grows into its own crate as the milestones land:
 | Capability | Where it'll live | Milestone |
 |-|-|-|
 | Input collection — drain `KeyboardInput` / `MouseInput` into an `InputState` resource | `spark-input` | M3 follow-up |
-| ✅ `Stage::FixedUpdate` driver + accumulator (60 Hz, deterministic) | `spark-window` runner | **shipped** |
+| ✅ `Stage::FixedUpdate` driver — reads `Time::fixed_steps_this_frame()` (accumulator owned by `Time`) | `spark-window` runner + `spark-common` | **shipped** |
 | `ControlFlow::Wait → Poll` flip + `about_to_wait` driver (relocates `FixedUpdate`) | `spark-window` | M3 follow-up |
 | `Stage::Render` driver that pushes a frame to the GPU | `spark-render` (`wgpu` + WGSL) | M5 |
 | Multi-threaded scheduler | `spark-ecs` parallel executor | M4 |

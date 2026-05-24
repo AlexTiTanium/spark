@@ -1,0 +1,20 @@
+# Engine-wide shared ECS types, packaged as a Plugin. Sits above
+# `spark-core` (for `Plugin`/`Application`/`Stage`) and `spark-ecs` (for
+# `#[derive(Resource)]` + `ResMut`). First inhabitant: the `Time` resource
+# — the engine's single wall-clock + fixed-timestep clock.
+
+[package]
+name = "spark-common"
+version = "0.1.0"
+readme = "README.md"
+
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+spark-core = { path = "../core" }
+spark-ecs = { path = "../ecs" }
