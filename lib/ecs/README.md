@@ -1121,6 +1121,59 @@ world.spawn().insert(Position(0.0, 0.0));
 let _q = Query::<(&mut Position, &Position)>::from_world(&world);
 ```
 
+**`for`-loop sugar — `&q` and `&mut q`.** Both forms also work directly
+in a `for` header, no `.iter()` call needed. `for x in &q` desugars to
+`q.iter()` (so it needs `D: ReadOnlyQueryData` — read-only shapes only),
+and `for x in &mut q` desugars to `q.iter_mut()` (any shape):
+
+```rust
+use spark_ecs::{Component, Query, World};
+
+#[derive(Component)]
+struct Position { x: f32, y: f32 }
+#[derive(Component)]
+struct Velocity { x: f32, y: f32 }
+
+let mut world = World::new();
+world.spawn()
+    .insert(Position { x: 0.0, y: 0.0 })
+    .insert(Velocity { x: 3.0, y: 1.0 });
+
+// Shared — `&q` requires `D: ReadOnlyQueryData` (no `&mut T` in the shape).
+// Scoped so its shared borrows drop before the mut query below (see
+// *Borrow rules*).
+{
+    let q = Query::<(&Position, &Velocity)>::from_world(&world);
+    for (pos, vel) in &q {
+        assert_eq!(pos.x + vel.x, 3.0);
+    }
+}
+
+// Exclusive — `&mut q` works for any shape, including `&mut T`.
+{
+    let mut q = Query::<(&mut Position, &Velocity)>::from_world(&world);
+    for (pos, vel) in &mut q {
+        pos.x += vel.x;
+        pos.y += vel.y;
+    }
+}
+
+let moved = Query::<&Position>::from_world(&world)
+    .iter()
+    .map(|p| p.x)
+    .next()
+    .unwrap();
+assert!((moved - 3.0).abs() < f32::EPSILON);
+```
+
+The sugar boxes the underlying iterator — one heap allocation when the
+loop starts and one extra indirect call per item, both negligible next
+to the work each iteration does. Reach for `.iter()` / `.iter_mut()`
+directly when you need an adapter chain (`q.iter().map(…).sum()`) or the
+very tightest loop. `for x in q` **by value** is intentionally not
+implemented: consuming the query would drop its storage borrow guards
+mid-iteration.
+
 **Borrow rules.** Two `Query<&T>` over the same `T` in one system
 coexist — shared borrows of the same storage stack. Two `Query<&mut T>`
 over the same `T` panic on the second fetch (the `RefCell` rule). Two
