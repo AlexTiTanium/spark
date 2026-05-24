@@ -15,9 +15,11 @@
 //!
 //! The button-bearing systems share a shape via
 //! [`PressSet`](crate::press_set::PressSet): begin the frame (clear edges),
-//! release everything on [`FocusLost`], then apply each event. The held sets
-//! persist across frames; the edges and the scroll delta describe only the
-//! frame just collected.
+//! apply each event, then — on [`FocusLost`] — release everything still held.
+//! The focus wipe runs *last* so a key pressed in the same frame focus is lost
+//! is released too, not left stuck (its key-up goes to whichever window took
+//! focus). The held sets persist across frames; the edges and the scroll delta
+//! describe only the frame just collected.
 
 use spark_ecs::{EventReader, ResMut};
 
@@ -36,14 +38,16 @@ pub(crate) fn collect_keyboard(
     mut kb: ResMut<KeyboardState>,
 ) {
     kb.keys.begin_frame();
-    // `EventReader` reads the frozen `previous` buffer and is stateless, so this
-    // system and `collect_mouse_buttons` each independently observe the same
-    // `FocusLost` — it's a broadcast read, not a consume-once queue.
-    if focus.read().next().is_some() {
-        kb.keys.release_all();
-    }
     for event in keys.read() {
         kb.keys.set(event.key, event.pressed);
+    }
+    // Focus loss wipes everything held — and must run *after* this frame's
+    // presses, so a key pressed in the same frame focus is lost (Alt+Tab) is
+    // released too rather than left stuck (its key-up goes to the window that
+    // took focus, never to us). `EventReader` is a stateless broadcast read, so
+    // `collect_mouse_buttons` independently observes this same `FocusLost`.
+    if focus.read().next().is_some() {
+        kb.keys.release_all();
     }
 }
 
@@ -61,11 +65,12 @@ pub(crate) fn collect_mouse_buttons(
     mut mouse: ResMut<MouseState>,
 ) {
     mouse.buttons.begin_frame();
-    if focus.read().next().is_some() {
-        mouse.buttons.release_all();
-    }
     for event in buttons.read() {
         mouse.buttons.set(event.button, event.pressed);
+    }
+    // After this frame's presses, for the same reason as `collect_keyboard`.
+    if focus.read().next().is_some() {
+        mouse.buttons.release_all();
     }
 }
 
@@ -277,6 +282,51 @@ mod tests {
         assert!(!kb.is_pressed(KeyCode::KeyW) && !kb.is_pressed(KeyCode::KeyA));
         assert!(kb.just_released(KeyCode::KeyW) && kb.just_released(KeyCode::KeyA));
         assert_eq!(kb.pressed().count(), 0);
+    }
+
+    #[test]
+    fn focus_loss_releases_keys_pressed_this_frame() {
+        // The Alt+Tab scenario: a key goes down in the *same* frame focus is
+        // lost. Its key-up will be delivered to the window that took focus, not
+        // us, so it must not stay stuck — the focus wipe has to apply after this
+        // frame's presses, not before.
+        let mut app = app();
+        send(
+            &mut app,
+            KeyboardInput {
+                key: KeyCode::KeyA,
+                pressed: true,
+            },
+        );
+        send(&mut app, FocusLost);
+        tick(&mut app);
+        let kb = keyboard(&app);
+        assert_eq!(
+            kb.pressed().count(),
+            0,
+            "no key may survive a same-frame focus loss"
+        );
+        assert!(kb.just_released(KeyCode::KeyA));
+    }
+
+    #[test]
+    fn focus_loss_releases_buttons_pressed_this_frame() {
+        let mut app = app();
+        send(
+            &mut app,
+            MouseButtonInput {
+                button: MouseButton::Left,
+                pressed: true,
+            },
+        );
+        send(&mut app, FocusLost);
+        tick(&mut app);
+        let mouse = mouse(&app);
+        assert!(
+            !mouse.is_pressed(MouseButton::Left),
+            "button must not survive same-frame focus loss"
+        );
+        assert!(mouse.just_released(MouseButton::Left));
     }
 
     #[test]
