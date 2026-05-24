@@ -1170,10 +1170,19 @@ dependencies = [
 name = "spark"
 version = "0.1.0"
 dependencies = [
+ "spark-common",
  "spark-core",
  "spark-ecs",
  "spark-log",
  "spark-window",
+]
+
+[[package]]
+name = "spark-common"
+version = "0.1.0"
+dependencies = [
+ "spark-core",
+ "spark-ecs",
 ]
 
 [[package]]
@@ -1214,6 +1223,7 @@ dependencies = [
 name = "spark-window"
 version = "0.1.0"
 dependencies = [
+ "spark-common",
  "spark-core",
  "thiserror 2.0.18",
  "tracing",

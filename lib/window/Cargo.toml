@@ -16,6 +16,7 @@ workspace = true
 
 [dependencies]
 spark-core = { path = "../core" }
+spark-common = { path = "../common" }   # Time resource — owns the 60 Hz clock the runner reads
 
 winit.workspace = true
 tracing.workspace = true

@@ -21,7 +21,7 @@ Guiding rule: **build the engine the game needs, not a general-purpose engine.**
 ## Architecture principles
 
 - **ECS-centric.** Everything that lives in the world is either an Entity (many, dynamic) or a Resource (one, unique). No global state outside the ECS.
-- **Modular by Cargo crate.** Each engine module is a separate `lib/*` crate with its own dependencies; the game binary in `src/` sits on top. A new crate is justified by a distinct architectural layer (windowing, rendering, input, ECS, audio) — engine-wide infrastructure (logging, errors, math, time, ids) lives as modules inside `spark-core`, not as standalone crates.
+- **Modular by Cargo crate.** Each engine module is a separate `lib/*` crate with its own dependencies; the game binary in `src/` sits on top. A new crate is justified by a distinct architectural layer (windowing, rendering, input, ECS, audio) **or by infrastructure that carries a `Plugin`/lifecycle**: logging lives in `spark-log`, and shared ECS-facing resources (starting with `Time`) live in `spark-common`. Only pure, dependency-free foundation types with no lifecycle (math, ids, error alias) stay as modules inside `spark-core`.
 - **Plugin-driven from day one.** The binary uses `spark_core::Application` — an ordered list of `Plugin`s plus the boot sequence (logging init, window startup, top-level error type). `add_plugin`, `world`, and `add_resource` are there from M1; what M4+ adds is the ECS read-side — `Res`/`ResMut` system params, the `Workload` machinery, and the schedule driver — so each `Plugin` can register Systems, not just Resources. The API grows additively; nothing gets ripped out.
 - **Separation of concerns.** Process-wide state (`tracing` subscriber, panic hook, root `EngineError`) lives in `spark-core`. Per-layer events and errors live in their layer crate (`WindowError` in `spark-window`, etc.). Libraries never install global state — that's the boot harness's job.
 - **Two clocks.** Fixed-timestep simulation (60 Hz) for game logic; variable-rate render for display.
@@ -39,7 +39,8 @@ Guiding rule: **build the engine the game needs, not a general-purpose engine.**
 |   ├── ECS_DESIGN.md
 |   ├── UI_DESIGN.md
 ├── lib/
-│   ├── core/                   # math, time, error, log, ids
+│   ├── common/                 # engine-wide shared resources (Time, TimePlugin)
+│   ├── core/                   # plugin harness (Application, Plugin, EngineError, Stage), math, ids
 │   ├── ecs/                    # roll-your-own ECS (see ECS_DESIGN.md)
 │   ├── window/                 # winit integration, surface lifecycle
 │   ├── input/                  # input collection → Resource each frame
@@ -72,7 +73,8 @@ Guiding rule: **build the engine the game needs, not a general-purpose engine.**
 ```
 ecs     ── (stdlib only — deepest foundation crate; no external ECS dep)
 core    ── ecs + (glam, thiserror, tracing)
-window  ── core + (winit)
+common  ── core + ecs                   (engine-wide shared resources: Time)
+window  ── core + common + (winit)
 input   ── core + window + (gilrs)
 render  ── core + window + (wgpu, image)
 assets  ── core + render + (notify)
@@ -155,7 +157,7 @@ Game UI is built on vanilla `egui` through M7–M13; the custom stack is compose
 - `Window` — single window handle
 - `RenderContext` — wgpu device, queue, surface
 - `Input` — current frame's keyboard/mouse state
-- `Time` — delta, elapsed, fixed-timestep accumulator, in-game clock
+- `Time` — delta, elapsed, fixed-timestep accumulator, in-game clock (lives in `spark-common`; owns the 60 Hz step count the window runner reads)
 - `AssetServer` — texture/atlas/sound storage
 - `TileMap` — the world grid (terrain, resource deposits)
 - `Settings` / `Config`
@@ -178,6 +180,7 @@ There's no ECS read-side yet (no `Res`/`ResMut` system params, no schedule drive
 fn main() -> Result<(), spark_core::EngineError> {
     spark_core::Application::new()
         .add_plugin(LogPlugin)
+        .add_plugin(TimePlugin) // before WindowPlugin: the runner reads Time each frame
         .add_plugin(WindowPlugin {
             config: WindowConfig::default()
                 .with_title("Spark")

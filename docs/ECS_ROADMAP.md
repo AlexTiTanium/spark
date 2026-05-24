@@ -281,12 +281,17 @@ mut-not-first, and fully-mutable multi-mut). Extending to arity 6+ is
 one line — `impl_all_tuple!(A, B, C, D, E, F);` — with no new
 mechanism (monomorphisation cost doubles per step).
 
-**6. `Time` + `WindowSize` resources — ⬜ not filed.**
-- *Work:* `Time { delta, elapsed }` updated each frame in `EventLoopRunner`;
-  `WindowSize` updated on `WindowEvent::Resized`.
-- *Warnings:* movement must use `delta` — the `#12` demo's `p.x += v.x` is
-  FPS-dependent and is a bug. `WindowSize` as a resource lets render react to
-  resize without the full event system.
+**6. `Time` resource — ✅ shipped with #54 · `WindowSize` — ⬜ not filed.**
+- *Shipped (`Time`):* lives in `spark-common` (not `spark-core`); advanced by the
+  `advance_time` system in `Stage::PreUpdate`, **not** inside `EventLoopRunner`.
+  Owns the wall clock, the scaled/pausable virtual clock, and the 60 Hz
+  fixed-timestep accumulator; the window runner reads `fixed_steps_this_frame()`
+  to dispatch `Stage::FixedUpdate`.
+- *Work (`WindowSize`):* updated on `WindowEvent::Resized`; as a resource it lets
+  render react to resize without the full event system.
+- *Warnings:* movement must use `delta_secs()` (variable) or `fixed_delta_secs()`
+  (sim) — never a raw frame count. The `#12` demo's `p.x += v.x` is FPS-dependent
+  and is a bug.
 
 **7. Component change-tick storage slot — ⬜ not filed.**
 - *Work:* add `changed_tick: Vec<u32>` to `ComponentStorage`, parallel to
