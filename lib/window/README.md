@@ -188,14 +188,20 @@ them. It's also the future home of input-state collection (see *Where
 we're headed*) — keeping the swap and input concerns in one named phase.
 
 **The fixed-timestep loop.** `Stage::FixedUpdate` runs off a real-time
-*accumulator*: each frame banks the elapsed wall-clock time, and the
-`while` loop spends it in whole 1/60 s steps, carrying the remainder to
-the next frame. A fast frame runs zero `FixedUpdate` steps; a slow one
-runs several — so simulation advances at a steady 60 Hz no matter the
-display rate, which is what keeps it deterministic across hardware. The
-per-frame time is clamped to 250 ms first: without that cap, one long
-stall (a breakpoint, a dragged title bar) would bank seconds and fire
-hundreds of catch-up steps at once — the "spiral of death".
+*accumulator*. The policy is a pure helper — `drain_fixed_steps(&mut
+accumulator, frame_dt) -> u32` — that banks each frame's elapsed
+wall-clock time and returns how many whole 1/60 s steps to run, carrying
+the sub-step remainder to the next frame; the runner then ticks
+`Stage::FixedUpdate` exactly that many times. A fast frame runs zero
+steps; a slow one runs several — so simulation advances at a steady 60 Hz
+no matter the display rate, which is what keeps it deterministic across
+hardware. The per-frame time is clamped to 250 ms *inside the helper*
+first: without that cap, one long stall (a breakpoint, a dragged title
+bar) would bank seconds and fire hundreds of catch-up steps at once — the
+"spiral of death". Keeping the math in a `Duration`-only helper (no
+window, no OS clock) is what lets it be unit-tested directly: carry-over
+across frames, the clamp, and the inclusive step boundary all have
+table-driven tests.
 
 The control-flow mode is `ControlFlow::Wait`: the OS thread sleeps
 between frames and `window.request_redraw()` is what wakes it for

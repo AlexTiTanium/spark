@@ -38,6 +38,35 @@ const FIXED_TIMESTEP: Duration = Duration::from_nanos(1_000_000_000 / 60);
 /// catch-up at ~15 steps and lets the sim fall behind gracefully instead.
 const MAX_FRAME_TIME: Duration = Duration::from_millis(250);
 
+/// Banks one frame's elapsed time into `accumulator` and returns how many
+/// whole [`FIXED_TIMESTEP`] steps to run this frame, carrying the remainder.
+///
+/// This is the pure heart of the fixed-timestep loop, factored out of the
+/// `RedrawRequested` handler so it can be tested without a window or an OS
+/// clock. The caller samples the wall clock; this function owns the policy:
+///
+/// 1. Clamp `frame_dt` to [`MAX_FRAME_TIME`] *before* banking, so one long
+///    stall can't bank seconds and trigger a catch-up burst (the spiral of
+///    death — see [`MAX_FRAME_TIME`]).
+/// 2. Add the clamped delta to `accumulator`.
+/// 3. Spend the accumulator in whole [`FIXED_TIMESTEP`] chunks, returning the
+///    count and leaving the sub-step remainder banked for the next call.
+///
+/// Because the step is fixed, the simulation advances at a steady 60 Hz no
+/// matter the display rate — the property that keeps it deterministic across
+/// hardware. The `>=` test is inclusive: an accumulator resting exactly on a
+/// step boundary spends it now, not next frame. Behaviour is pinned by the
+/// table-driven tests in this module (a doctest can't reach a private fn).
+fn drain_fixed_steps(accumulator: &mut Duration, frame_dt: Duration) -> u32 {
+    *accumulator += frame_dt.min(MAX_FRAME_TIME);
+    let mut steps: u32 = 0;
+    while *accumulator >= FIXED_TIMESTEP {
+        *accumulator -= FIXED_TIMESTEP;
+        steps += 1;
+    }
+    steps
+}
+
 /// Opens the window from `config` and drives the OS event loop until
 /// the user closes it, ticking [`Application`]'s per-frame stages on
 /// every `RedrawRequested`. Blocks the calling thread; must run on the
@@ -163,15 +192,15 @@ impl ApplicationHandler for EventLoopRunner {
                 event_loop.exit();
             }
             WindowEvent::RedrawRequested => {
-                // Advance the fixed-timestep clock: bank this frame's real
-                // elapsed time (clamped against the spiral of death), so the
-                // accumulator below can spend it in whole 1/60 s steps.
+                // Sample this frame's real elapsed wall-clock time. The clamp
+                // and accumulator math live in `drain_fixed_steps`; here we
+                // only read the clock and hand it the delta.
                 let now = Instant::now();
-                let frame_time = self.last_frame.map_or(Duration::ZERO, |prev| {
-                    now.saturating_duration_since(prev).min(MAX_FRAME_TIME)
-                });
+                let frame_time = self
+                    .last_frame
+                    .map_or(Duration::ZERO, |prev| now.saturating_duration_since(prev));
                 self.last_frame = Some(now);
-                self.fixed_accumulator += frame_time;
+                let fixed_steps = drain_fixed_steps(&mut self.fixed_accumulator, frame_time);
 
                 // Per-frame tick. Each stage flushes its pending commands at
                 // the end of its run via `Application::run_stage`.
@@ -182,13 +211,13 @@ impl ApplicationHandler for EventLoopRunner {
                 // frame's sends before any other stage touches them.
                 self.app.run_stage(Stage::Input);
                 self.app.run_stage(Stage::PreUpdate);
-                // Fixed-timestep simulation: run one `FixedUpdate` per whole
-                // step the accumulator covers, carrying the remainder into the
-                // next frame. Zero steps on a fast frame, several after a slow
-                // one — but never an unbounded burst, thanks to the clamp.
-                while self.fixed_accumulator >= FIXED_TIMESTEP {
+                // Fixed-timestep simulation: `drain_fixed_steps` already told us
+                // how many whole 1/60 s steps this frame's banked time covers —
+                // run `FixedUpdate` exactly that many times. Zero on a fast
+                // frame, several after a slow one, but never an unbounded burst
+                // (the 250 ms clamp inside the helper caps it at ~15).
+                for _ in 0..fixed_steps {
                     self.app.run_stage(Stage::FixedUpdate);
-                    self.fixed_accumulator -= FIXED_TIMESTEP;
                 }
                 self.app.run_stage(Stage::Update);
                 self.app.run_stage(Stage::PostUpdate);
@@ -224,5 +253,101 @@ impl ApplicationHandler for EventLoopRunner {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::{FIXED_TIMESTEP, MAX_FRAME_TIME, drain_fixed_steps};
+
+    /// A frame worth exactly one fixed step runs one `FixedUpdate` and leaves
+    /// nothing banked.
+    #[test]
+    fn single_step_at_60hz() {
+        let mut acc = Duration::ZERO;
+        assert_eq!(drain_fixed_steps(&mut acc, FIXED_TIMESTEP), 1);
+        assert_eq!(acc, Duration::ZERO);
+    }
+
+    /// A frame shorter than one step runs zero `FixedUpdate`s and banks the
+    /// whole delta for next time.
+    #[test]
+    fn fast_frame_runs_no_steps_and_banks_time() {
+        let mut acc = Duration::ZERO;
+        let dt = Duration::from_millis(8); // ~half a step
+        assert_eq!(drain_fixed_steps(&mut acc, dt), 0);
+        assert_eq!(acc, dt);
+    }
+
+    /// Sub-step deltas accumulate across frames: four 5 ms frames bank 20 ms,
+    /// and the single whole step inside that fires on the fourth frame, with
+    /// the ~3.33 ms remainder carried forward.
+    #[test]
+    fn carry_across_four_fast_frames() {
+        let mut acc = Duration::ZERO;
+        let dt = Duration::from_millis(5);
+        let mut total: u32 = 0;
+        for _ in 0..4 {
+            total += drain_fixed_steps(&mut acc, dt);
+        }
+        assert_eq!(total, 1);
+        // Remainder + the one step we spent == the 20 ms banked (stated as an
+        // addition to dodge `Duration`'s unchecked-subtraction lint).
+        assert_eq!(acc + FIXED_TIMESTEP, Duration::from_millis(20));
+    }
+
+    /// A 50 ms frame covers three whole steps, so it runs three `FixedUpdate`s
+    /// and banks a sub-step remainder.
+    #[test]
+    fn slow_frame_runs_multiple_steps() {
+        let mut acc = Duration::ZERO;
+        assert_eq!(drain_fixed_steps(&mut acc, Duration::from_millis(50)), 3);
+        assert!(acc < FIXED_TIMESTEP);
+    }
+
+    /// Two slow frames in a row keep the accumulator's carry: each 50 ms frame
+    /// runs three steps (six total) and the tiny remainder persists between
+    /// them rather than resetting.
+    #[test]
+    fn two_slow_frames_preserve_carry() {
+        let mut acc = Duration::ZERO;
+        let first = drain_fixed_steps(&mut acc, Duration::from_millis(50));
+        let second = drain_fixed_steps(&mut acc, Duration::from_millis(50));
+        assert_eq!(first, 3);
+        assert_eq!(second, 3);
+        assert!(acc < FIXED_TIMESTEP);
+    }
+
+    /// The spiral-of-death guard: a pathological 1 s frame is clamped to
+    /// `MAX_FRAME_TIME` (250 ms) before banking, capping catch-up at the ~15
+    /// steps that fit in 250 ms instead of the 60 a full second would demand.
+    #[test]
+    fn clamp_caps_pathological_frame() {
+        let mut acc = Duration::ZERO;
+        let steps = drain_fixed_steps(&mut acc, Duration::from_secs(1));
+        let max_steps = MAX_FRAME_TIME.as_nanos() / FIXED_TIMESTEP.as_nanos();
+        assert_eq!(u128::from(steps), max_steps);
+        assert_eq!(steps, 15);
+    }
+
+    /// A zero-length delta (the first frame, before any time has passed) runs
+    /// nothing and banks nothing.
+    #[test]
+    fn zero_elapsed_runs_no_steps() {
+        let mut acc = Duration::ZERO;
+        assert_eq!(drain_fixed_steps(&mut acc, Duration::ZERO), 0);
+        assert_eq!(acc, Duration::ZERO);
+    }
+
+    /// The `>=` boundary is inclusive: an accumulator resting exactly on a step
+    /// boundary spends it now (one step, zero remainder), even with no new time
+    /// this frame.
+    #[test]
+    fn exact_boundary_is_inclusive() {
+        let mut acc = FIXED_TIMESTEP;
+        assert_eq!(drain_fixed_steps(&mut acc, Duration::ZERO), 1);
+        assert_eq!(acc, Duration::ZERO);
     }
 }
