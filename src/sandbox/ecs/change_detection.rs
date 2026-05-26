@@ -96,14 +96,13 @@ mod tests {
 
     #[test]
     fn changed_fires_only_on_write_frames() {
-        // `bump` writes Hp on even frames only; `observe` counts how many
-        // Hp changed since it last ran. Frame 1 also sees the build-time
-        // entities (clocks start at 1, baseline 0) — the documented
-        // first-run-sees-pre-existing behaviour — so the sequence is:
-        //   f1 (odd, no write): 2  (first run sees both pre-existing)
-        //   f2 (even, write):   2
-        //   f3 (odd, no write): 0
-        //   f4 (even, write):   2
+        // `bump` writes Hp only on even frame numbers; `observe` counts how
+        // many Hp changed since it last ran. The expected sequence:
+        //   f1: bump skips (f=1), but the first run still sees both
+        //       pre-existing entities (clocks start at 1, baseline 0) → 2
+        //   f2: bump writes (f=2) → 2
+        //   f3: bump skips (f=3), nothing changed since f2 → 0
+        //   f4: bump writes (f=4) → 2
         fn bump(f: Res<Frame>, mut q: Query<&mut Hp>) {
             if f.0.is_multiple_of(2) {
                 for mut hp in q.iter_mut() {

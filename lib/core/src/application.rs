@@ -20,6 +20,11 @@ type Runner = Box<dyn FnOnce(Application) -> Result<(), EngineError>>;
 /// A sequential system: its erased run closure, its declared [`Access`],
 /// and its per-component change-detection baselines.
 ///
+/// This is the deliberate sequential-path twin of `spark-ecs`'s
+/// `BoxedSystem` (the workload path) — they can't share one concrete type
+/// because they live in separate crates, but both delegate the tick dance
+/// to the same [`World::run_system`](spark_ecs::World::run_system).
+///
 /// The `last_seen` list is the sequential-path mirror of
 /// `BoxedSystem`'s: [`run`](StageSystem::run) hands it to
 /// [`World::run_system`](spark_ecs::World::run_system), which advances the
