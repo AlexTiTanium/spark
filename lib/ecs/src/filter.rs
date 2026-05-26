@@ -16,13 +16,15 @@
 //!
 //! # The matching mechanism
 //!
-//! [`QueryFilter::matches`] takes the entity and a `&World` and returns a
-//! bool. [`Query::iter`](crate::Query::iter) wraps the existing data
-//! driver in a `.filter(…)` that calls it once per candidate entity, so
-//! the filter rides on top of the safe iteration path — no new `unsafe`,
-//! no change to the join machinery. The presence check goes through the
-//! same `World::storage::<T>()` accessor [`QueryData::init_state`] uses,
-//! so the M4 `RefCell → UnsafeCell` swap stays a single chokepoint.
+//! [`Query::iter`](crate::Query::iter) calls [`QueryFilter::init_state`]
+//! once at the start of iteration — taking the storage borrow(s) and tick
+//! baseline(s) the filter needs — then wraps the data driver in a
+//! `.filter(…)` that calls [`QueryFilter::matches`] per candidate entity
+//! against that pre-fetched `&Self::State`. So `World::storage::<T>()` is
+//! borrowed exactly once per iteration, not per entity, and the filter
+//! rides on top of the safe iteration path — no new `unsafe`, no change to
+//! the join machinery. That single `init_state` borrow is the chokepoint
+//! the M4 `RefCell → UnsafeCell` swap will target.
 //!
 //! # Access reporting (and the `With` / `Without` asymmetry)
 //!
@@ -39,8 +41,11 @@
 //!   exclusion. The cost: a nonsensical `Query<&mut T, Without<T>>`
 //!   (mutate `T` on entities that lack `T` — always empty) is *not*
 //!   caught at construction; if `T`'s storage is non-empty it surfaces
-//!   later as the `RefCell`'s "already mutably borrowed" when `matches`
-//!   re-borrows `T` mid-iteration. That query is meaningless anyway.
+//!   when iteration begins — `Without<T>::init_state` takes a shared
+//!   borrow of `T` while the `&mut T` data shape already holds it
+//!   exclusively, so the `RefCell`'s "already mutably borrowed" fires at
+//!   the `iter`/`iter_mut` call, before any entity is visited. That query
+//!   is meaningless anyway.
 //!
 //! [`And`] / [`Or`] report the **union** of their children's access —
 //! conservative on purpose, since the scheduler needs the worst case
@@ -55,8 +60,10 @@
 //! last written (`changed_tick`) and first attached (`added_tick`). A
 //! system carries one *baseline* per component it touches — the tick that
 //! component's clock read when it last ran — which the scheduler parks on
-//! the world via [`World::baseline_for`](crate::World::baseline_for) for
-//! the static [`matches`](QueryFilter::matches) to read.
+//! the world via [`World::baseline_for`](crate::World::baseline_for).
+//! [`init_state`](QueryFilter::init_state) reads it once into the filter's
+//! [`State`](QueryFilter::State); per-entity [`matches`](QueryFilter::matches)
+//! then compares against that, never touching the world directly.
 //!
 //! [`Changed<T>`] passes when `changed_tick > baseline`; [`Added<T>`]
 //! when `added_tick > baseline` (a one-shot, since `added_tick` never

@@ -97,8 +97,10 @@
 //! (always true), so `Query<D>` is shorthand for `Query<D, ()>`. A
 //! filter narrows *which* entities iterate without touching the yielded
 //! item: `Query<&Position, With<Powered>>` still yields `&Position`,
-//! just for fewer entities. Iteration wraps the data driver in a
-//! `.filter(…)` that calls [`QueryFilter::matches`] per candidate, and
+//! just for fewer entities. Iteration calls [`QueryFilter::init_state`]
+//! once (fetching the filter's storage borrows + tick baselines), then
+//! wraps the data driver in a `.filter(…)` that calls
+//! [`QueryFilter::matches`] per candidate against that state;
 //! [`Query::from_world`] folds [`QueryFilter::collect_access`] into the
 //! same self-conflict check the data shape runs. See the [`filter`]
 //! module for the filter set and the access-reporting rules.
@@ -827,9 +829,11 @@ impl_all_tuple!(A, B, C, D, E);
 /// assert!(xs.contains(&99.0));
 /// ```
 pub struct Query<'w, D: QueryData + 'w, F: QueryFilter = ()> {
-    /// Retained for the per-entity filter check during iteration — see
-    /// [`QueryFilter::matches`]. Shared, so it coexists with the
-    /// `Ref`/`RefMut` storage guards in `state`.
+    /// Retained so [`QueryFilter::init_state`] can build the filter's
+    /// state — one borrow of the relevant storages and tick baselines —
+    /// at the start of each `iter` / `iter_mut`, before any entity is
+    /// visited. Shared, so it coexists with the `Ref`/`RefMut` storage
+    /// guards in `state`.
     world: &'w World,
     state: D::State<'w>,
     _filter: PhantomData<F>,
@@ -2114,14 +2118,15 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "already mutably borrowed")]
-    fn query_mut_data_without_same_component_panics_mid_iteration() {
+    fn query_mut_data_without_same_component_panics_at_iter_start() {
         // The flip side of the test above. When `Position`'s storage is
-        // *non-empty*, the `&mut Position` data shape holds a live
-        // `RefMut` on its cell while `Without<Position>::matches`
-        // re-borrows that same cell (shared) per entity — the documented
-        // `RefCell` "already mutably borrowed" panic. The query is nonsensical
-        // (it could never yield anything), but the failure mode is
-        // exactly what `Without`'s no-access decision implies.
+        // *non-empty*, `D::init_state` takes a `RefMut` on its cell inside
+        // `iter_mut`; then `Without<Position>::init_state` tries a shared
+        // borrow of the same cell — the `RefCell` "already mutably
+        // borrowed" panic fires at the `iter_mut` call, before any entity
+        // is visited. The query is nonsensical (it could never yield
+        // anything), but the failure mode is exactly what `Without`'s
+        // no-access decision implies.
         let mut world = World::new();
         world.spawn().insert(Position(1, 1));
         let mut q = Query::<&mut Position, Without<Position>>::from_world(&world);

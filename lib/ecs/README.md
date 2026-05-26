@@ -1494,8 +1494,11 @@ cities-with-names runs in 50 iterations, not 50 × 200.
 | `Query<&A, And<(With<B>, With<C>)>>` | O(\|A\|) + one sparse lookup per filter term per item |
 | `Query<(&A, Option<&T>)>` | O(over the rest of the query) — Option doesn't gate (⏳) |
 
-Filters are essentially free: `With<T>`/`Without<T>` are a single
-sparse lookup per candidate entity, no component fetch.
+Filters are essentially free: each filter borrows its storage **once**
+per iteration (in `init_state`), then `With<T>` / `Without<T>` do a single
+sparse lookup per candidate entity — no component fetch, no repeated
+`RefCell` borrow. `Changed<T>` / `Added<T>` add one tick compare per item
+against a baseline also fetched once.
 
 > **Every `&` / `&mut` combination ships at arity 2-5.** Reads use
 > the storage's safe `get`; mutable non-driver lookups fetch per
