@@ -736,22 +736,13 @@ impl World {
     /// running system — the tick its clock read when that system last
     /// ran, or `0` ("never observed") if it has no recorded baseline.
     ///
-    /// Read by [`Changed<T>`](crate::Changed) / [`Added<T>`](crate::Added);
-    /// the scheduler parks the value via [`run_system`](Self::run_system).
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use spark_ecs::World;
-    ///
-    /// #[derive(spark_ecs::Component)]
-    /// struct Health(u32);
-    ///
-    /// let world = World::new();
-    /// assert_eq!(world.baseline_for::<Health>(), 0); // nothing parked
-    /// ```
+    /// Crate-internal: read by [`Changed<T>`](crate::Changed) /
+    /// [`Added<T>`](crate::Added) during iteration, from the value
+    /// [`run_system`](Self::run_system) parks here for the running system.
+    /// Not part of the public surface — users express change detection
+    /// through the filters, never by reading the baseline directly.
     #[must_use]
-    pub fn baseline_for<T: Component>(&self) -> u32 {
+    pub(crate) fn baseline_for<T: Component>(&self) -> u32 {
         let tid = TypeId::of::<T>();
         self.current_baselines
             .iter()
