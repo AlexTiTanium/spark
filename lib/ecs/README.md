@@ -486,7 +486,8 @@ assert!(world.get::<Health>(e).is_none());
 ### Sparse-set storage: O(1) everything, packed iteration
 
 Each component type gets its own [`ComponentStorage<T>`] — three
-parallel vectors:
+sparse-set vectors, plus two parallel `u32` tick arrays for change
+detection:
 
 ```text
 ComponentStorage<Position> for entities e0, e2, e4 holding Position:
@@ -498,9 +499,11 @@ ComponentStorage<Position> for entities e0, e2, e4 holding Position:
   dense:         [Pos₀,           Pos₂,          Pos₄]
                   dense_idx 0     dense_idx 1    dense_idx 2
   entity_index:  [e0,             e2,            e4]
+  changed_tick:  [t₀,             t₂,            t₄]   ← change detection
+  added_tick:    [a₀,             a₂,            a₄]   ← change detection
 ```
 
-Three vecs, each pulling its weight:
+The three sparse-set vecs, each pulling its weight:
 
 - **`sparse[entity.index]`** points to where in `dense` this entity's
   component lives, or `None`. Mostly empty — that's where "sparse"
@@ -510,6 +513,12 @@ Three vecs, each pulling its weight:
 - **`entity_index`** mirrors `dense` and tells you which entity owns
   each dense slot. Required by swap-remove (next) and by `iter()` so
   it can yield `(Entity, &T)` pairs.
+
+Two more `u32` arrays — `changed_tick` and `added_tick` — ride parallel
+to `dense` (swap-removed in the same lockstep) and power the
+`Changed<T>` / `Added<T>` filters; see *Change detection* above. The
+memory walkthroughs below elide them to keep the sparse-set mechanics in
+focus.
 
 Why three vecs instead of `HashMap<Entity, T>`?
 

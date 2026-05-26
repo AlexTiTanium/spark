@@ -533,9 +533,9 @@ impl World {
                 .downcast_mut::<ComponentStorage<T>>()
                 .expect("TypeId key and stored storage type must agree");
             // A direct mutable borrow is its own change event: advance the
-            // component's clock so the stamp below lands past any prior
-            // observation (the scheduler can't advance for an ad-hoc
-            // `get_mut` outside a declared-write system). `get_mut` stamps.
+            // component's clock first so `get_mut`'s stamp lands past any
+            // prior observation (the scheduler can't advance for an ad-hoc
+            // `get_mut` outside a declared-write system).
             storage.advance_tick();
             storage.get_mut(entity)
         })
