@@ -19,6 +19,10 @@
 //!
 //! ## The three lessons
 //!
+//! Each lesson is a **folder**, and inside it **each example is its own
+//! file** — open one and read the whole thing top-to-bottom: its components,
+//! the systems, what to expect, and why. Start at lesson 1 and work down.
+//!
 //! 1. [`reacting`] — **react only to what changed.** The fundamentals on the
 //!    simplest query (`&T`): `Changed` vs `Added`, why "changed" is relative
 //!    to *the reader*, and why marking is *precise* (a battery bank whose
@@ -36,10 +40,11 @@
 //! This is an ECS, so the two halves live apart on purpose:
 //!
 //! - [`components`] holds the **data** — every `LineLoad`, `FuelLevel`,
-//!   `CityDemand`, … the lessons use. Components are just values (or empty
-//!   "flags"); they contain no logic.
-//! - the three lesson files hold the **behaviour** — the systems that read,
-//!   write, and react.
+//!   `CityDemand`, … the lessons use, in one shared place. Components are
+//!   just values (or empty "flags"); they contain no logic. Each example
+//!   imports the handful it needs.
+//! - the three lesson folders hold the **behaviour** — one file per example,
+//!   each a self-contained system or two.
 //! - [`scoreboard`] is the **honesty check**: a demo that claims to work
 //!   should prove it, so every example counts its matches each frame and
 //!   compares them to the number its doc comment predicts.
