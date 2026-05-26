@@ -121,7 +121,7 @@ struct Position(f32, f32);
 struct Velocity(f32, f32);
 
 fn integrate(time: Res<Time>, mut q: Query<(&mut Position, &Velocity)>) {
-    for (pos, vel) in q.iter_mut() {
+    for (mut pos, vel) in q.iter_mut() {
         pos.0 += vel.0 * time.delta;
     }
 }
@@ -486,7 +486,8 @@ assert!(world.get::<Health>(e).is_none());
 ### Sparse-set storage: O(1) everything, packed iteration
 
 Each component type gets its own [`ComponentStorage<T>`] — three
-parallel vectors:
+sparse-set vectors, plus two parallel `u32` tick arrays for change
+detection:
 
 ```text
 ComponentStorage<Position> for entities e0, e2, e4 holding Position:
@@ -498,9 +499,11 @@ ComponentStorage<Position> for entities e0, e2, e4 holding Position:
   dense:         [Pos₀,           Pos₂,          Pos₄]
                   dense_idx 0     dense_idx 1    dense_idx 2
   entity_index:  [e0,             e2,            e4]
+  changed_tick:  [t₀,             t₂,            t₄]   ← change detection
+  added_tick:    [a₀,             a₂,            a₄]   ← change detection
 ```
 
-Three vecs, each pulling its weight:
+The three sparse-set vecs, each pulling its weight:
 
 - **`sparse[entity.index]`** points to where in `dense` this entity's
   component lives, or `None`. Mostly empty — that's where "sparse"
@@ -510,6 +513,12 @@ Three vecs, each pulling its weight:
 - **`entity_index`** mirrors `dense` and tells you which entity owns
   each dense slot. Required by swap-remove (next) and by `iter()` so
   it can yield `(Entity, &T)` pairs.
+
+Two more `u32` arrays — `changed_tick` and `added_tick` — ride parallel
+to `dense` (swap-removed in the same lockstep) and power the
+`Changed<T>` / `Added<T>` filters; see *Change detection* above. The
+memory walkthroughs below elide them to keep the sparse-set mechanics in
+focus.
 
 Why three vecs instead of `HashMap<Entity, T>`?
 
@@ -993,7 +1002,7 @@ world.spawn().insert(Position { x: 100.0, y: 100.0 });
 {
     // Scope the query so its `RefMut` drops before the read below.
     let mut q = Query::<(&mut Position, &Velocity)>::from_world(&world);
-    for (pos, vel) in q.iter_mut() {
+    for (mut pos, vel) in q.iter_mut() {
         pos.x += vel.x;
         pos.y += vel.y;
     }
@@ -1027,7 +1036,7 @@ struct Position { x: f32, y: f32 }
 struct Velocity { x: f32, y: f32 }
 
 fn integrate(time: Res<Time>, mut q: Query<(&mut Position, &Velocity)>) {
-    for (pos, vel) in q.iter_mut() {
+    for (mut pos, vel) in q.iter_mut() {
         pos.x += vel.x * time.delta;
         pos.y += vel.y * time.delta;
     }
@@ -1081,7 +1090,7 @@ world.spawn()
 
 {
     let mut q = Query::<(&mut Position, &mut Velocity)>::from_world(&world);
-    for (pos, vel) in q.iter_mut() {
+    for (mut pos, mut vel) in q.iter_mut() {
         pos.x += vel.x;
         pos.y += vel.y;
         // Drag on the way out — only possible because Velocity is `&mut` too.
@@ -1152,7 +1161,7 @@ world.spawn()
 // Exclusive — `&mut q` works for any shape, including `&mut T`.
 {
     let mut q = Query::<(&mut Position, &Velocity)>::from_world(&world);
-    for (pos, vel) in &mut q {
+    for (mut pos, vel) in &mut q {
         pos.x += vel.x;
         pos.y += vel.y;
     }
@@ -1317,7 +1326,7 @@ let mut world = World::new();
 world.spawn().insert(Position(0.0, 0.0)).insert(Velocity(1.0, 0.0));
 
 let mut q = Query::<(&mut Position, &Velocity)>::from_world(&world);
-for (pos, vel) in q.iter_mut() {
+for (mut pos, vel) in q.iter_mut() {
     pos.0 += vel.0;
     pos.1 += vel.1;
 }
@@ -1337,7 +1346,7 @@ struct Position(f32, f32);
 struct Velocity(f32, f32);
 
 fn integrate(time: Res<Time>, mut q: Query<(&mut Position, &Velocity)>) {
-    for (pos, vel) in q.iter_mut() {
+    for (mut pos, vel) in q.iter_mut() {
         pos.0 += vel.0 * time.delta;
     }
 }
@@ -1377,6 +1386,62 @@ Query<&Plant, Or<(With<Operational>, With<Backup>)>>
 Query<&Plant, And<(With<Online>, Or<(With<Powered>, With<Backup>)>)>>
 ```
 
+### Change detection: `Changed<T>` / `Added<T>`
+
+✅ **Ships today.** Two filters that ask *when* a component was last
+touched, so a system processes only what moved:
+
+- `Changed<T>` — `T` was **written** since this system last ran (insert,
+  overwrite, or a `&mut T` write). React to edits: redraw an HP bar only
+  when health changed, rebuild a spatial index only when a `Transform`
+  moved.
+- `Added<T>` — `T` was **first attached** since this system last ran. A
+  one-shot: run setup for an entity the frame after it gains a component.
+
+The model is **per-component clocks**. Each component type owns its own
+tick that advances when something writes that type — so `Position`'s clock
+and `Velocity`'s clock move independently. A system remembers, per
+component it touches, the tick it last saw; a write bumps the clock past
+that, and `changed_tick > last_seen` answers "changed since I looked." No
+global frame counter.
+
+```rust
+use spark_ecs::{Changed, Component, Query, World};
+
+#[derive(Component)]
+struct Health(u32); // #[derive(Component)] required for Query to see it
+
+let mut world = World::new();
+world.spawn().insert(Health(100)); // Health's clock advances on insert
+
+// A real system just writes `fn ui(q: Query<&Health, Changed<Health>>)`;
+// the scheduler tracks each system's per-component baseline for you. With
+// no prior run (baseline 0), the fresh insert reads as changed:
+let changed = Query::<&Health, Changed<Health>>::from_world(&world)
+    .iter()
+    .count();
+assert_eq!(changed, 1);
+```
+
+Three properties that fall out of this design — all verified by tests:
+
+- **Precise marking.** `Query<&mut T>` yields a `Mut<T>` guard that marks
+  the component changed only when you actually write through it
+  (`hp.0 -= 1`). Iterate a thousand, write three, and only three are
+  marked — no false positives from merely visiting, joining, or filtering.
+  (The ergonomic cost: write `for mut hp in q.iter_mut()`, like Bevy.)
+- **Pre-existing components are visible on first run.** Clocks start at 1
+  and a fresh system's baseline is 0, so a component attached during setup
+  (before any system ran) is seen by a system's first `Changed`/`Added`.
+- **Command-spawned entities are seen next run.** A `commands.spawn()`
+  flush advances the component's clock, so an `Added<T>` reaction sees it
+  on its next run regardless of system order.
+
+Both filters report a **read** of `T` (like `With<T>`), so
+`Query<&mut T, Changed<T>>` is a self-conflict — read with `&T`, or detect
+a *different* component (`Query<&mut Sprite, Changed<Transform>>`). They
+compose with the combinators: `And<(With<Powered>, Changed<Load>)>`.
+
 ### All variants at a glance
 
 ```rust,ignore
@@ -1397,18 +1462,16 @@ Query<Entity>                                // ⏳ just the ID, no component
 Query<(Entity, &Position, &mut Velocity)>    // ⏳ ID + multiple components
 Query<&Position, ()>                         // ✅ explicit empty filter (the default)
 
-// — FILTERS —                        ✅ filters PR
+// — FILTERS —                        ✅ filters + change-detection PRs
 With<T>            // entity must have T (but don't fetch T)
 Without<T>         // entity must NOT have T
 And<(F1, F2, …)>   // AND of filters (explicit, not a bare tuple)
 Or<(F1, F2, …)>    // OR of filters — nests with And
+Changed<T>         // ✅ T written since this system last ran
+Added<T>           // ✅ T first attached since this system last ran
 
 // — OPTIONAL DATA —                  ⏳ optional-fetch PR (added when needed)
 Option<&T>         // fetch T if present, give None otherwise
-
-// — DEFERRED —                       ⏳ later follow-ups
-Changed<T>         // only entities whose T was mutated this frame
-Added<T>           // only entities that gained T this frame
 
 // — ARITY 6+ —                       follow-up (one line per arity)
 // Add `impl_all_tuple!(A, B, C, D, E, F);` in query.rs to unlock all
@@ -1440,8 +1503,11 @@ cities-with-names runs in 50 iterations, not 50 × 200.
 | `Query<&A, And<(With<B>, With<C>)>>` | O(\|A\|) + one sparse lookup per filter term per item |
 | `Query<(&A, Option<&T>)>` | O(over the rest of the query) — Option doesn't gate (⏳) |
 
-Filters are essentially free: `With<T>`/`Without<T>` are a single
-sparse lookup per candidate entity, no component fetch.
+Filters are essentially free: each filter borrows its storage **once**
+per iteration (in `init_state`), then `With<T>` / `Without<T>` do a single
+sparse lookup per candidate entity — no component fetch, no repeated
+`RefCell` borrow. `Changed<T>` / `Added<T>` add one tick compare per item
+against a baseline also fetched once.
 
 > **Every `&` / `&mut` combination ships at arity 2-5.** Reads use
 > the storage's safe `get`; mutable non-driver lookups fetch per
@@ -1768,12 +1834,12 @@ struct Velocity {
 
 // Touch different components → no conflict → one shared batch.
 fn move_positions(mut q: Query<&mut Position>) {
-    for p in q.iter_mut() {
+    for mut p in q.iter_mut() {
         p.x += 1.0;
     }
 }
 fn move_velocities(mut q: Query<&mut Velocity>) {
-    for v in q.iter_mut() {
+    for mut v in q.iter_mut() {
         v.x += 1.0;
     }
 }
@@ -1826,12 +1892,12 @@ struct Position {
 }
 
 fn apply_gravity(g: Res<Gravity>, mut q: Query<&mut Velocity>) {
-    for v in q.iter_mut() {
+    for mut v in q.iter_mut() {
         v.y -= g.0;
     }
 }
 fn integrate(mut q: Query<(&mut Position, &Velocity)>) {
-    for (p, v) in q.iter_mut() {
+    for (mut p, v) in q.iter_mut() {
         p.y += v.y;
     }
 }

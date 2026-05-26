@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 
 use spark_ecs::{
-    Event, Events, IntoSystem, Resource, Schedule, WorkloadBuilder, WorkloadLabel,
+    Event, Events, IntoSystem, Resource, Schedule, System, WorkloadBuilder, WorkloadLabel,
     WorkloadOrderBuilder, World, swap_events,
 };
 
@@ -14,7 +14,6 @@ use crate::plugin::Plugin;
 use crate::stage::Stage;
 
 type StartupSystem = Box<dyn FnOnce() -> Result<(), EngineError>>;
-type StageSystem = Box<dyn FnMut(&World) + 'static>;
 type Runner = Box<dyn FnOnce(Application) -> Result<(), EngineError>>;
 
 /// Ordered list of plugins' registered work, plus the optional runner
@@ -56,7 +55,10 @@ pub struct Application {
     startup: Vec<StartupSystem>,
     /// **Sequential** systems per stage: run in registration order, in the
     /// calling thread, no batching. Fed by [`add_system`](Self::add_system).
-    stages: HashMap<Stage, Vec<StageSystem>>,
+    /// Each is a [`spark_ecs::System`] — the same record the workload
+    /// scheduler stores — so the sequential path reuses its construction
+    /// and change-detection wiring rather than duplicating it.
+    stages: HashMap<Stage, Vec<System>>,
     /// **Parallel-capable** workloads per stage, lazily created — a stage
     /// with no workloads has no [`Schedule`]. Fed by
     /// [`add_workload`](Self::add_workload).
@@ -310,10 +312,13 @@ impl Application {
     where
         S: IntoSystem<Marker>,
     {
+        // `System::from_system` extracts the access, refuses a
+        // self-conflict, and wires up change detection — the same path the
+        // workload scheduler uses, so the two never drift.
         self.stages
             .entry(stage)
             .or_default()
-            .push(system.into_system());
+            .push(System::from_system(system));
         self
     }
 
@@ -434,7 +439,11 @@ impl Application {
     pub fn run_stage(&mut self, stage: Stage) {
         if let Some(systems) = self.stages.get_mut(&stage) {
             for system in systems {
-                system(&self.world);
+                // Per-component change-detection dance lives in
+                // `System::run` → `World::run_system`. `self.world` and
+                // `self.stages` are disjoint fields, so the borrow checker
+                // lets `system` and `&mut self.world` coexist.
+                system.run(&mut self.world);
             }
         }
         // Apply the sequential systems' queued commands *before* the stage's
@@ -526,8 +535,8 @@ impl Application {
 mod tests {
     use super::*;
     use spark_ecs::{
-        Commands, Component, Event, EventReader, EventWriter, Events, Query, ResMut, Resource,
-        WorkloadLabel,
+        Added, Changed, Commands, Component, Event, EventReader, EventWriter, Events, Query,
+        ResMut, Resource, WorkloadLabel,
     };
 
     #[derive(Resource)]
@@ -846,5 +855,59 @@ mod tests {
         app.run_stage(Stage::FixedUpdate);
         app.run_stage(Stage::FixedUpdate);
         assert_eq!(app.world().resource::<Log>().0, vec![5, 5, 5]);
+    }
+
+    // -------- change detection: the 3 caveats, on the sequential path --------
+
+    #[test]
+    fn run_stage_first_run_sees_build_time_component() {
+        // Caveat #1: a component attached before any system ran (here via
+        // `world_mut()`, standing in for plugin `build()`) is visible to a
+        // system's first `Changed` — per-component clocks start at 1,
+        // insert advances to ≥2, the system's baseline starts at 0.
+        #[derive(Component)]
+        struct Hp(u32);
+        #[derive(Resource)]
+        struct Seen(usize);
+        fn observer(q: Query<&Hp, Changed<Hp>>, mut seen: ResMut<Seen>) {
+            // Read the field too, so it isn't dead.
+            seen.0 = q.iter().filter(|hp| hp.0 > 0).count();
+        }
+        let mut app = Application::new();
+        app.add_resource(Seen(0));
+        app.world_mut().spawn().insert(Hp(100)); // "build time"
+        app.add_system(Stage::Update, observer);
+        app.run_stage(Stage::Update);
+        assert_eq!(app.world().resource::<Seen>().0, 1);
+    }
+
+    #[test]
+    fn run_stage_added_sees_command_spawn_even_when_observer_is_last() {
+        // Caveat #3: a `Commands`-spawned entity (flushed after the
+        // stage's sequential systems) is visible to an `Added` observer on
+        // its next run — even though the observer is the *last* system
+        // before the flush. The flush's insert advances the component's
+        // clock past the observer's last-seen baseline.
+        #[derive(Component)]
+        struct Spawned;
+        #[derive(Resource)]
+        struct Seen(usize);
+        fn spawner(mut commands: Commands) {
+            commands.spawn().insert(Spawned);
+        }
+        fn observer(q: Query<&Spawned, Added<Spawned>>, mut seen: ResMut<Seen>) {
+            seen.0 = q.iter().count();
+        }
+        let mut app = Application::new();
+        app.add_resource(Seen(0));
+        app.add_system(Stage::Update, spawner);
+        app.add_system(Stage::Update, observer); // last system before the flush
+        // Frame 1: observer runs before the spawn is flushed → sees nothing.
+        app.run_stage(Stage::Update);
+        assert_eq!(app.world().resource::<Seen>().0, 0);
+        // Frame 2: the frame-1 spawn (flushed at end of frame 1) is now
+        // visible — the architectural fix for the flush-tick boundary.
+        app.run_stage(Stage::Update);
+        assert_eq!(app.world().resource::<Seen>().0, 1);
     }
 }

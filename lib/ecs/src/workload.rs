@@ -16,7 +16,7 @@
 //!   `#[derive(WorkloadLabel)]` enum hands the scheduler.
 //! - [`WorkloadBuilder`] / [`SystemRef`] — the `|w| { … }` closure API for
 //!   adding systems and ordering them against each other by handle.
-//! - [`BoxedSystem`] / [`SystemId`] — a workload's stored systems and the
+//! - [`System`] / [`SystemId`] — a workload's stored systems and the
 //!   index that names one; [`build_batches`] groups them into
 //!   access-disjoint batches.
 //! - The graph primitives ([`topo_sort`], [`reachable_in`],
@@ -183,28 +183,66 @@ pub struct SystemRef {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SystemId(pub(crate) usize);
 
-/// A registered system: its erased run closure, its declared [`Access`],
-/// and its name (the fn's type path, for diagnostics — overridable with
-/// [`SystemOrderBuilder::label`]).
-pub(crate) struct BoxedSystem {
+/// A registered, runnable system: its erased run closure, its declared
+/// [`Access`], its name (the fn's type path, for diagnostics —
+/// overridable with [`SystemOrderBuilder::label`]), and its per-component
+/// change-detection baselines.
+///
+/// This is the **one** concrete system record both scheduling paths store:
+/// the workload scheduler keeps a `Vec<System>` per workload and batches
+/// them by [`Access`]; `spark_core`'s sequential `Application` keeps a
+/// `Vec<System>` per stage and runs them in registration order. Both build
+/// it with [`from_system`](Self::from_system) and drive it with
+/// [`run`](Self::run), so the access-extraction, self-conflict check, and
+/// change-detection wiring live here once rather than duplicated per
+/// scheduler.
+///
+/// `last_seen` records, per component this system accesses, the tick that
+/// component's clock read when the system last ran. [`run`](Self::run)
+/// feeds it to [`World::run_system`](crate::World::run_system), which
+/// parks it as the [`Changed`](crate::Changed) / [`Added`](crate::Added)
+/// baseline and refreshes it. Starts empty, so a system's first run sees
+/// every prior-existing component (baseline defaults to 0).
+///
+/// # Examples
+///
+/// ```
+/// use spark_ecs::{ResMut, Resource, System, World};
+///
+/// #[derive(Resource)]
+/// struct Score(u32);
+///
+/// let mut world = World::new();
+/// world.add_resource(Score(0));
+///
+/// let mut system = System::from_system(|mut s: ResMut<Score>| s.0 += 1);
+/// system.run(&mut world);
+/// system.run(&mut world);
+/// assert_eq!(world.resource::<Score>().0, 2);
+/// ```
+pub struct System {
     pub(crate) name: &'static str,
     pub(crate) access: Access,
-    pub(crate) run: Box<dyn FnMut(&World) + 'static>,
+    run: Box<dyn FnMut(&World) + 'static>,
+    last_seen: Vec<(TypeId, u32)>,
 }
 
-impl BoxedSystem {
-    /// Boxes a system fn, capturing its name and declared [`Access`].
+impl System {
+    /// Boxes a system fn, capturing its name and declared [`Access`] and
+    /// refusing a self-conflicting system up front.
     ///
-    /// Shared by [`WorkloadBuilder::add_system`] and
-    /// [`add_systems`](WorkloadBuilder::add_systems) so both registration
-    /// paths refuse a self-conflicting system identically.
+    /// The single construction path for every registered system — the
+    /// workload builder ([`WorkloadBuilder::add_system`] /
+    /// [`add_systems`](WorkloadBuilder::add_systems)) and `spark_core`'s
+    /// sequential `Application::add_system` all call it, so each rejects
+    /// conflicts and wires up change detection identically.
     ///
     /// # Panics
     ///
     /// Panics if the system's own parameters conflict — two writing the
     /// same component/resource, or one writing what another reads. See
     /// [`Access::assert_no_self_conflict`].
-    pub(crate) fn from_system<S, Marker>(system: S) -> Self
+    pub fn from_system<S, Marker>(system: S) -> Self
     where
         S: IntoSystem<Marker>,
     {
@@ -214,7 +252,16 @@ impl BoxedSystem {
             name: std::any::type_name::<S>(),
             access,
             run: system.into_system(),
+            last_seen: Vec::new(),
         }
+    }
+
+    /// Runs this system against `world` with per-component change
+    /// detection, updating its `last_seen` baselines. Thin wrapper over
+    /// [`World::run_system`](crate::World::run_system) — the tick dance
+    /// lives there, shared by every caller of this method.
+    pub fn run(&mut self, world: &mut World) {
+        world.run_system(&self.access, &mut self.last_seen, &mut *self.run);
     }
 }
 
@@ -246,7 +293,7 @@ pub(crate) enum EdgeKind {
 pub struct WorkloadData {
     pub(crate) label: WorkloadId,
     pub(crate) name: &'static str,
-    pub(crate) systems: Vec<BoxedSystem>,
+    pub(crate) systems: Vec<System>,
     pub(crate) edges: Vec<(usize, usize)>,
     pub(crate) any_order: Vec<(usize, usize)>,
     pub(crate) aggregate_access: Access,
@@ -270,7 +317,7 @@ impl WorkloadData {
     /// Appends `boxed`, folding its access into the workload aggregate.
     /// The shared sink for [`WorkloadBuilder::add_system`] and
     /// [`add_systems`](WorkloadBuilder::add_systems).
-    pub(crate) fn push(&mut self, boxed: BoxedSystem) -> usize {
+    pub(crate) fn push(&mut self, boxed: System) -> usize {
         self.aggregate_access.extend(&boxed.access);
         let idx = self.systems.len();
         self.systems.push(boxed);
@@ -409,10 +456,7 @@ impl WorkloadBuilder {
     where
         S: IntoSystem<Marker>,
     {
-        let idx = self
-            .data
-            .borrow_mut()
-            .push(BoxedSystem::from_system(system));
+        let idx = self.data.borrow_mut().push(System::from_system(system));
         SystemOrderBuilder {
             system: SystemRef {
                 idx,
@@ -650,7 +694,7 @@ macro_rules! impl_into_system_tuple {
             #[allow(non_snake_case, clippy::allow_attributes)]
             fn register_into(self, data: &mut WorkloadData) {
                 let ($($S,)+) = self;
-                $( data.push(BoxedSystem::from_system($S)); )+
+                $( data.push(System::from_system($S)); )+
             }
         }
     };
@@ -864,10 +908,7 @@ pub(crate) fn cycle_path(leftover: &[usize], edges: &[(usize, usize)]) -> Vec<us
 ///
 /// On a cycle in the explicit edges, with the system-ordering cycle
 /// message (the cycle is genuinely user-declared — conflicts add no edges).
-pub(crate) fn build_batches(
-    systems: &[BoxedSystem],
-    edges: &[(usize, usize)],
-) -> Vec<Vec<SystemId>> {
+pub(crate) fn build_batches(systems: &[System], edges: &[(usize, usize)]) -> Vec<Vec<SystemId>> {
     let n = systems.len();
 
     // Linearise the user-declared order. A cycle here is a real
@@ -1085,11 +1126,11 @@ mod tests {
     /// Boxes a system fn the same way registration does — lets the
     /// batcher's pure-layering tests build inputs directly, without a
     /// `Schedule` (and so without the conflict policy `Schedule` enforces).
-    fn boxed<S, Marker>(system: S) -> BoxedSystem
+    fn boxed<S, Marker>(system: S) -> System
     where
         S: IntoSystem<Marker>,
     {
-        BoxedSystem::from_system(system)
+        System::from_system(system)
     }
 
     // ── build_batches: pure access-conflict layering ───────────────────
@@ -1133,7 +1174,7 @@ mod tests {
     #[test]
     fn component_query_conflicts_feed_batching() {
         fn move_pos(mut q: Query<&mut Position>) {
-            for p in q.iter_mut() {
+            for mut p in q.iter_mut() {
                 p.x += 1.0;
             }
         }
@@ -1151,12 +1192,12 @@ mod tests {
     #[test]
     fn query_over_disjoint_components_shares_a_batch() {
         fn move_pos(mut q: Query<&mut Position>) {
-            for p in q.iter_mut() {
+            for mut p in q.iter_mut() {
                 p.x += 1.0;
             }
         }
         fn move_vel(mut q: Query<&mut Velocity>) {
-            for v in q.iter_mut() {
+            for mut v in q.iter_mut() {
                 v.x += 1.0;
             }
         }
@@ -1173,7 +1214,7 @@ mod tests {
         // the conflicts below would vanish and the batch layout change.
         fn mover(_f: Res<Frame>, mut s: ResMut<Score>, mut q: Query<&mut Position>, _c: Commands) {
             s.value += 1;
-            for p in q.iter_mut() {
+            for mut p in q.iter_mut() {
                 p.x += 1.0;
             }
         }
@@ -1186,7 +1227,7 @@ mod tests {
             let _ = s.value;
         }
         fn moves_vel(mut q: Query<&mut Velocity>) {
-            for v in q.iter_mut() {
+            for mut v in q.iter_mut() {
                 v.x += 1.0;
             }
         }
@@ -1211,7 +1252,7 @@ mod tests {
         // `With<Velocity>` makes `filtered` read Velocity even though it
         // yields only `&Position`, so it conflicts with a Velocity writer.
         fn writes_vel(mut q: Query<&mut Velocity>) {
-            for v in q.iter_mut() {
+            for mut v in q.iter_mut() {
                 v.x += 1.0;
             }
         }

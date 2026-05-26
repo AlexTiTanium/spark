@@ -22,13 +22,13 @@ pub use access::{Access, ConflictKind, QueryAccess};
 pub use commands::{CommandQueue, Commands, EntityCommands};
 pub use entity::{Entity, EntityAllocator};
 pub use events::{EventReader, EventWriter, Events, swap_events};
-pub use filter::{And, Or, QueryFilter, With, Without};
+pub use filter::{Added, And, Changed, Or, QueryFilter, With, Without};
 pub use query::{Query, QueryData, ReadOnlyQueryData};
 pub use scheduler::{Schedule, WorkloadOrderBuilder};
-pub use storage::{AnyStorage, ComponentStorage};
+pub use storage::{AnyStorage, ComponentStorage, Mut};
 pub use system::{IntoSystem, Res, ResMut, SystemParam};
 pub use workload::{
-    IntoSystemTuple, SystemId, SystemOrderBuilder, SystemRef, WorkloadBuilder, WorkloadId,
+    IntoSystemTuple, System, SystemId, SystemOrderBuilder, SystemRef, WorkloadBuilder, WorkloadId,
     WorkloadLabel,
 };
 pub use world::{EntityMut, World};

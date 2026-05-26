@@ -51,7 +51,7 @@ fn build_world(n: i64) -> (World, Vec<Entity>, Vec<Entity>) {
 fn step_once(world: &World) {
     let mut q = Query::<(&mut Position, &Velocity)>::from_world(world);
     // Path B: iter yields just `(&mut Position, &Velocity)` — no entity.
-    for (pos, vel) in q.iter_mut() {
+    for (mut pos, vel) in q.iter_mut() {
         pos.0 += vel.0;
         pos.1 += vel.1;
     }

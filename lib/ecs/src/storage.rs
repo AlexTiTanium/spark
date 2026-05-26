@@ -9,15 +9,98 @@
 //! concrete component types.
 
 use std::any::Any;
+use std::ops::{Deref, DerefMut};
 
 use crate::Component;
 use crate::entity::Entity;
 
-/// Sparse-set storage for one component type.
+/// A change-detecting mutable handle to a component, yielded by
+/// `Query<&mut T>` iteration.
 ///
 /// # Logic
 ///
-/// Three vectors working together:
+/// Wraps the component plus a pointer to its `changed_tick` slot and the
+/// component's current tick. [`Deref`] hands out `&T` and touches nothing;
+/// [`DerefMut`] stamps `changed_tick = current_tick` *before* returning
+/// `&mut T`. A component is therefore marked changed exactly when the
+/// caller takes a `&mut` to it — reading through a `Mut` never marks it.
+///
+/// # Why it works
+///
+/// Change detection must answer "did this system write this component?"
+/// A bare `&mut T` can't tell — the borrow exists whether or not you
+/// assign through it. Routing the `&mut` through `DerefMut` makes the
+/// *act of taking the mutable borrow* the trigger, so marking is precise:
+/// iterate a thousand entities, write three, and only three
+/// `changed_tick`s move. That precision is what lets `Query<&mut A>` drive
+/// a tuple join or sit behind a filter without falsely marking entities
+/// the body never wrote.
+///
+/// # How NOT to use
+///
+/// - Don't bind `let r = &mut *m;` and then *not* write — that still marks
+///   changed, because you took the mutable borrow. Read through `&*m` (or
+///   a plain `Query<&T>`) when you only intend to observe.
+///
+/// # Examples
+///
+/// ```
+/// use spark_ecs::{Component, Query, World};
+///
+/// #[derive(Component)]
+/// struct Health(u32);
+///
+/// let mut world = World::new();
+/// world.spawn().insert(Health(100));
+///
+/// let mut q = Query::<&mut Health>::from_world(&world);
+/// for mut hp in q.iter_mut() {
+///     if hp.0 > 50 {
+///         hp.0 -= 10; // DerefMut here marks the component changed
+///     }
+/// }
+/// ```
+pub struct Mut<'a, T> {
+    value: &'a mut T,
+    changed_tick: &'a mut u32,
+    current_tick: u32,
+}
+
+impl<'a, T> Mut<'a, T> {
+    /// Wraps a component slot and its `changed_tick` for change detection.
+    /// Crate-internal: only the storage / query layers know the slot is
+    /// kept in lockstep with `dense`.
+    pub(crate) fn new(value: &'a mut T, changed_tick: &'a mut u32, current_tick: u32) -> Self {
+        Self {
+            value,
+            changed_tick,
+            current_tick,
+        }
+    }
+}
+
+impl<T> Deref for Mut<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        self.value
+    }
+}
+
+impl<T> DerefMut for Mut<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        // Taking the mutable borrow is the change signal.
+        *self.changed_tick = self.current_tick;
+        self.value
+    }
+}
+
+/// Sparse-set storage for one component type, carrying its **own**
+/// change-detection clock.
+///
+/// # Logic
+///
+/// Five fields. The three sparse-set vectors:
 /// - `sparse[entity.index]` is `Some(dense_idx)` if this entity has the
 ///   component, `None` otherwise. Sparse: most slots are `None`.
 /// - `dense` holds the packed `T` values, in arbitrary order.
@@ -25,17 +108,29 @@ use crate::entity::Entity;
 ///   `dense[dense_idx]`. Required for [`remove`](Self::remove)'s
 ///   swap-remove and for [`iter`](Self::iter) yielding `(Entity, &T)`.
 ///
+/// Plus the per-component change-detection state:
+/// - `changed_tick[dense_idx]` / `added_tick[dense_idx]` — the tick at
+///   which the slot was last written / first attached (parallel to
+///   `dense`).
+/// - `current_tick` — **this component's own clock.** Unlike a single
+///   world tick, each storage advances independently: `Position`'s clock
+///   bumps only when something writes `Position`. [`insert`](Self::insert)
+///   advances it; the scheduler advances it once before a system that
+///   declares a write of `T` (so that system's in-place edits share one
+///   tick). Starts at 1, so `0` is a clean "never observed" baseline.
+///
 /// Operations:
-/// - [`insert`](Self::insert) — extend `sparse` if needed; either
-///   overwrite an existing dense slot or push a new one.
-/// - [`remove`](Self::remove) — swap-remove the doomed dense slot with
-///   the tail; patch the moved entity's `sparse` pointer.
+/// - [`insert`](Self::insert) — advance the clock, then overwrite an
+///   existing dense slot or push a new one, stamping the tick(s).
+/// - [`remove`](Self::remove) — swap-remove the doomed slot across **all
+///   four** parallel arrays; patch the moved entity's `sparse` pointer.
 /// - [`get`](Self::get) — `sparse[index]` → `dense[dense_idx]`, with a
 ///   generation check via `entity_index`.
 ///
 /// # Memory layout
 ///
-/// For three entities `E0`, `E2`, `E4` holding `Position` components:
+/// Three entities `E0`, `E2`, `E4` holding `Position`, last written at
+/// this component's ticks 4 / 4 / 9, first attached at 4 / 4 / 7:
 ///
 /// ```text
 ///   sparse:        [Some(0), None, Some(1), None, Some(2)]
@@ -43,32 +138,43 @@ use crate::entity::Entity;
 ///   dense:         [Pos₀,           Pos₂,         Pos₄]
 ///                  dense_idx 0     dense_idx 1   dense_idx 2
 ///   entity_index:  [E0,             E2,           E4]
+///   changed_tick:  [4,              4,            9]   ← parallel to dense
+///   added_tick:    [4,              4,            7]   ← parallel to dense
+///   current_tick:  9   (this Position storage's own clock)
 /// ```
 ///
-/// Removing `E2` swaps `dense[1]` with `dense[2]`, pops the tail, and
-/// patches `sparse[E4.index] = Some(1)`:
+/// Removing `E2` swap-removes index 1 across all four arrays and patches
+/// `sparse[E4.index] = Some(1)`:
 ///
 /// ```text
 ///   sparse:        [Some(0), None, None, None, Some(1)]
 ///   dense:         [Pos₀,                       Pos₄]
 ///   entity_index:  [E0,                         E4]
+///   changed_tick:  [4,                          9]
+///   added_tick:    [4,                          7]
 /// ```
 ///
-/// `dense` stays packed; one swap + one pop = O(1).
+/// `dense` stays packed; one swap + one pop per array = O(1).
 ///
 /// # Why it works
 ///
 /// The `entity_index` parallel array is what makes swap-remove sound:
 /// after the swap, the entity that *was* at the tail now lives at the
 /// freed dense slot, so its `sparse` pointer must move with it.
-/// Without `entity_index` you'd have to scan `sparse` to find which
-/// entity's pointer to fix — O(n) instead of O(1).
+/// `changed_tick` / `added_tick` ride the same swap so all four stay
+/// aligned by `dense_idx`.
 ///
 /// The generation check inside [`get`](Self::get) / [`remove`](Self::remove)
 /// is what makes stale [`Entity`] handles safe: the sparse pointer
 /// might still be `Some(_)` from a previous tenant of the same slot,
 /// but the `entity_index[dense_idx]` won't match the stale handle, so
 /// the lookup returns `None`.
+///
+/// The per-component clock is the heart of change detection here: a
+/// reader records "I last saw `T` at tick N" and a write bumps `T`'s
+/// clock past N, so `changed_tick > reader_baseline` answers "changed
+/// since I looked" without any global frame counter. The invariant
+/// `changed_tick[i] >= added_tick[i]` always holds.
 ///
 /// # How NOT to use
 ///
@@ -97,6 +203,14 @@ pub struct ComponentStorage<T: Component> {
     sparse: Vec<Option<u32>>,
     dense: Vec<T>,
     entity_index: Vec<Entity>,
+    /// Tick of the last write to each slot. Parallel to `dense`.
+    changed_tick: Vec<u32>,
+    /// Tick each slot's component was first attached. Parallel to `dense`.
+    added_tick: Vec<u32>,
+    /// This component type's own change-detection clock. Advanced by
+    /// [`insert`](Self::insert) and by the scheduler before a writing
+    /// system; never by a read. Starts at 1.
+    current_tick: u32,
 }
 
 impl<T: Component> ComponentStorage<T> {
@@ -160,6 +274,17 @@ impl<T: Component> ComponentStorage<T> {
     /// assert_eq!(replaced.0, 1.0);
     /// ```
     pub fn insert(&mut self, entity: Entity, value: T) -> Option<T> {
+        // A structural attach/overwrite is its own write event: advance
+        // this component's clock so the stamps below land strictly after
+        // any prior observation. This is what makes a `Commands`-spawned
+        // or build-time component visible to a later reader with no
+        // separate flush-tick bookkeeping. (Cost: a bulk spawn of N
+        // entities advances *this* component's clock N times — harmless
+        // for the wrapping `u32`, and per-component so it stays local to
+        // the spawn-heavy type.)
+        self.current_tick = self.current_tick.wrapping_add(1);
+        let tick = self.current_tick;
+
         let slot = entity.index as usize;
         if slot >= self.sparse.len() {
             self.sparse.resize(slot + 1, None);
@@ -167,20 +292,24 @@ impl<T: Component> ComponentStorage<T> {
         if let Some(dense_idx) = self.sparse[slot] {
             let di = dense_idx as usize;
             if self.entity_index[di] == entity {
-                // Genuine overwrite: same entity, same generation.
+                // Genuine overwrite: same entity, same generation. The
+                // value changed but it was not newly added — bump
+                // `changed_tick` only; `added_tick[di]` keeps its stamp.
+                self.changed_tick[di] = tick;
                 return Some(std::mem::replace(&mut self.dense[di], value));
             }
             // Sparse slot holds a previous tenant's dense pointer
             // (stale generation). Through `World` this can't happen —
             // `despawn` cleans every storage. Direct callers of
             // `ComponentStorage` may not, so reuse the dense slot in
-            // place: overwrite both `entity_index[di]` and
-            // `dense[di]`. The dead tenant's data is dropped here;
-            // nothing reachable through any public API was holding
-            // it. Returns `None` because *this* entity had no prior
-            // value.
+            // place: overwrite `entity_index[di]`, `dense[di]`, and both
+            // ticks. This is a *fresh attach* for the new handle, so both
+            // ticks bump. Returns `None` because *this* entity had no
+            // prior value.
             self.entity_index[di] = entity;
             self.dense[di] = value;
+            self.changed_tick[di] = tick;
+            self.added_tick[di] = tick;
             return None;
         }
         let dense_idx = u32::try_from(self.dense.len())
@@ -188,6 +317,8 @@ impl<T: Component> ComponentStorage<T> {
         self.sparse[slot] = Some(dense_idx);
         self.dense.push(value);
         self.entity_index.push(entity);
+        self.changed_tick.push(tick);
+        self.added_tick.push(tick);
         None
     }
 
@@ -260,6 +391,8 @@ impl<T: Component> ComponentStorage<T> {
                 Some(u32::try_from(dense_idx).expect("dense idx fits u32"));
         }
         self.entity_index.swap_remove(dense_idx);
+        self.changed_tick.swap_remove(dense_idx);
+        self.added_tick.swap_remove(dense_idx);
         Some(self.dense.swap_remove(dense_idx))
     }
 
@@ -288,7 +421,15 @@ impl<T: Component> ComponentStorage<T> {
         Some(&self.dense[dense_idx])
     }
 
-    /// Returns a mutable reference to `entity`'s component, or `None`.
+    /// Returns a mutable reference to `entity`'s component, or `None`,
+    /// stamping its `changed_tick` with this component's `current_tick`.
+    ///
+    /// Stamps but does **not** advance the clock; `added_tick` is
+    /// untouched. Whoever wants the stamp to land *past* prior
+    /// observations advances first — [`World::get_mut`](crate::World::get_mut)
+    /// does so before delegating here, and the scheduler advances a
+    /// written component's clock before the system runs (so a
+    /// `Query<&mut T>`'s edits all share one tick).
     ///
     /// # Examples
     ///
@@ -306,6 +447,7 @@ impl<T: Component> ComponentStorage<T> {
     #[must_use]
     pub fn get_mut(&mut self, entity: Entity) -> Option<&mut T> {
         let dense_idx = self.dense_idx_of(entity)?;
+        self.changed_tick[dense_idx] = self.current_tick;
         Some(&mut self.dense[dense_idx])
     }
 
@@ -336,7 +478,15 @@ impl<T: Component> ComponentStorage<T> {
         self.entity_index.iter().copied().zip(self.dense.iter())
     }
 
-    /// Iterates `(Entity, &mut T)` pairs in dense (packed) order.
+    /// Iterates `(Entity, Mut<T>)` pairs in dense (packed) order.
+    ///
+    /// Each component is wrapped in a [`Mut`] change-marker: the entry's
+    /// `changed_tick` moves to this component's `current_tick` only when
+    /// the caller takes a `&mut` through [`DerefMut`](std::ops::DerefMut)
+    /// (writing). Reading through `Deref`, or skipping an entry, marks
+    /// nothing — so marking is precise, with no driver/filter over-marking.
+    /// Does not advance the clock (the scheduler does that once before a
+    /// writing system). `added_tick` is never touched here.
     ///
     /// # Examples
     ///
@@ -350,13 +500,19 @@ impl<T: Component> ComponentStorage<T> {
     /// let e0 = alloc.allocate();
     /// let mut storage = ComponentStorage::<Health>::new();
     /// storage.insert(e0, Health(100));
-    /// for (_, hp) in storage.iter_mut() {
-    ///     hp.0 -= 10;
+    /// for (_, mut hp) in storage.iter_mut() {
+    ///     hp.0 -= 10; // DerefMut marks this entry changed
     /// }
     /// assert_eq!(storage.get(e0).unwrap().0, 90);
     /// ```
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = (Entity, &mut T)> {
-        self.entity_index.iter().copied().zip(self.dense.iter_mut())
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (Entity, Mut<'_, T>)> {
+        let tick = self.current_tick;
+        self.entity_index
+            .iter()
+            .copied()
+            .zip(self.dense.iter_mut())
+            .zip(self.changed_tick.iter_mut())
+            .map(move |((entity, value), changed)| (entity, Mut::new(value, changed, tick)))
     }
 
     /// Returns the number of live components stored.
@@ -415,25 +571,54 @@ impl<T: Component> ComponentStorage<T> {
         self.dense_idx_of(entity).is_some()
     }
 
-    /// Hands out the three parallel arrays for one specific consumer:
-    /// the `DenseMut` random-access view that powers the
-    /// `(D1, &mut T)` tuple impl — i.e. the multi-mut path
-    /// (`Query<(&mut A, &mut B)>`). `dense` mutably, `sparse` and
-    /// `entity_index` by shared reference.
+    /// Hands out the parallel arrays for one specific consumer: the
+    /// `DenseMut` random-access view that powers the `(D1, &mut T)` tuple
+    /// impl — i.e. the multi-mut path (`Query<(&mut A, &mut B)>`).
+    /// `dense` and `changed_tick` mutably, `sparse` and `entity_index` by
+    /// shared reference, plus this component's `current_tick` to stamp.
     ///
     /// Crate-private on purpose — raw access to the parallel arrays
     /// would break every invariant `ComponentStorage` is built around if
     /// called from outside the query layer.
     ///
-    /// `entity_index` lets the random-access view perform the
-    /// generation check before handing out `&mut T`, matching
-    /// [`get`](Self::get) / [`get_mut`](Self::get_mut)'s discipline.
-    pub(crate) fn split_for_join(&mut self) -> (&mut [T], &[Option<u32>], &[Entity]) {
+    /// `entity_index` lets the random-access view perform the generation
+    /// check before handing out `&mut T`. The mutable `changed_tick`
+    /// slice + `current_tick` let `DenseMut::get` build a [`Mut`] that
+    /// marks only the entities the join actually writes.
+    #[allow(clippy::type_complexity)]
+    // Five-element raw split for a single consumer (`DenseMut::new`) that
+    // destructures it immediately with named bindings; a wrapper struct
+    // would be ceremony for one crate-private call site.
+    pub(crate) fn split_for_join(
+        &mut self,
+    ) -> (&mut [T], &mut [u32], &[Option<u32>], &[Entity], u32) {
         (
             self.dense.as_mut_slice(),
+            self.changed_tick.as_mut_slice(),
             self.sparse.as_slice(),
             self.entity_index.as_slice(),
+            self.current_tick,
         )
+    }
+
+    /// The tick at which `entity`'s component was last written, or `None`
+    /// if absent. Read by the [`Changed<T>`](crate::Changed) filter.
+    pub(crate) fn changed_tick_for(&self, entity: Entity) -> Option<u32> {
+        self.dense_idx_of(entity).map(|i| self.changed_tick[i])
+    }
+
+    /// The tick at which `entity`'s component was first attached, or
+    /// `None` if absent. Read by the [`Added<T>`](crate::Added) filter.
+    pub(crate) fn added_tick_for(&self, entity: Entity) -> Option<u32> {
+        self.dense_idx_of(entity).map(|i| self.added_tick[i])
+    }
+
+    /// Overrides this component's clock. Test-only control point for
+    /// driving ticks to specific values; normal operation advances the
+    /// clock via [`insert`](Self::insert) and [`AnyStorage::advance_tick`].
+    #[cfg(test)]
+    pub(crate) fn set_current_tick(&mut self, tick: u32) {
+        self.current_tick = tick;
     }
 
     /// Resolves the dense index for `entity` if it's live in this
@@ -454,6 +639,11 @@ impl<T: Component> Default for ComponentStorage<T> {
             sparse: Vec::new(),
             dense: Vec::new(),
             entity_index: Vec::new(),
+            changed_tick: Vec::new(),
+            added_tick: Vec::new(),
+            // Starts at 1 so the `0` baseline means "never observed" and
+            // a component's first write is always visible.
+            current_tick: 1,
         }
     }
 }
@@ -493,6 +683,17 @@ pub trait AnyStorage: Any {
     /// otherwise. Called by [`World::despawn`](crate::World::despawn)
     /// for every registered storage.
     fn remove_entity(&mut self, entity: Entity);
+
+    /// Advances this component's change-detection clock by one tick.
+    /// Type-erased so the [`World`](crate::World) can advance a storage
+    /// it knows only by [`TypeId`](std::any::TypeId) — used before a
+    /// system that declares a write of this component.
+    fn advance_tick(&mut self);
+
+    /// This component's current change-detection tick. Type-erased so the
+    /// [`World`](crate::World) can record a system's "last seen" baseline
+    /// without naming the concrete component type.
+    fn current_tick(&self) -> u32;
 }
 
 impl<T: Component> AnyStorage for ComponentStorage<T> {
@@ -506,6 +707,14 @@ impl<T: Component> AnyStorage for ComponentStorage<T> {
 
     fn remove_entity(&mut self, entity: Entity) {
         let _ = self.remove(entity);
+    }
+
+    fn advance_tick(&mut self) {
+        self.current_tick = self.current_tick.wrapping_add(1);
+    }
+
+    fn current_tick(&self) -> u32 {
+        self.current_tick
     }
 }
 
@@ -679,5 +888,116 @@ mod tests {
             .downcast_ref::<ComponentStorage<Pos>>()
             .unwrap();
         assert!(typed.is_empty());
+    }
+
+    // -------- change detection: per-component clock --------
+
+    #[test]
+    fn fresh_insert_advances_clock_and_stamps_both_ticks() {
+        // A new storage starts at tick 1; the first insert advances to 2
+        // and stamps both ticks (so a baseline-0 reader sees it).
+        let (_alloc, entities) = alloc_n(1);
+        let mut storage = ComponentStorage::<Pos>::new();
+        assert_eq!(storage.current_tick(), 1);
+        storage.insert(entities[0], Pos(1, 2));
+        assert_eq!(storage.current_tick(), 2);
+        assert_eq!(storage.changed_tick_for(entities[0]), Some(2));
+        assert_eq!(storage.added_tick_for(entities[0]), Some(2));
+    }
+
+    #[test]
+    fn overwrite_advances_and_bumps_changed_not_added() {
+        let (_alloc, entities) = alloc_n(1);
+        let mut storage = ComponentStorage::<Pos>::new();
+        storage.insert(entities[0], Pos(1, 2)); // added = changed = 2
+        storage.insert(entities[0], Pos(3, 4)); // advance → 3, changed only
+        assert_eq!(storage.changed_tick_for(entities[0]), Some(3));
+        assert_eq!(storage.added_tick_for(entities[0]), Some(2));
+    }
+
+    #[test]
+    fn iter_mut_marks_only_written_entries() {
+        // The `Mut` deref-marker is precise: iterating without writing
+        // marks nothing; writing one entry marks only that one.
+        let (_alloc, entities) = alloc_n(2);
+        let mut storage = ComponentStorage::<Pos>::new();
+        storage.insert(entities[0], Pos(0, 0)); // changed = 2
+        storage.insert(entities[1], Pos(1, 1)); // changed = 3
+
+        storage.set_current_tick(10);
+        for (_, _) in storage.iter_mut() {} // consume, mutate nothing
+        assert_eq!(storage.changed_tick_for(entities[0]), Some(2)); // untouched
+        assert_eq!(storage.changed_tick_for(entities[1]), Some(3)); // untouched
+
+        for (entity, mut pos) in storage.iter_mut() {
+            if entity == entities[0] {
+                pos.0 += 1; // DerefMut marks entity 0 only
+            }
+        }
+        assert_eq!(storage.changed_tick_for(entities[0]), Some(10)); // written
+        assert_eq!(storage.changed_tick_for(entities[1]), Some(3)); // skipped
+    }
+
+    #[test]
+    fn remove_keeps_all_four_arrays_aligned() {
+        // Distinct ticks per entity so a misaligned swap_remove would show
+        // up as a tick travelling to the wrong dense slot.
+        let (_alloc, entities) = alloc_n(3);
+        let mut storage = ComponentStorage::<Pos>::new();
+        for (i, &e) in entities.iter().enumerate() {
+            storage.insert(e, Pos(i32::try_from(i).unwrap(), 0));
+        }
+        // Inserts advanced the clock to 2, 3, 4 → those are the added ticks.
+        storage.remove(entities[0]); // tail (entity 2) slides into slot 0
+        assert_eq!(storage.added_tick_for(entities[2]), Some(4));
+        assert_eq!(storage.changed_tick_for(entities[2]), Some(4));
+        assert_eq!(storage.added_tick_for(entities[1]), Some(3));
+        assert!(storage.changed_tick_for(entities[0]).is_none());
+    }
+
+    #[test]
+    fn changed_never_below_added_invariant() {
+        let (_alloc, entities) = alloc_n(1);
+        let mut storage = ComponentStorage::<Pos>::new();
+        let ok = |s: &ComponentStorage<Pos>, e| {
+            s.changed_tick_for(e).unwrap() >= s.added_tick_for(e).unwrap()
+        };
+        storage.insert(entities[0], Pos(0, 0));
+        assert!(ok(&storage, entities[0]));
+        storage.insert(entities[0], Pos(1, 1)); // overwrite
+        assert!(ok(&storage, entities[0]));
+        storage.set_current_tick(9);
+        let _ = storage.get_mut(entities[0]); // stamp changed
+        assert!(ok(&storage, entities[0]));
+    }
+
+    #[test]
+    fn any_storage_advance_and_read_clock() {
+        // The type-erased clock controls the `World` uses by `TypeId`.
+        let mut storage = ComponentStorage::<Pos>::new();
+        assert_eq!(AnyStorage::current_tick(&storage), 1);
+        AnyStorage::advance_tick(&mut storage);
+        assert_eq!(AnyStorage::current_tick(&storage), 2);
+    }
+
+    #[test]
+    fn tick_wraparound_does_not_panic_and_is_a_clean_false_negative() {
+        // The clock is `wrapping_add`. Driving it across `u32::MAX` must
+        // not panic; the documented cost is a single false-negative frame
+        // at the wrap boundary (a write stamped post-wrap reads as "older"
+        // than a pre-wrap baseline). This pins that behaviour.
+        let (_alloc, entities) = alloc_n(1);
+        let mut storage = ComponentStorage::<Pos>::new();
+        storage.set_current_tick(u32::MAX - 1);
+        storage.insert(entities[0], Pos(1, 2)); // advance → u32::MAX, stamp both
+        assert_eq!(storage.changed_tick_for(entities[0]), Some(u32::MAX));
+        storage.insert(entities[0], Pos(3, 4)); // overwrite: advance wraps → 0
+        assert_eq!(storage.current_tick(), 0);
+        assert_eq!(storage.changed_tick_for(entities[0]), Some(0)); // wrapped, no panic
+
+        // A reader whose baseline was the pre-wrap tick misses this write:
+        // 0 > (u32::MAX - 1) is false. Documented wraparound false-negative.
+        let baseline = u32::MAX - 1;
+        assert!(storage.changed_tick_for(entities[0]).unwrap() <= baseline);
     }
 }

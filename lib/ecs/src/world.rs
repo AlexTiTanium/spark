@@ -19,6 +19,7 @@ use std::any::{Any, TypeId};
 use std::cell::{Ref, RefCell, RefMut};
 use std::collections::HashMap;
 
+use crate::access::Access;
 use crate::commands::CommandQueue;
 use crate::entity::{Entity, EntityAllocator};
 use crate::storage::{AnyStorage, ComponentStorage};
@@ -89,6 +90,14 @@ pub struct World {
     // drained by [`flush_commands`](Self::flush_commands) at the stage
     // boundary. One cell per `World`; the queue itself is FIFO.
     pending: RefCell<CommandQueue>,
+    // The change-detection baseline for the *currently running* system:
+    // one `(TypeId, tick)` per component it accesses, the tick that
+    // component's clock read when the system last ran. Parked here by
+    // [`run_system`](Self::run_system) (O(1) `mem::swap`) so the static
+    // [`QueryFilter::matches`](crate::QueryFilter::matches), which sees only
+    // `&World`, can read it. Each component carries its own clock, so the
+    // baseline is per-component, not a single number. Empty between runs.
+    current_baselines: Vec<(TypeId, u32)>,
 }
 
 impl World {
@@ -485,6 +494,13 @@ impl World {
     /// Returns an exclusive borrow of `entity`'s component of type
     /// `T`, or `None` if absent (or `entity` is stale).
     ///
+    /// This is the ad-hoc single-entity mutate path; it advances `T`'s
+    /// change-detection clock and marks the component changed. The
+    /// systems/`Query<&mut T>` path is the normal one — reach for this
+    /// from setup or tests. (Two `get_mut`s of the same `T` back-to-back
+    /// before any system runs each advance the clock, so a reader
+    /// observes both as changed on its next run, then nothing after.)
+    ///
     /// # Panics
     ///
     /// Panics if any other borrow of this storage is live (the
@@ -512,10 +528,16 @@ impl World {
         }
         let cell = self.components.get(&TypeId::of::<T>())?;
         RefMut::filter_map(cell.borrow_mut(), |b| {
-            b.as_any_mut()
+            let storage = b
+                .as_any_mut()
                 .downcast_mut::<ComponentStorage<T>>()
-                .expect("TypeId key and stored storage type must agree")
-                .get_mut(entity)
+                .expect("TypeId key and stored storage type must agree");
+            // A direct mutable borrow is its own change event: advance the
+            // component's clock first so `get_mut`'s stamp lands past any
+            // prior observation (the scheduler can't advance for an ad-hoc
+            // `get_mut` outside a declared-write system).
+            storage.advance_tick();
+            storage.get_mut(entity)
         })
         .ok()
     }
@@ -641,6 +663,119 @@ impl World {
                 .expect("TypeId key and stored storage type must agree")
         }))
     }
+
+    // -------- per-component change detection --------
+
+    /// Runs one system, driving the per-component change-detection dance,
+    /// and updates `last_seen` (the system's per-component baselines) in
+    /// place.
+    ///
+    /// Both scheduling paths funnel through here so the dance lives once:
+    ///
+    /// 1. **Advance** the clock of every component the system *writes*, so
+    ///    its in-place edits stamp a tick strictly past any prior look.
+    /// 2. **Copy** `last_seen` into the world so the system's `Changed<T>`
+    ///    / `Added<T>` filters — which see only `&World` — can read their
+    ///    baselines via [`baseline_for`](Self::baseline_for).
+    /// 3. **Run** the system.
+    /// 4. **Record** each accessed component's current clock into
+    ///    `last_seen`, so next run compares against where this one left off.
+    ///
+    /// `Commands` writes are *not* advanced here (a `Commands` system
+    /// declares no specific access); [`ComponentStorage::insert`] advances
+    /// each touched component's clock itself at flush time.
+    ///
+    /// # Caller contract
+    ///
+    /// `last_seen` is the system's **durable** per-component baseline — the
+    /// caller must keep the same `Vec` across runs of the same logical
+    /// system (both schedulers hold it in the system's struct). Passing a
+    /// fresh `Vec::new()` each call resets every baseline to 0, so every
+    /// component that was ever written looks `Changed` on every run.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use spark_ecs::{Access, World};
+    ///
+    /// let mut world = World::new();
+    /// // The scheduler keeps `last_seen` in the system's struct across
+    /// // runs; here it touches nothing, so its contents never matter.
+    /// let mut last_seen = Vec::new();
+    /// let access = Access::new();
+    /// world.run_system(&access, &mut last_seen, &mut |_w: &World| {});
+    /// ```
+    pub fn run_system(
+        &mut self,
+        access: &Access,
+        last_seen: &mut Vec<(TypeId, u32)>,
+        run: &mut dyn FnMut(&World),
+    ) {
+        for tid in access.component_write_ids() {
+            self.advance_storage_tick(tid);
+        }
+        // Copy the system's baselines into the world so the static filter
+        // `matches` can read them during the run via `baseline_for`. A
+        // *copy* (not a move) is what keeps this panic-safe: if `run`
+        // panics, `last_seen` is still intact and `current_baselines` is
+        // mere scratch — the next `run_system` clears and refills it
+        // before anything reads it.
+        self.current_baselines.clear();
+        self.current_baselines.extend_from_slice(last_seen);
+        run(&*self);
+        // Record where each accessed component's clock landed, straight
+        // into the caller's durable `last_seen`, so next run sees the delta.
+        for tid in access.component_access_ids() {
+            let tick = self.storage_tick(tid).unwrap_or(0);
+            upsert_baseline(last_seen, tid, tick);
+        }
+        self.current_baselines.clear();
+    }
+
+    /// The change-detection baseline for component `T` in the currently
+    /// running system — the tick its clock read when that system last
+    /// ran, or `0` ("never observed") if it has no recorded baseline.
+    ///
+    /// Crate-internal: read by [`Changed<T>`](crate::Changed) /
+    /// [`Added<T>`](crate::Added) during iteration, from the value
+    /// [`run_system`](Self::run_system) parks here for the running system.
+    /// Not part of the public surface — users express change detection
+    /// through the filters, never by reading the baseline directly.
+    #[must_use]
+    pub(crate) fn baseline_for<T: Component>(&self) -> u32 {
+        let tid = TypeId::of::<T>();
+        self.current_baselines
+            .iter()
+            .find(|(id, _)| *id == tid)
+            .map_or(0, |(_, tick)| *tick)
+    }
+
+    /// Advances the clock of the storage keyed by `tid`, if it exists.
+    /// No-op when no entity has ever held that component.
+    fn advance_storage_tick(&mut self, tid: TypeId) {
+        if let Some(cell) = self.components.get_mut(&tid) {
+            cell.get_mut().advance_tick();
+        }
+    }
+
+    /// The current clock of the storage keyed by `tid`, or `None` if no
+    /// such storage exists yet.
+    fn storage_tick(&self, tid: TypeId) -> Option<u32> {
+        self.components
+            .get(&tid)
+            .map(|cell| cell.borrow().current_tick())
+    }
+}
+
+/// Inserts or updates `(tid, tick)` in a small per-system baseline list.
+/// Linear scan — the list holds one entry per component a system touches
+/// (a handful), so a `Vec` beats a `HashMap` on both speed and footprint.
+fn upsert_baseline(baselines: &mut Vec<(TypeId, u32)>, tid: TypeId, tick: u32) {
+    if let Some(slot) = baselines.iter_mut().find(|(id, _)| *id == tid) {
+        slot.1 = tick;
+    } else {
+        baselines.push((tid, tick));
+    }
 }
 
 /// Chainable builder returned by [`World::spawn`].
@@ -722,7 +857,7 @@ impl EntityMut<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Component, Resource};
+    use crate::{Added, Changed, Component, Query, Resource};
     use std::cell::Cell;
     use std::rc::Rc;
 
@@ -948,5 +1083,176 @@ mod tests {
         assert_eq!(world.resource::<A>().0, 7);
         assert!(world.is_alive(e));
         assert!(world.get::<Position>(e).is_some());
+    }
+
+    // -------- change detection: per-component clocks --------
+
+    #[test]
+    fn per_component_clocks_advance_independently() {
+        // The signature of this architecture: each component type owns its
+        // own clock. Writing Position never moves Velocity's clock.
+        let mut world = World::new();
+        world.spawn().insert(Position(0, 0)); // Position clock 1→2
+        world
+            .spawn()
+            .insert(Position(1, 1)) // Position 2→3
+            .insert(Velocity(1, 1)); // Velocity 1→2
+        assert_eq!(world.storage::<Position>().unwrap().current_tick(), 3);
+        assert_eq!(world.storage::<Velocity>().unwrap().current_tick(), 2);
+    }
+
+    #[test]
+    fn run_system_advances_only_written_component_clocks() {
+        let mut world = World::new();
+        world.spawn().insert(Position(0, 0)).insert(Velocity(1, 1));
+        let pos_before = world.storage::<Position>().unwrap().current_tick();
+        let vel_before = world.storage::<Velocity>().unwrap().current_tick();
+
+        // A system that writes Position and reads Velocity.
+        let mut access = Access::new();
+        access.components_mut().add_write::<Position>();
+        access.components_mut().add_read::<Velocity>();
+        let mut last_seen = Vec::new();
+        world.run_system(&access, &mut last_seen, &mut |_w| {});
+
+        // Only the written component's clock advanced.
+        assert_eq!(
+            world.storage::<Position>().unwrap().current_tick(),
+            pos_before + 1
+        );
+        assert_eq!(
+            world.storage::<Velocity>().unwrap().current_tick(),
+            vel_before
+        );
+    }
+
+    #[test]
+    fn build_time_insert_visible_to_first_run_then_quiesces() {
+        // Caveat #1 fixed architecturally: a component attached before any
+        // system ran is visible to a system's first `Changed`/`Added`
+        // (clock starts at 1, insert advances to ≥2; a fresh system's
+        // baseline is 0). The next run, having observed it, sees nothing.
+        let mut world = World::new();
+        let e = world.spawn().insert(Position(1, 1)).id();
+        let _ = e;
+
+        let mut access = Access::new();
+        access.components_mut().add_read::<Position>();
+        let mut last_seen = Vec::new();
+
+        let (mut changed, mut added) = (0, 0);
+        world.run_system(&access, &mut last_seen, &mut |w| {
+            changed = Query::<&Position, Changed<Position>>::from_world(w)
+                .iter()
+                .count();
+            added = Query::<&Position, Added<Position>>::from_world(w)
+                .iter()
+                .count();
+        });
+        assert_eq!(changed, 1, "first run sees the pre-existing component");
+        assert_eq!(added, 1);
+
+        // Second run: last_seen now records Position's clock, so nothing
+        // is newly changed/added.
+        let (mut changed2, mut added2) = (0, 0);
+        world.run_system(&access, &mut last_seen, &mut |w| {
+            changed2 = Query::<&Position, Changed<Position>>::from_world(w)
+                .iter()
+                .count();
+            added2 = Query::<&Position, Added<Position>>::from_world(w)
+                .iter()
+                .count();
+        });
+        assert_eq!(changed2, 0, "second run sees no new change");
+        assert_eq!(added2, 0);
+    }
+
+    #[test]
+    fn baseline_for_defaults_to_zero_between_runs() {
+        let world = World::new();
+        assert_eq!(world.baseline_for::<Position>(), 0);
+    }
+
+    #[test]
+    fn run_system_is_panic_safe() {
+        // A panicking system body must not corrupt change detection for
+        // subsequent systems: `run_system` copies (never moves) the
+        // baselines in, so `last_seen` survives and the scratch
+        // `current_baselines` is overwritten on the next run.
+        let mut world = World::new();
+        world.spawn().insert(Position(1, 1));
+        let mut access = Access::new();
+        access.components_mut().add_read::<Position>();
+
+        let mut panicking_seen = Vec::new();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            world.run_system(&access, &mut panicking_seen, &mut |_w| {
+                panic!("system blew up mid-run");
+            });
+        }));
+        assert!(result.is_err());
+
+        // A fresh system still sees the pre-existing component correctly —
+        // no stale baseline leaked from the panicking run.
+        let mut seen = Vec::new();
+        let mut changed = 0;
+        world.run_system(&access, &mut seen, &mut |w| {
+            changed = Query::<&Position, Changed<Position>>::from_world(w)
+                .iter()
+                .count();
+        });
+        assert_eq!(changed, 1);
+    }
+
+    #[test]
+    fn despawn_then_respawn_at_same_slot_has_clean_change_ticks() {
+        // Re-spawning into a freed slot must give the new entity fresh
+        // change-detection state, never the dead tenant's stale ticks.
+        let mut world = World::new();
+        let a = world.spawn().insert(Position(1, 1)).id();
+        world.despawn(a);
+        let b = world.spawn().insert(Position(2, 2)).id();
+        assert_eq!(a.index, b.index); // slot reused
+        assert_ne!(a, b); // new generation
+
+        let storage = world.storage::<Position>().unwrap();
+        let current = storage.current_tick();
+        // `b`'s component was freshly attached: both ticks are non-zero
+        // and within the clock — a baseline-0 reader sees it as Added.
+        assert_eq!(storage.added_tick_for(b), Some(current));
+        assert_eq!(storage.changed_tick_for(b), Some(current));
+        // The dead handle's slot is gone entirely.
+        assert!(storage.changed_tick_for(a).is_none());
+    }
+
+    #[test]
+    fn get_mut_write_is_observed_by_changed_filter() {
+        // `World::get_mut` advances the clock then stamps, so an ad-hoc
+        // direct write is seen by a later `Changed<T>` system once, then
+        // quiesces.
+        let mut world = World::new();
+        let e = world.spawn().insert(Position(1, 1)).id();
+        world.get_mut::<Position>(e).unwrap().0 = 99; // advance + stamp
+        assert_eq!(world.get::<Position>(e).unwrap().0, 99);
+
+        let mut access = Access::new();
+        access.components_mut().add_read::<Position>();
+        let mut last_seen = Vec::new();
+
+        let mut first = 0;
+        world.run_system(&access, &mut last_seen, &mut |w| {
+            first = Query::<&Position, Changed<Position>>::from_world(w)
+                .iter()
+                .count();
+        });
+        assert_eq!(first, 1, "the get_mut write is seen on the next run");
+
+        let mut second = 0;
+        world.run_system(&access, &mut last_seen, &mut |w| {
+            second = Query::<&Position, Changed<Position>>::from_world(w)
+                .iter()
+                .count();
+        });
+        assert_eq!(second, 0, "nothing changed since → quiesces");
     }
 }

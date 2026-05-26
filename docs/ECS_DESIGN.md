@@ -196,7 +196,9 @@ Query<(&Position, Option<&Velocity>)>                       // optional componen
 Query<(Entity, &Position)>                                  // entity ID alongside
 ```
 
-Filters available on day 1: `With<T>`, `Without<T>`, tuple of filters. Deferred: `Or<(F1, F2)>` (post-M4); `Changed<T>`, `Added<T>` (Phase 2 — depends on the change-tick storage slot).
+Filters: `With<T>`, `Without<T>`, `And<(…)>` / `Or<(…)>`, and the
+change-detection pair `Changed<T>` / `Added<T>` (shipped with #56 on
+per-component clocks — see *Stage 22*) all ship today.
 
 ### System
 
@@ -874,9 +876,18 @@ Estimated: ½ day.
 `.run_if(condition_fn)` on systems and workloads. Useful for "only run during gameplay, not in menu".
 Estimated: 1 day.
 
-**Stage 22 — `Changed<T>` / `Added<T>` query filters**
-Builds on `#[derive(Trace)]` infrastructure. Lets systems iterate only modified entities.
-Estimated: 2 days.
+**Stage 22 — `Changed<T>` / `Added<T>` query filters — ✅ shipped (#56).**
+Lets systems iterate only entities whose component was written / first
+attached since they last ran. Implemented on **per-component clocks**: each
+`ComponentStorage<T>` owns a `current_tick` (advanced by `insert`, and once
+before any system that declares a write of `T`) plus parallel
+`changed_tick` / `added_tick` arrays. A system records a per-component
+`last_seen` baseline, which `World::run_system` parks on the world so the
+static filters can read it; `Changed<T>` / `Added<T>` compare the entity's
+tick against that baseline. `Query<&mut T>` yields a `Mut<T>` deref-marker
+that stamps `changed_tick` only on a real write, so marking is precise. No
+`#[derive(Trace)]` machinery was needed. (An A/B against a single-`World`-tick
+model was done; per-component won — see `docs/ECS_ROADMAP.md` item 7.)
 
 **Stage 23 — `#[derive(Bundle)]` for named bundles**
 Sugar over tuples: `#[derive(Bundle)] struct WorkerBundle { pos: Position, vel: Velocity, ... }` then `cmd.spawn(worker_bundle)`.

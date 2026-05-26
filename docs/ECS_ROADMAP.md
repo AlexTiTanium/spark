@@ -293,13 +293,32 @@ mechanism (monomorphisation cost doubles per step).
   (sim) — never a raw frame count. The `#12` demo's `p.x += v.x` is FPS-dependent
   and is a bug.
 
-**7. Component change-tick storage slot — ⬜ not filed.**
-- *Work:* add `changed_tick: Vec<u32>` to `ComponentStorage`, parallel to
-  `dense`; set on `insert` / `get_mut`.
-- *Warnings:* `changed_tick` must be `swap_remove`d in lockstep with
-  `dense`/`entity_index` (same discipline as #10). Reserve the slot only — the
-  `Changed<T>` filter itself is a fast-follow after render, do not implement it
-  here. Needs a `World`-level tick counter.
+**7. ~~Component change-tick storage slot~~ — ✅ shipped (#56), as full
+end-to-end change detection on a *per-component* clock.**
+- *Shipped:* `ComponentStorage<T>` carries `changed_tick` + `added_tick`
+  (parallel to `dense`, `swap_remove`d in lockstep — same discipline as #10)
+  **plus its own `current_tick`**. `Changed<T>` / `Added<T>` query filters
+  ship alongside the slot (not deferred): each reads the per-component clock
+  against a per-system baseline. `Query<&mut T>` yields a `Mut<T>`
+  deref-marker that stamps `changed_tick` only on an actual write, so marking
+  is precise (no driver/filter over-marking). Filters fetch their storage +
+  baseline once via a hoisted `QueryFilter::State`.
+- *Design choice — per-component clocks, not a single `World` tick.* The
+  original plan reserved a `changed_tick` slot driven by one `World`-level
+  counter (the per-system-global-tick model). We built and A/B-compared both;
+  the per-component model was chosen because it fixes three caveats the
+  global model only documented around: (a) components attached before any
+  system ran are visible on a system's first run (clocks start at 1,
+  baselines at 0); (b) tuple-join drivers don't over-mark unjoined entities;
+  (c) `Commands`-spawned entities are seen by a last-in-stage `Added` reaction
+  next frame. Each component owns a clock advanced by `insert` and once before
+  any system that declares a write of it; a system records a per-component
+  `last_seen` baseline, parked on the `World` by `World::run_system` (the
+  shared tick dance for both the sequential and workload paths). No
+  `#[derive(Trace)]` machinery was needed. The per-system-global alternative
+  is preserved on a reference branch.
+- *Follow-up:* periodic tick-clamping for the `u32` wraparound (documented
+  false-negative at the wrap boundary today).
 
 **8. Bundles — ❌ rejected 2026-05-26 (see #57); spawn-ergonomics need deferred.**
 - *Disposition:* in-code `Bundle` (trait + tuple impl + `#[derive(Bundle)]`) is

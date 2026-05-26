@@ -16,13 +16,15 @@
 //!
 //! # The matching mechanism
 //!
-//! [`QueryFilter::matches`] takes the entity and a `&World` and returns a
-//! bool. [`Query::iter`](crate::Query::iter) wraps the existing data
-//! driver in a `.filter(…)` that calls it once per candidate entity, so
-//! the filter rides on top of the safe iteration path — no new `unsafe`,
-//! no change to the join machinery. The presence check goes through the
-//! same `World::storage::<T>()` accessor [`QueryData::init_state`] uses,
-//! so the M4 `RefCell → UnsafeCell` swap stays a single chokepoint.
+//! [`Query::iter`](crate::Query::iter) calls [`QueryFilter::init_state`]
+//! once at the start of iteration — taking the storage borrow(s) and tick
+//! baseline(s) the filter needs — then wraps the data driver in a
+//! `.filter(…)` that calls [`QueryFilter::matches`] per candidate entity
+//! against that pre-fetched `&Self::State`. So `World::storage::<T>()` is
+//! borrowed exactly once per iteration, not per entity, and the filter
+//! rides on top of the safe iteration path — no new `unsafe`, no change to
+//! the join machinery. That single `init_state` borrow is the chokepoint
+//! the M4 `RefCell → UnsafeCell` swap will target.
 //!
 //! # Access reporting (and the `With` / `Without` asymmetry)
 //!
@@ -39,23 +41,57 @@
 //!   exclusion. The cost: a nonsensical `Query<&mut T, Without<T>>`
 //!   (mutate `T` on entities that lack `T` — always empty) is *not*
 //!   caught at construction; if `T`'s storage is non-empty it surfaces
-//!   later as the `RefCell`'s "already mutably borrowed" when `matches`
-//!   re-borrows `T` mid-iteration. That query is meaningless anyway.
+//!   when iteration begins — `Without<T>::init_state` takes a shared
+//!   borrow of `T` while the `&mut T` data shape already holds it
+//!   exclusively, so the `RefCell`'s "already mutably borrowed" fires at
+//!   the `iter`/`iter_mut` call, before any entity is visited. That query
+//!   is meaningless anyway.
 //!
 //! [`And`] / [`Or`] report the **union** of their children's access —
 //! conservative on purpose, since the scheduler needs the worst case
 //! even though any single entity may have matched via only one branch.
 //!
+//! # Change detection ([`Changed<T>`] / [`Added<T>`])
+//!
+//! These read the per-component change-detection clock. **Each component
+//! type owns its own clock** ([`ComponentStorage::current_tick`]): it
+//! advances when `T` is inserted, and once before any system that
+//! declares a write of `T`. Every entity's slot records the tick it was
+//! last written (`changed_tick`) and first attached (`added_tick`). A
+//! system carries one *baseline* per component it touches — the tick that
+//! component's clock read when it last ran — which the scheduler parks on
+//! the world via [`World::baseline_for`](crate::World::baseline_for).
+//! [`init_state`](QueryFilter::init_state) reads it once into the filter's
+//! [`State`](QueryFilter::State); per-entity [`matches`](QueryFilter::matches)
+//! then compares against that, never touching the world directly.
+//!
+//! [`Changed<T>`] passes when `changed_tick > baseline`; [`Added<T>`]
+//! when `added_tick > baseline` (a one-shot, since `added_tick` never
+//! moves after the attach). Both report a **read** of `T`, like
+//! [`With<T>`], so `Query<&mut T, Changed<T>>` is a self-conflict (use
+//! `&T`, or detect a *different* component).
+//!
+//! Marking is **precise**: a `Query<&mut T>` yields [`Mut<T>`](crate::Mut),
+//! which stamps `changed_tick` only on an actual write (`DerefMut`). An
+//! entity merely visited by a tuple's driver, dropped by the join, or
+//! excluded by a filter is never stamped. And because each component's
+//! clock starts at 1 while a fresh system's baseline is 0, a component
+//! attached before any system ran is seen on that system's first run.
+//!
+//! [`ComponentStorage::current_tick`]: crate::ComponentStorage
+//! [`Mut<T>`]: crate::Mut
 //! [`Query`]: crate::Query
 //! [`QueryData`]: crate::QueryData
 //! [`QueryData::init_state`]: crate::QueryData::init_state
 //! [`Query::from_world`]: crate::Query::from_world
 
+use std::cell::Ref;
 use std::marker::PhantomData;
 
 use crate::Component;
 use crate::access::QueryAccess;
 use crate::entity::Entity;
+use crate::storage::ComponentStorage;
 use crate::world::World;
 
 /// A predicate over entities that gates a [`Query`] without widening its
@@ -87,11 +123,23 @@ use crate::world::World;
 /// [`And<(…)>`]: And
 /// [`Or<(…)>`]: Or
 pub trait QueryFilter {
-    /// Returns `true` if `entity` passes this filter.
-    ///
-    /// Called once per candidate entity during iteration. Reads
-    /// component presence through `world`; performs no mutation.
-    fn matches(entity: Entity, world: &World) -> bool;
+    /// Per-query state fetched **once** before iteration — the storage
+    /// borrow(s) and tick baseline(s) the filter needs — so the per-entity
+    /// [`matches`](Self::matches) is a cheap field read instead of a fresh
+    /// `HashMap` lookup + `RefCell` borrow each time. Mirrors
+    /// [`QueryData::State`](crate::QueryData::State).
+    type State<'w>
+    where
+        Self: 'w;
+
+    /// Fetches the filter's [`State`](Self::State) from the world, once,
+    /// at the start of iteration.
+    fn init_state(world: &World) -> Self::State<'_>;
+
+    /// Returns `true` if `entity` passes this filter, reading only the
+    /// pre-fetched `state`. Called once per candidate entity; performs no
+    /// mutation and touches the world only through `state`.
+    fn matches(entity: Entity, state: &Self::State<'_>) -> bool;
 
     /// Reports the components this filter inspects into `access`.
     ///
@@ -108,7 +156,11 @@ pub trait QueryFilter {
 /// Matches every entity and reports no access, so `Query<D>` and
 /// `Query<D, ()>` are the same query.
 impl QueryFilter for () {
-    fn matches(_entity: Entity, _world: &World) -> bool {
+    type State<'w> = ();
+
+    fn init_state(_world: &World) -> Self::State<'_> {}
+
+    fn matches(_entity: Entity, _state: &Self::State<'_>) -> bool {
         true
     }
 
@@ -147,9 +199,15 @@ impl QueryFilter for () {
 pub struct With<T>(PhantomData<T>);
 
 impl<T: Component> QueryFilter for With<T> {
-    fn matches(entity: Entity, world: &World) -> bool {
-        world
-            .storage::<T>()
+    type State<'w> = Option<Ref<'w, ComponentStorage<T>>>;
+
+    fn init_state(world: &World) -> Self::State<'_> {
+        world.storage::<T>()
+    }
+
+    fn matches(entity: Entity, state: &Self::State<'_>) -> bool {
+        state
+            .as_ref()
             .is_some_and(|storage| storage.contains(entity))
     }
 
@@ -189,15 +247,130 @@ impl<T: Component> QueryFilter for With<T> {
 pub struct Without<T>(PhantomData<T>);
 
 impl<T: Component> QueryFilter for Without<T> {
-    fn matches(entity: Entity, world: &World) -> bool {
+    type State<'w> = Option<Ref<'w, ComponentStorage<T>>>;
+
+    fn init_state(world: &World) -> Self::State<'_> {
+        world.storage::<T>()
+    }
+
+    fn matches(entity: Entity, state: &Self::State<'_>) -> bool {
         // No storage for `T` → no entity has it → everyone passes.
-        world
-            .storage::<T>()
+        state
+            .as_ref()
             .is_none_or(|storage| !storage.contains(entity))
     }
 
     fn collect_access(_access: &mut QueryAccess) {
         // Pure exclusion — reports no access. See module docs for why.
+    }
+}
+
+/// Keeps only entities whose `T` was **written** since the calling system
+/// last ran (insert, overwrite, or a `&mut T` write through [`Mut`]).
+///
+/// Zero-sized, like [`With<T>`]. Each component type carries its own
+/// change-detection clock; this compares the entity's `changed_tick`
+/// against [`World::baseline_for::<T>`](crate::World::baseline_for) — the
+/// tick `T`'s clock read when this system last ran — with a strict `>`.
+/// Reports a **read** of `T`, so pairing it with a `&mut T` data shape is
+/// a self-conflict (read with `&T`, or filter on a different component).
+///
+/// Iterating a `Query<&mut T>` marks an entity changed only when the body
+/// actually writes it (via [`Mut`]'s `DerefMut`), so `Changed<T>` is
+/// precise — no over-marking of merely-visited or filtered-out entities.
+///
+/// [`Mut`]: crate::Mut
+///
+/// # Examples
+///
+/// ```
+/// use spark_ecs::{Changed, Component, Query, World};
+///
+/// #[derive(Component)]
+/// struct Health(u32);
+///
+/// let mut world = World::new();
+/// world.spawn().insert(Health(100)); // Health's clock advances on insert
+///
+/// // With no baseline parked (system never ran → baseline 0), the fresh
+/// // insert counts as changed.
+/// let changed = Query::<&Health, Changed<Health>>::from_world(&world)
+///     .iter()
+///     .count();
+/// assert_eq!(changed, 1);
+/// ```
+pub struct Changed<T>(PhantomData<T>);
+
+impl<T: Component> QueryFilter for Changed<T> {
+    /// The `T` storage borrow + the baseline tick, both fetched once.
+    type State<'w> = (Option<Ref<'w, ComponentStorage<T>>>, u32);
+
+    fn init_state(world: &World) -> Self::State<'_> {
+        (world.storage::<T>(), world.baseline_for::<T>())
+    }
+
+    fn matches(entity: Entity, state: &Self::State<'_>) -> bool {
+        let (storage, baseline) = state;
+        storage.as_ref().is_some_and(|s| {
+            s.changed_tick_for(entity)
+                .is_some_and(|tick| tick > *baseline)
+        })
+    }
+
+    fn collect_access(access: &mut QueryAccess) {
+        access.add_read::<T>();
+    }
+}
+
+/// Keeps only entities to which `T` was **newly attached** since the
+/// calling system last ran — a one-shot signal, unlike the every-write
+/// [`Changed<T>`].
+///
+/// Zero-sized, like [`With<T>`]. Compares the entity's `added_tick` (set
+/// only on a fresh attach, never re-stamped by overwrite or `&mut`)
+/// against [`World::baseline_for::<T>`](crate::World::baseline_for) with a
+/// strict `>`. Reports a **read** of `T`, same as [`With<T>`].
+///
+/// Because `added_tick` does not move on later writes, an entity matches
+/// `Added<T>` for exactly the run after its `T` was attached and never
+/// again (until the component is removed and re-added).
+///
+/// # Examples
+///
+/// ```
+/// use spark_ecs::{Added, Component, Query, World};
+///
+/// #[derive(Component)]
+/// struct Spawned;
+///
+/// let mut world = World::new();
+/// world.spawn().insert(Spawned);
+///
+/// let added = Query::<&Spawned, Added<Spawned>>::from_world(&world)
+///     .iter()
+///     .count();
+/// assert_eq!(added, 1);
+/// ```
+pub struct Added<T>(PhantomData<T>);
+
+impl<T: Component> QueryFilter for Added<T> {
+    /// The `T` storage borrow + the baseline tick, both fetched once.
+    type State<'w> = (Option<Ref<'w, ComponentStorage<T>>>, u32);
+
+    fn init_state(world: &World) -> Self::State<'_> {
+        (world.storage::<T>(), world.baseline_for::<T>())
+    }
+
+    fn matches(entity: Entity, state: &Self::State<'_>) -> bool {
+        let (storage, baseline) = state;
+        storage.as_ref().is_some_and(|s| {
+            s.added_tick_for(entity)
+                .is_some_and(|tick| tick > *baseline)
+        })
+    }
+
+    fn collect_access(access: &mut QueryAccess) {
+        access.add_read::<T>();
     }
 }
 
@@ -273,8 +446,19 @@ pub struct Or<F>(PhantomData<F>);
 macro_rules! impl_logical_filter {
     ($($F:ident),+) => {
         impl<$($F: QueryFilter),+> QueryFilter for And<($($F,)+)> {
-            fn matches(entity: Entity, world: &World) -> bool {
-                $($F::matches(entity, world))&&+
+            type State<'w>
+                = ($($F::State<'w>,)+)
+            where
+                Self: 'w;
+
+            fn init_state(world: &World) -> Self::State<'_> {
+                ($($F::init_state(world),)+)
+            }
+
+            #[allow(non_snake_case)]
+            fn matches(entity: Entity, state: &Self::State<'_>) -> bool {
+                let ($($F,)+) = state;
+                $($F::matches(entity, $F))&&+
             }
 
             fn collect_access(access: &mut QueryAccess) {
@@ -283,8 +467,19 @@ macro_rules! impl_logical_filter {
         }
 
         impl<$($F: QueryFilter),+> QueryFilter for Or<($($F,)+)> {
-            fn matches(entity: Entity, world: &World) -> bool {
-                $($F::matches(entity, world))||+
+            type State<'w>
+                = ($($F::State<'w>,)+)
+            where
+                Self: 'w;
+
+            fn init_state(world: &World) -> Self::State<'_> {
+                ($($F::init_state(world),)+)
+            }
+
+            #[allow(non_snake_case)]
+            fn matches(entity: Entity, state: &Self::State<'_>) -> bool {
+                let ($($F,)+) = state;
+                $($F::matches(entity, $F))||+
             }
 
             fn collect_access(access: &mut QueryAccess) {
@@ -320,35 +515,41 @@ mod tests {
         (world, only_a, a_and_b, a_and_c)
     }
 
+    /// `F::matches` with its state fetched once — the exact shape
+    /// `Query::iter` uses (`init_state` then `matches`). Presence filters
+    /// need no parked baseline, so a bare `World` is enough.
+    fn passes<F: QueryFilter>(world: &World, e: Entity) -> bool {
+        F::matches(e, &F::init_state(world))
+    }
+
     #[test]
     fn unit_filter_matches_everything() {
         let (world, only_a, a_and_b, _) = world_abc();
-        assert!(<() as QueryFilter>::matches(only_a, &world));
-        assert!(<() as QueryFilter>::matches(a_and_b, &world));
+        assert!(passes::<()>(&world, only_a));
+        assert!(passes::<()>(&world, a_and_b));
     }
 
     #[test]
     fn with_matches_only_entities_having_component() {
         let (world, only_a, a_and_b, _) = world_abc();
-        assert!(With::<B>::matches(a_and_b, &world));
-        assert!(!With::<B>::matches(only_a, &world));
+        assert!(passes::<With<B>>(&world, a_and_b));
+        assert!(!passes::<With<B>>(&world, only_a));
     }
 
     #[test]
     fn with_unknown_component_matches_nobody() {
-        // No entity ever held a `B`-less... rather, a component never
-        // inserted has no storage at all — `With` must say "no match",
-        // not panic.
+        // A component never inserted has no storage at all — `With` must
+        // say "no match", not panic.
         let mut world = World::new();
         let e = world.spawn().insert(A).id();
-        assert!(!With::<B>::matches(e, &world));
+        assert!(!passes::<With<B>>(&world, e));
     }
 
     #[test]
     fn without_matches_entities_lacking_component() {
         let (world, only_a, a_and_b, _) = world_abc();
-        assert!(Without::<B>::matches(only_a, &world));
-        assert!(!Without::<B>::matches(a_and_b, &world));
+        assert!(passes::<Without<B>>(&world, only_a));
+        assert!(!passes::<Without<B>>(&world, a_and_b));
     }
 
     #[test]
@@ -356,24 +557,24 @@ mod tests {
         // No storage for `C` yet → every entity lacks it → all pass.
         let mut world = World::new();
         let e = world.spawn().insert(A).id();
-        assert!(Without::<C>::matches(e, &world));
+        assert!(passes::<Without<C>>(&world, e));
     }
 
     #[test]
     fn and_requires_all_branches() {
         let (world, only_a, a_and_b, _) = world_abc();
         // A present AND B absent.
-        assert!(And::<(With<A>, Without<B>)>::matches(only_a, &world));
-        assert!(!And::<(With<A>, Without<B>)>::matches(a_and_b, &world));
+        assert!(passes::<And<(With<A>, Without<B>)>>(&world, only_a));
+        assert!(!passes::<And<(With<A>, Without<B>)>>(&world, a_and_b));
     }
 
     #[test]
     fn or_requires_any_branch() {
         let (world, only_a, a_and_b, a_and_c) = world_abc();
         // Has B or C.
-        assert!(Or::<(With<B>, With<C>)>::matches(a_and_b, &world));
-        assert!(Or::<(With<B>, With<C>)>::matches(a_and_c, &world));
-        assert!(!Or::<(With<B>, With<C>)>::matches(only_a, &world));
+        assert!(passes::<Or<(With<B>, With<C>)>>(&world, a_and_b));
+        assert!(passes::<Or<(With<B>, With<C>)>>(&world, a_and_c));
+        assert!(!passes::<Or<(With<B>, With<C>)>>(&world, only_a));
     }
 
     #[test]
@@ -381,9 +582,9 @@ mod tests {
         // With<A> AND (With<B> OR With<C>).
         type F = And<(With<A>, Or<(With<B>, With<C>)>)>;
         let (world, only_a, a_and_b, a_and_c) = world_abc();
-        assert!(F::matches(a_and_b, &world));
-        assert!(F::matches(a_and_c, &world));
-        assert!(!F::matches(only_a, &world)); // has A, but neither B nor C
+        assert!(passes::<F>(&world, a_and_b));
+        assert!(passes::<F>(&world, a_and_c));
+        assert!(!passes::<F>(&world, only_a)); // has A, but neither B nor C
     }
 
     #[test]
@@ -421,5 +622,88 @@ mod tests {
         }))
         .is_err();
         assert!(conflicted, "And should union child access (read of B)");
+    }
+
+    // -------- change-detection filters --------
+
+    use crate::Access;
+    use std::any::TypeId;
+
+    /// Evaluates `F::matches(e)` with `baseline` parked as the running
+    /// system's per-component baselines — exactly how the scheduler feeds
+    /// `Changed`/`Added`. Empty access ⇒ no clock advance, no observe.
+    fn matches_with<F: QueryFilter>(
+        world: &mut World,
+        e: Entity,
+        baseline: &[(TypeId, u32)],
+    ) -> bool {
+        let access = Access::new();
+        let mut last_seen = baseline.to_vec();
+        let mut result = false;
+        world.run_system(&access, &mut last_seen, &mut |w| {
+            // `init_state` reads the parked baseline (and storage borrow),
+            // exactly as `Query::iter` does, before per-entity `matches`.
+            result = F::matches(e, &F::init_state(w));
+        });
+        result
+    }
+
+    #[test]
+    fn changed_matches_when_clock_is_past_baseline() {
+        let mut world = World::new();
+        let e = world.spawn().insert(A).id(); // A's clock 1→2, changed = 2
+        let aid = TypeId::of::<A>();
+        assert!(matches_with::<Changed<A>>(&mut world, e, &[(aid, 1)])); // 2 > 1
+        assert!(!matches_with::<Changed<A>>(&mut world, e, &[(aid, 2)])); // 2 > 2 false
+    }
+
+    #[test]
+    fn added_is_one_shot_but_changed_repeats() {
+        let mut world = World::new();
+        let e = world.spawn().insert(A).id(); // added = changed = 2
+        world.insert(e, A); // overwrite: clock → 3, changed = 3, added stays 2
+        let aid = TypeId::of::<A>();
+        // From baseline 2: Added (2 > 2) is false; Changed (3 > 2) is true.
+        assert!(!matches_with::<Added<A>>(&mut world, e, &[(aid, 2)]));
+        assert!(matches_with::<Changed<A>>(&mut world, e, &[(aid, 2)]));
+    }
+
+    #[test]
+    fn change_filters_compose_with_combinators() {
+        let (mut world, only_a, a_and_b, _a_and_c) = world_abc();
+        let aid = TypeId::of::<A>();
+        let bid = TypeId::of::<B>();
+        let cid = TypeId::of::<C>();
+        // Has A and B was changed since baseline 0.
+        assert!(matches_with::<And<(With<A>, Changed<B>)>>(
+            &mut world,
+            a_and_b,
+            &[(aid, 0), (bid, 0)]
+        ));
+        // only_a lacks B → the And fails.
+        assert!(!matches_with::<And<(With<A>, Changed<B>)>>(
+            &mut world,
+            only_a,
+            &[(aid, 0), (bid, 0)]
+        ));
+        // B or C added since baseline 0 — a_and_b has B.
+        assert!(matches_with::<Or<(Added<B>, Added<C>)>>(
+            &mut world,
+            a_and_b,
+            &[(bid, 0), (cid, 0)]
+        ));
+        assert!(!matches_with::<Or<(Added<B>, Added<C>)>>(
+            &mut world,
+            only_a,
+            &[(bid, 0), (cid, 0)]
+        ));
+    }
+
+    #[test]
+    fn change_filters_on_unknown_component_match_nobody() {
+        let mut world = World::new();
+        let e = world.spawn().insert(A).id();
+        assert!(!matches_with::<Changed<B>>(&mut world, e, &[]));
+        assert!(!matches_with::<Added<B>>(&mut world, e, &[]));
     }
 }

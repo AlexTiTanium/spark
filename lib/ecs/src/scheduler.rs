@@ -371,7 +371,9 @@ impl Schedule {
             let batches = std::mem::take(&mut self.workloads[widx].batches);
             for batch in &batches {
                 for &SystemId(sidx) in batch {
-                    (self.workloads[widx].systems[sidx].run)(world);
+                    // The per-component change-detection tick dance lives
+                    // in `System::run` → `World::run_system`.
+                    self.workloads[widx].systems[sidx].run(world);
                 }
             }
             self.workloads[widx].batches = batches;
@@ -754,10 +756,10 @@ mod tests {
             Tick,
         }
         fn weird(mut q1: Query<&mut Position>, mut q2: Query<&mut Position>) {
-            for p in q1.iter_mut() {
+            for mut p in q1.iter_mut() {
                 p.x += 1.0;
             }
-            for p in q2.iter_mut() {
+            for mut p in q2.iter_mut() {
                 p.x += 1.0;
             }
         }
@@ -856,5 +858,42 @@ mod tests {
         });
         schedule.run(&mut world);
         assert_eq!(world.resource::<Log>().order, vec!["supply", "distribute"]);
+    }
+
+    #[test]
+    fn run_drives_change_detection_across_ordered_systems() {
+        // The workload path threads each system through `World::run_system`:
+        // `write_pos` advances Position's clock and marks what it writes;
+        // `observe` (ordered after it) sees those writes via `Changed`.
+        #[derive(WorkloadLabel)]
+        enum W {
+            Tick,
+        }
+        #[derive(Resource)]
+        struct Seen {
+            n: usize,
+        }
+        fn write_pos(mut q: Query<&mut Position>) {
+            for mut p in q.iter_mut() {
+                p.x += 1.0;
+            }
+        }
+        fn observe(q: Query<&Position, crate::Changed<Position>>, mut seen: ResMut<Seen>) {
+            seen.n = q.iter().count();
+        }
+        let mut world = World::new();
+        world.add_resource(Seen { n: 0 });
+        world.spawn().insert(Position { x: 0.0 });
+        let mut schedule = Schedule::new();
+        schedule.add_workload(W::Tick, |w| {
+            let written = w.add_system(write_pos);
+            w.add_system(observe).after(written);
+        });
+        schedule.run(&mut world);
+        assert_eq!(
+            world.resource::<Seen>().n,
+            1,
+            "observe sees the fresh write"
+        );
     }
 }

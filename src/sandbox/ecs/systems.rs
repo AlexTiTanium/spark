@@ -113,7 +113,7 @@ pub(super) fn report_initial(tick: Res<TickCount>, q_pos: Query<&Position>) {
 /// query-construction self-conflict check.
 pub(super) fn physics_step(mut q: Query<(&mut Position, &mut Velocity, &Acceleration)>) {
     let mut stepped = 0;
-    for (pos, vel, acc) in q.iter_mut() {
+    for (mut pos, mut vel, acc) in q.iter_mut() {
         // velocity += acceleration  (Euler symplectic — order matters)
         vel.x += acc.x;
         vel.y += acc.y;
@@ -135,7 +135,7 @@ pub(super) fn physics_step(mut q: Query<(&mut Position, &mut Velocity, &Accelera
 pub(super) fn decay_health(mut tick: ResMut<TickCount>, mut q: Query<&mut Health>) {
     tick.0 += 1;
     let mut decayed = 0;
-    for h in q.iter_mut() {
+    for mut h in q.iter_mut() {
         h.0 = h.0.saturating_sub(5);
         decayed += 1;
     }
@@ -157,7 +157,7 @@ pub(super) fn decay_health(mut tick: ResMut<TickCount>, mut q: Query<&mut Health
 /// (-5 from decay, +2 from regen, net -3) shows up clearly in the
 /// debug logs.
 pub(super) fn player_regen(mut q: Query<(&Player, &mut Health)>) {
-    for (_player, hp) in q.iter_mut() {
+    for (_player, mut hp) in q.iter_mut() {
         hp.0 = hp.0.saturating_add(2);
         debug!(
             hp = hp.0,
