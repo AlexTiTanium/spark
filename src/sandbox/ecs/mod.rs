@@ -16,9 +16,14 @@
 //!   distinct `Query<D>` shape.
 //! - [`filters`]: the filter demo systems, each exercising a distinct
 //!   `Query<D, F>` filter combination over a power-grid roster.
+//! - [`change_detection`]: a self-contained sub-plugin
+//!   (`ChangeDetectionPlugin`) that sweeps `Changed<T>` / `Added<T>`
+//!   across every supported query-data shape and filter combination,
+//!   self-checking each against its expected per-frame count.
 //! - [`plugin`]: [`EcsSandboxPlugin`] — seeds the demo entities,
-//!   registers the systems. Assumes [`crate::sandbox::SandboxPlugin`]
-//!   has already inserted the shared resources.
+//!   registers the systems, and nests `ChangeDetectionPlugin`. Assumes
+//!   [`crate::sandbox::SandboxPlugin`] has already inserted the shared
+//!   resources.
 //!
 //! # Query shapes exercised
 //!

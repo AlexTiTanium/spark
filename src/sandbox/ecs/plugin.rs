@@ -12,7 +12,7 @@
 
 use spark_core::{Application, Plugin, Stage};
 
-use super::change_detection::{recharge_low, report_recharged, seed_batteries};
+use super::change_detection::ChangeDetectionPlugin;
 use super::filters::{
     and_filter, bump_powered_capacity, filtered_join, nested_filter, or_filter, spawn_filter_demo,
     with_filter, without_filter,
@@ -24,12 +24,14 @@ use super::systems::{
 
 /// Plugin that wires the ECS sub-sandbox into an [`Application`].
 ///
-/// Build order: every system goes through `add_system` (no
-/// resources added here — see the module docs). Seeding happens
-/// inside [`spawn_demo`] during `Startup` (via `Commands`) so the
-/// entities are visible to every later stage's queries — the flush
-/// at the `Startup` boundary makes them so before `PreUpdate`
-/// fires.
+/// Build order: the data-shape and filter systems go through
+/// `add_system`; this plugin adds no resources of its own (it relies on
+/// the shared `TickCount` from [`crate::sandbox::SandboxPlugin`]). The
+/// nested `ChangeDetectionPlugin` it composes owns its own `CdFrame` /
+/// `CdScore` resources. Seeding happens inside [`spawn_demo`] during
+/// `Startup` (via `Commands`) so the entities are visible to every later
+/// stage's queries — the flush at the `Startup` boundary makes them so
+/// before `PreUpdate` fires.
 pub struct EcsSandboxPlugin;
 
 impl Plugin for EcsSandboxPlugin {
@@ -73,14 +75,13 @@ impl Plugin for EcsSandboxPlugin {
             .add_system(Stage::PreUpdate, filtered_join)
             .add_system(Stage::PreUpdate, bump_powered_capacity);
 
-        // ----- Change-detection demo (`Changed<T>`) -----
+        // ----- Change-detection demo (`Changed<T>` / `Added<T>`) -----
         //
-        // Seed a battery roster in Startup, top up the low cells each
-        // Update, and report (in PostUpdate) how many actually changed —
-        // a count that falls to zero as the pack fills, showing precise
-        // `Mut`-driven marking.
-        app.add_system(Stage::Startup, seed_batteries)
-            .add_system(Stage::Update, recharge_low)
-            .add_system(Stage::PostUpdate, report_recharged);
+        // A self-contained sub-plugin: it seeds twelve isolated rosters and
+        // sweeps every supported query-data shape × change-filter
+        // combination, self-checking each against its expected per-frame
+        // count. Owns its own frame counter / scoreboard resources, so it
+        // nests cleanly here. See `change_detection.rs` for the matrix.
+        app.add_plugin(ChangeDetectionPlugin);
     }
 }
