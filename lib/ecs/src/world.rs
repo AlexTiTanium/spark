@@ -1212,4 +1212,56 @@ mod tests {
         });
         assert_eq!(changed, 1);
     }
+
+    #[test]
+    fn despawn_then_respawn_at_same_slot_has_clean_change_ticks() {
+        // Re-spawning into a freed slot must give the new entity fresh
+        // change-detection state, never the dead tenant's stale ticks.
+        let mut world = World::new();
+        let a = world.spawn().insert(Position(1, 1)).id();
+        world.despawn(a);
+        let b = world.spawn().insert(Position(2, 2)).id();
+        assert_eq!(a.index, b.index); // slot reused
+        assert_ne!(a, b); // new generation
+
+        let storage = world.storage::<Position>().unwrap();
+        let current = storage.current_tick();
+        // `b`'s component was freshly attached: both ticks are non-zero
+        // and within the clock — a baseline-0 reader sees it as Added.
+        assert_eq!(storage.added_tick_for(b), Some(current));
+        assert_eq!(storage.changed_tick_for(b), Some(current));
+        // The dead handle's slot is gone entirely.
+        assert!(storage.changed_tick_for(a).is_none());
+    }
+
+    #[test]
+    fn get_mut_write_is_observed_by_changed_filter() {
+        // `World::get_mut` advances the clock then stamps, so an ad-hoc
+        // direct write is seen by a later `Changed<T>` system once, then
+        // quiesces.
+        let mut world = World::new();
+        let e = world.spawn().insert(Position(1, 1)).id();
+        world.get_mut::<Position>(e).unwrap().0 = 99; // advance + stamp
+        assert_eq!(world.get::<Position>(e).unwrap().0, 99);
+
+        let mut access = Access::new();
+        access.components_mut().add_read::<Position>();
+        let mut last_seen = Vec::new();
+
+        let mut first = 0;
+        world.run_system(&access, &mut last_seen, &mut |w| {
+            first = Query::<&Position, Changed<Position>>::from_world(w)
+                .iter()
+                .count();
+        });
+        assert_eq!(first, 1, "the get_mut write is seen on the next run");
+
+        let mut second = 0;
+        world.run_system(&access, &mut last_seen, &mut |w| {
+            second = Query::<&Position, Changed<Position>>::from_world(w)
+                .iter()
+                .count();
+        });
+        assert_eq!(second, 0, "nothing changed since → quiesces");
+    }
 }

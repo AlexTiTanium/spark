@@ -2200,4 +2200,39 @@ mod tests {
             Some(2)
         );
     }
+
+    #[test]
+    fn multi_mut_tuple_marks_only_the_written_component() {
+        // `Query<(&mut Position, &mut Velocity)>`, body writes Position
+        // (DerefMut) but only reads Velocity (Deref). Run through
+        // `run_system` so BOTH clocks advance to 3 first — proving that
+        // advancing the clock is *not* what marks: only the `DerefMut`
+        // on the non-driver `Velocity` (via `DenseMut::get` → `Mut`) would,
+        // and it never happens. Velocity stays at its insert tick.
+        let mut world = World::new();
+        let e = world
+            .spawn()
+            .insert(Position(1, 1)) // Position clock → 2
+            .insert(Velocity(2, 2)) // Velocity clock → 2
+            .id();
+        let mut access = Access::new();
+        access.components_mut().add_write::<Position>();
+        access.components_mut().add_write::<Velocity>();
+        let mut last_seen = Vec::new();
+        world.run_system(&access, &mut last_seen, &mut |w| {
+            let mut q = Query::<(&mut Position, &mut Velocity)>::from_world(w);
+            for (mut pos, vel) in q.iter_mut() {
+                pos.0 += vel.0; // DerefMut on pos; Deref-only on vel
+            }
+        });
+        // Both clocks advanced 2 → 3; only the written component is stamped.
+        assert_eq!(
+            world.storage::<Position>().unwrap().changed_tick_for(e),
+            Some(3) // written
+        );
+        assert_eq!(
+            world.storage::<Velocity>().unwrap().changed_tick_for(e),
+            Some(2) // read-only → stays at its insert tick
+        );
+    }
 }

@@ -979,4 +979,25 @@ mod tests {
         AnyStorage::advance_tick(&mut storage);
         assert_eq!(AnyStorage::current_tick(&storage), 2);
     }
+
+    #[test]
+    fn tick_wraparound_does_not_panic_and_is_a_clean_false_negative() {
+        // The clock is `wrapping_add`. Driving it across `u32::MAX` must
+        // not panic; the documented cost is a single false-negative frame
+        // at the wrap boundary (a write stamped post-wrap reads as "older"
+        // than a pre-wrap baseline). This pins that behaviour.
+        let (_alloc, entities) = alloc_n(1);
+        let mut storage = ComponentStorage::<Pos>::new();
+        storage.set_current_tick(u32::MAX - 1);
+        storage.insert(entities[0], Pos(1, 2)); // advance → u32::MAX, stamp both
+        assert_eq!(storage.changed_tick_for(entities[0]), Some(u32::MAX));
+        storage.insert(entities[0], Pos(3, 4)); // overwrite: advance wraps → 0
+        assert_eq!(storage.current_tick(), 0);
+        assert_eq!(storage.changed_tick_for(entities[0]), Some(0)); // wrapped, no panic
+
+        // A reader whose baseline was the pre-wrap tick misses this write:
+        // 0 > (u32::MAX - 1) is false. Documented wraparound false-negative.
+        let baseline = u32::MAX - 1;
+        assert!(storage.changed_tick_for(entities[0]).unwrap() <= baseline);
+    }
 }
