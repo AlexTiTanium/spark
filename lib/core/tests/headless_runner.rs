@@ -33,7 +33,7 @@ fn spawn_two(mut commands: Commands) {
 
 /// Canonical movement system: `Query<(&mut Position, &Velocity)>`.
 fn integrate(mut q: Query<(&mut Position, &Velocity)>) {
-    for (pos, vel) in q.iter_mut() {
+    for (mut pos, vel) in q.iter_mut() {
         pos.0 += vel.0;
         pos.1 += vel.1;
     }

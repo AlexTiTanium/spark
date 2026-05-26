@@ -356,6 +356,17 @@ every workload boundary. A `commands.spawn().insert(…)` queued by a
 sequential system in `Update` is visible to that stage's workloads, to
 `PostUpdate` of the same frame, and to every system in every later frame.
 
+`run_stage` also drives **change detection** for its sequential systems
+(the same way [`Schedule::run`](../spark_ecs/struct.Schedule.html) does for
+workloads): each system goes through
+[`World::run_system`](../spark_ecs/struct.World.html), which advances the
+clock of every component the system *writes*, parks the system's
+per-component baselines so its
+[`Changed<T>`](../spark_ecs/struct.Changed.html) /
+[`Added<T>`](../spark_ecs/struct.Added.html) filters compare against where
+it last ran, and records where each accessed component's clock landed —
+all with no wiring on your side.
+
 > **Why a closed enum, not string labels?** There is exactly one frame
 > timeline, so there is one shared set of phases. A closed enum makes a
 > `match` over stages exhaustive and turns a misspelled stage into a

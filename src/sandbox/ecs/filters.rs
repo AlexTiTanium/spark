@@ -324,7 +324,7 @@ pub(super) fn bump_powered_capacity(
         return;
     }
     let mut bumped: Vec<(&str, u32)> = Vec::new();
-    for (building, capacity) in q.iter_mut() {
+    for (building, mut capacity) in q.iter_mut() {
         capacity.0 += 10;
         bumped.push((building.name, capacity.0));
     }

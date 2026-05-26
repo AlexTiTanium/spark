@@ -184,12 +184,21 @@ pub struct SystemRef {
 pub struct SystemId(pub(crate) usize);
 
 /// A registered system: its erased run closure, its declared [`Access`],
-/// and its name (the fn's type path, for diagnostics — overridable with
-/// [`SystemOrderBuilder::label`]).
+/// its name (the fn's type path, for diagnostics — overridable with
+/// [`SystemOrderBuilder::label`]), and its per-component change-detection
+/// baselines.
+///
+/// `last_seen` records, per component this system accesses, the tick that
+/// component's clock read when the system last ran. [`run`](Self::run)
+/// feeds it to [`World::run_system`](crate::World::run_system), which
+/// parks it as the [`Changed`](crate::Changed) / [`Added`](crate::Added)
+/// baseline and refreshes it. Starts empty, so a system's first run sees
+/// every prior-existing component (baseline defaults to 0).
 pub(crate) struct BoxedSystem {
     pub(crate) name: &'static str,
     pub(crate) access: Access,
-    pub(crate) run: Box<dyn FnMut(&World) + 'static>,
+    run: Box<dyn FnMut(&World) + 'static>,
+    last_seen: Vec<(TypeId, u32)>,
 }
 
 impl BoxedSystem {
@@ -214,7 +223,16 @@ impl BoxedSystem {
             name: std::any::type_name::<S>(),
             access,
             run: system.into_system(),
+            last_seen: Vec::new(),
         }
+    }
+
+    /// Runs this system against `world` with per-component change
+    /// detection, updating its `last_seen` baselines. Thin wrapper over
+    /// [`World::run_system`](crate::World::run_system) — the tick dance
+    /// lives there, shared with the sequential path.
+    pub(crate) fn run(&mut self, world: &mut World) {
+        world.run_system(&self.access, &mut self.last_seen, &mut *self.run);
     }
 }
 
@@ -1133,7 +1151,7 @@ mod tests {
     #[test]
     fn component_query_conflicts_feed_batching() {
         fn move_pos(mut q: Query<&mut Position>) {
-            for p in q.iter_mut() {
+            for mut p in q.iter_mut() {
                 p.x += 1.0;
             }
         }
@@ -1151,12 +1169,12 @@ mod tests {
     #[test]
     fn query_over_disjoint_components_shares_a_batch() {
         fn move_pos(mut q: Query<&mut Position>) {
-            for p in q.iter_mut() {
+            for mut p in q.iter_mut() {
                 p.x += 1.0;
             }
         }
         fn move_vel(mut q: Query<&mut Velocity>) {
-            for v in q.iter_mut() {
+            for mut v in q.iter_mut() {
                 v.x += 1.0;
             }
         }
@@ -1173,7 +1191,7 @@ mod tests {
         // the conflicts below would vanish and the batch layout change.
         fn mover(_f: Res<Frame>, mut s: ResMut<Score>, mut q: Query<&mut Position>, _c: Commands) {
             s.value += 1;
-            for p in q.iter_mut() {
+            for mut p in q.iter_mut() {
                 p.x += 1.0;
             }
         }
@@ -1186,7 +1204,7 @@ mod tests {
             let _ = s.value;
         }
         fn moves_vel(mut q: Query<&mut Velocity>) {
-            for v in q.iter_mut() {
+            for mut v in q.iter_mut() {
                 v.x += 1.0;
             }
         }
@@ -1211,7 +1229,7 @@ mod tests {
         // `With<Velocity>` makes `filtered` read Velocity even though it
         // yields only `&Position`, so it conflicts with a Velocity writer.
         fn writes_vel(mut q: Query<&mut Velocity>) {
-            for v in q.iter_mut() {
+            for mut v in q.iter_mut() {
                 v.x += 1.0;
             }
         }

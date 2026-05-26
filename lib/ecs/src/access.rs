@@ -544,6 +544,33 @@ impl Access {
         self.components.extend(&other.components);
         self.resources.extend(&other.resources);
     }
+
+    /// The component [`TypeId`]s this system **writes**.
+    ///
+    /// Drives change detection: [`World::run_system`](crate::World::run_system)
+    /// advances each of these storages' clocks once before the system
+    /// runs, so the system's in-place edits stamp a tick strictly past
+    /// any prior observation.
+    pub(crate) fn component_write_ids(&self) -> impl Iterator<Item = TypeId> + '_ {
+        self.components.writes.iter().map(|e| e.id)
+    }
+
+    /// The component [`TypeId`]s this system reads **or** writes.
+    ///
+    /// After the system runs, [`World::run_system`](crate::World::run_system)
+    /// records each storage's current tick as this system's "last seen"
+    /// baseline, so its next run's `Changed<T>` / `Added<T>` compare
+    /// against where it left off. A valid system never names the same
+    /// component in both reads and writes (that self-conflict panics at
+    /// registration), so in practice each `TypeId` appears once; the
+    /// recorder upserts regardless, so any repeat is harmless.
+    pub(crate) fn component_access_ids(&self) -> impl Iterator<Item = TypeId> + '_ {
+        self.components
+            .reads
+            .iter()
+            .chain(self.components.writes.iter())
+            .map(|e| e.id)
+    }
 }
 
 #[cfg(test)]

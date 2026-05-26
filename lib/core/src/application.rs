@@ -2,10 +2,11 @@
 //! nothing about windowing or logging; every capability is supplied
 //! by a [`Plugin`].
 
+use std::any::TypeId;
 use std::collections::HashMap;
 
 use spark_ecs::{
-    Event, Events, IntoSystem, Resource, Schedule, WorkloadBuilder, WorkloadLabel,
+    Access, Event, Events, IntoSystem, Resource, Schedule, WorkloadBuilder, WorkloadLabel,
     WorkloadOrderBuilder, World, swap_events,
 };
 
@@ -14,8 +15,32 @@ use crate::plugin::Plugin;
 use crate::stage::Stage;
 
 type StartupSystem = Box<dyn FnOnce() -> Result<(), EngineError>>;
-type StageSystem = Box<dyn FnMut(&World) + 'static>;
 type Runner = Box<dyn FnOnce(Application) -> Result<(), EngineError>>;
+
+/// A sequential system: its erased run closure, its declared [`Access`],
+/// and its per-component change-detection baselines.
+///
+/// The `last_seen` list is the sequential-path mirror of
+/// `BoxedSystem`'s: [`run`](StageSystem::run) hands it to
+/// [`World::run_system`](spark_ecs::World::run_system), which advances the
+/// clocks of components this system writes, parks `last_seen` as the
+/// [`Changed`](spark_ecs::Changed) / [`Added`](spark_ecs::Added) baseline,
+/// runs, and records where each accessed component's clock landed.
+struct StageSystem {
+    run: Box<dyn FnMut(&World) + 'static>,
+    access: Access,
+    last_seen: Vec<(TypeId, u32)>,
+}
+
+impl StageSystem {
+    /// Runs this system against `world` with per-component change
+    /// detection, updating its `last_seen` baselines. Thin wrapper over
+    /// [`World::run_system`](spark_ecs::World::run_system), shared in
+    /// spirit with the workload path's `BoxedSystem::run`.
+    fn run(&mut self, world: &mut World) {
+        world.run_system(&self.access, &mut self.last_seen, &mut *self.run);
+    }
+}
 
 /// Ordered list of plugins' registered work, plus the optional runner
 /// that takes the main thread after startup.
@@ -310,10 +335,13 @@ impl Application {
     where
         S: IntoSystem<Marker>,
     {
-        self.stages
-            .entry(stage)
-            .or_default()
-            .push(system.into_system());
+        let access = <S as IntoSystem<Marker>>::access();
+        access.assert_no_self_conflict();
+        self.stages.entry(stage).or_default().push(StageSystem {
+            run: system.into_system(),
+            access,
+            last_seen: Vec::new(),
+        });
         self
     }
 
@@ -434,7 +462,11 @@ impl Application {
     pub fn run_stage(&mut self, stage: Stage) {
         if let Some(systems) = self.stages.get_mut(&stage) {
             for system in systems {
-                system(&self.world);
+                // Per-component change-detection dance lives in
+                // `StageSystem::run` → `World::run_system`. `self.world`
+                // and `self.stages` are disjoint fields, so the borrow
+                // checker lets `system` and `&mut self.world` coexist.
+                system.run(&mut self.world);
             }
         }
         // Apply the sequential systems' queued commands *before* the stage's
@@ -526,8 +558,8 @@ impl Application {
 mod tests {
     use super::*;
     use spark_ecs::{
-        Commands, Component, Event, EventReader, EventWriter, Events, Query, ResMut, Resource,
-        WorkloadLabel,
+        Added, Changed, Commands, Component, Event, EventReader, EventWriter, Events, Query,
+        ResMut, Resource, WorkloadLabel,
     };
 
     #[derive(Resource)]
@@ -846,5 +878,59 @@ mod tests {
         app.run_stage(Stage::FixedUpdate);
         app.run_stage(Stage::FixedUpdate);
         assert_eq!(app.world().resource::<Log>().0, vec![5, 5, 5]);
+    }
+
+    // -------- change detection: the 3 caveats, on the sequential path --------
+
+    #[test]
+    fn run_stage_first_run_sees_build_time_component() {
+        // Caveat #1: a component attached before any system ran (here via
+        // `world_mut()`, standing in for plugin `build()`) is visible to a
+        // system's first `Changed` — per-component clocks start at 1,
+        // insert advances to ≥2, the system's baseline starts at 0.
+        #[derive(Component)]
+        struct Hp(u32);
+        #[derive(Resource)]
+        struct Seen(usize);
+        fn observer(q: Query<&Hp, Changed<Hp>>, mut seen: ResMut<Seen>) {
+            // Read the field too, so it isn't dead.
+            seen.0 = q.iter().filter(|hp| hp.0 > 0).count();
+        }
+        let mut app = Application::new();
+        app.add_resource(Seen(0));
+        app.world_mut().spawn().insert(Hp(100)); // "build time"
+        app.add_system(Stage::Update, observer);
+        app.run_stage(Stage::Update);
+        assert_eq!(app.world().resource::<Seen>().0, 1);
+    }
+
+    #[test]
+    fn run_stage_added_sees_command_spawn_even_when_observer_is_last() {
+        // Caveat #3: a `Commands`-spawned entity (flushed after the
+        // stage's sequential systems) is visible to an `Added` observer on
+        // its next run — even though the observer is the *last* system
+        // before the flush. The flush's insert advances the component's
+        // clock past the observer's last-seen baseline.
+        #[derive(Component)]
+        struct Spawned;
+        #[derive(Resource)]
+        struct Seen(usize);
+        fn spawner(mut commands: Commands) {
+            commands.spawn().insert(Spawned);
+        }
+        fn observer(q: Query<&Spawned, Added<Spawned>>, mut seen: ResMut<Seen>) {
+            seen.0 = q.iter().count();
+        }
+        let mut app = Application::new();
+        app.add_resource(Seen(0));
+        app.add_system(Stage::Update, spawner);
+        app.add_system(Stage::Update, observer); // last system before the flush
+        // Frame 1: observer runs before the spawn is flushed → sees nothing.
+        app.run_stage(Stage::Update);
+        assert_eq!(app.world().resource::<Seen>().0, 0);
+        // Frame 2: the frame-1 spawn (flushed at end of frame 1) is now
+        // visible — the architectural fix for the flush-tick boundary.
+        app.run_stage(Stage::Update);
+        assert_eq!(app.world().resource::<Seen>().0, 1);
     }
 }

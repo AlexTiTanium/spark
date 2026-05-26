@@ -114,7 +114,7 @@ use crate::Component;
 use crate::access::{Access, QueryAccess};
 use crate::entity::Entity;
 use crate::filter::QueryFilter;
-use crate::storage::ComponentStorage;
+use crate::storage::{ComponentStorage, Mut};
 use crate::system::SystemParam;
 use crate::world::World;
 
@@ -285,7 +285,7 @@ impl<T: Component> ReadOnlyQueryData for &T {
 
 impl<T: Component> QueryData for &mut T {
     type Item<'w>
-        = &'w mut T
+        = Mut<'w, T>
     where
         Self: 'w;
     type State<'w>
@@ -302,7 +302,7 @@ impl<T: Component> QueryData for &mut T {
 
     fn iter<'s, 'w>(
         state: &'s mut Self::State<'w>,
-    ) -> Box<dyn Iterator<Item = (Entity, &'s mut T)> + 's>
+    ) -> Box<dyn Iterator<Item = (Entity, Mut<'s, T>)> + 's>
     where
         Self: 's,
         Self: 'w,
@@ -335,8 +335,17 @@ impl<T: Component> QueryData for &mut T {
 /// `PhantomData<&'s mut [T]>` ties the view's lifetime to the
 /// storage's exclusive borrow (so it cannot dangle) and gives `T` the
 /// invariance that `&mut` requires.
+///
+/// `changed_ptr` + `current_tick` carry change detection through the
+/// join: `get` builds a [`Mut`] over the matched slot, so a `&mut B` in
+/// `Query<(&mut A, &mut B)>` marks **only** the entities the body writes,
+/// never the rest of `B`'s storage. The pointer aliases the same
+/// `dense_idx` space as `ptr` and obeys the same "fetched at most once"
+/// contract, so the borrows never overlap.
 pub(crate) struct DenseMut<'s, T> {
     ptr: *mut T,
+    changed_ptr: *mut u32,
+    current_tick: u32,
     len: usize,
     sparse: &'s [Option<u32>],
     entity_index: &'s [Entity],
@@ -349,14 +358,28 @@ pub(crate) struct DenseMut<'s, T> {
 // relaxing it crate-wide.
 #[allow(unsafe_code)]
 impl<'s, T> DenseMut<'s, T> {
-    /// Builds a view from the storage's exclusively-borrowed `dense`
-    /// slice plus shared borrows of its `sparse` table and
-    /// `entity_index`. All three at lifetime `'s`; converting `dense`
-    /// to a raw pointer consumes the unique borrow, and
-    /// `PhantomData<&'s mut [T]>` keeps the lifetime tracked.
-    fn new(dense: &'s mut [T], sparse: &'s [Option<u32>], entity_index: &'s [Entity]) -> Self {
+    /// Builds a view from the storage's exclusively-borrowed `dense` and
+    /// `changed_tick` slices plus shared borrows of its `sparse` table and
+    /// `entity_index`, and the component's `current_tick`. All at lifetime
+    /// `'s`; converting `dense` / `changed_tick` to raw pointers consumes
+    /// the unique borrows. `PhantomData<&'s mut [T]>` keeps `'s` tracked
+    /// and `T` invariant; `changed_ptr` needs no separate phantom — it
+    /// comes from the same `split_for_join(&mut self)` call on the same
+    /// `RefMut`-guarded storage, so it shares `'s` and cannot dangle, and
+    /// a `*mut u32` is already invariant in its pointee.
+    /// `changed_tick.len() == dense.len()` by the `ComponentStorage`
+    /// parallel-array invariant.
+    fn new(
+        dense: &'s mut [T],
+        changed_tick: &'s mut [u32],
+        sparse: &'s [Option<u32>],
+        entity_index: &'s [Entity],
+        current_tick: u32,
+    ) -> Self {
         Self {
             ptr: dense.as_mut_ptr(),
+            changed_ptr: changed_tick.as_mut_ptr(),
+            current_tick,
             len: dense.len(),
             sparse,
             entity_index,
@@ -364,10 +387,14 @@ impl<'s, T> DenseMut<'s, T> {
         }
     }
 
-    /// Returns a mutable reference to `entity`'s component, or `None`
-    /// if this storage has no entry for `entity` (or holds a stale
+    /// Returns a change-marking [`Mut`] handle to `entity`'s component, or
+    /// `None` if this storage has no entry for `entity` (or holds a stale
     /// handle to a recycled slot — same generation check
     /// [`ComponentStorage::get_mut`] uses).
+    ///
+    /// Like [`ComponentStorage::iter_mut`], the returned `Mut` marks the
+    /// component changed only when the caller writes through it — `get`
+    /// itself stamps nothing.
     ///
     /// # Safety
     ///
@@ -376,16 +403,18 @@ impl<'s, T> DenseMut<'s, T> {
     /// alias. See the module-level *Joins* docs for how the
     /// `(D1, &mut T)` arity-2 impl upholds this — structural driver
     /// shape plus [`QueryAccess::assert_no_self_conflict`] at query
-    /// construction.
+    /// construction. The same once-per-entity contract makes the two raw
+    /// borrows below sound: each slot (value + `changed_tick`) is handed
+    /// out at most once across `'s`, so no live borrow overlaps.
     ///
     /// Also assumes `ComponentStorage`'s sparse/dense parallel-array
     /// invariant: every `Some(idx)` in `sparse` points at an in-bounds
-    /// `dense` slot. The `debug_assert!` catches violations in tests;
-    /// release builds trust the invariant — or rather, the
-    /// bounds-checked `entity_index[dense_idx]` access below would
-    /// panic first, so reaching the `ptr.add` proves the index is in
-    /// bounds.
-    unsafe fn get(&self, entity: Entity) -> Option<&'s mut T> {
+    /// `dense` slot, and `changed_tick` is the same length as `dense`.
+    /// The `debug_assert!` catches violations in tests; release builds
+    /// trust the invariant — or rather, the bounds-checked
+    /// `entity_index[dense_idx]` access below would panic first, so
+    /// reaching the `ptr.add` proves the index is in bounds.
+    unsafe fn get(&self, entity: Entity) -> Option<Mut<'s, T>> {
         let dense_idx = (*self.sparse.get(entity.index as usize)?)? as usize;
         debug_assert!(
             dense_idx < self.len,
@@ -396,16 +425,26 @@ impl<'s, T> DenseMut<'s, T> {
         // `None`, matching `ComponentStorage::get_mut`. The Vec
         // indexing is bounds-checked in release too, so reaching the
         // `ptr.add` below proves `dense_idx < entity_index.len() ==
-        // dense.len() == self.len`.
+        // dense.len() == changed_tick.len() == self.len`.
         if self.entity_index[dense_idx] != entity {
             return None;
         }
-        // SAFETY: `dense_idx < self.len` (established by the
-        // bounds-checked `entity_index[dense_idx]` above plus the
-        // sparse/dense parallel-array invariant), and by this fn's
-        // contract this entity is fetched at most once across `'s`, so
-        // no other live `&mut` overlaps this slot.
-        Some(unsafe { &mut *self.ptr.add(dense_idx) })
+        // SAFETY: bounds for BOTH borrows:
+        //   1. The `entity_index[dense_idx]` access above is bounds-checked,
+        //      so `dense_idx < entity_index.len()`.
+        //   2. The `ComponentStorage` parallel-array invariant keeps
+        //      `entity_index.len() == dense.len() == changed_tick.len()`,
+        //      and `DenseMut::new` set `self.len = dense.len()` and took
+        //      `changed_tick` as a `&'s mut [u32]` of that same length —
+        //      so both `ptr.add(dense_idx)` and `changed_ptr.add(dense_idx)`
+        //      are in bounds.
+        // Aliasing: by this fn's contract the entity is fetched at most
+        // once across `'s` (the driver's linear scan visits each entity
+        // once), so neither `&'s mut` below overlaps another live borrow.
+        // The returned `Mut` stamps the tick only if the caller writes.
+        let value = unsafe { &mut *self.ptr.add(dense_idx) };
+        let changed = unsafe { &mut *self.changed_ptr.add(dense_idx) };
+        Some(Mut::new(value, changed, self.current_tick))
     }
 }
 
@@ -444,10 +483,20 @@ impl<'s, T> DenseMut<'s, T> {
 // for that position. They keep `impl_one_combo!` body free of
 // per-flag branching.
 
-/// `&'w T` for `R`, `&'w mut T` for `W`.
-macro_rules! item_type {
+/// `&'w T` for `R`, `&'w mut T` for `W` — the type a user *writes* in the
+/// query shape, used as the `impl QueryData for (…)` target.
+macro_rules! decl_type {
     (R $T:ident, $w:lifetime) => { &$w $T };
     (W $T:ident, $w:lifetime) => { &$w mut $T };
+}
+
+/// `&'w T` for `R`, `Mut<'w, T>` for `W` — the type iteration *yields*
+/// (the `Item<'w>` associated type), so a tuple's mutable elements stamp
+/// only on actual write. Distinct from [`decl_type!`]: `Query<(&A, &mut B)>`
+/// is spelled with `&mut B` but yields `Mut<'_, B>`.
+macro_rules! item_type {
+    (R $T:ident, $w:lifetime) => { &$w $T };
+    (W $T:ident, $w:lifetime) => { Mut<$w, $T> };
 }
 
 /// `Option<Ref<'w, ComponentStorage<T>>>` for `R`, `Option<RefMut<…>>`
@@ -491,8 +540,8 @@ macro_rules! build_non_driver_fetch {
     };
     (W, $state:ident) => {
         $state.as_mut().map(|refmut| {
-            let (dense, sparse, entity_index) = refmut.split_for_join();
-            DenseMut::new(dense, sparse, entity_index)
+            let (dense, changed_tick, sparse, entity_index, current_tick) = refmut.split_for_join();
+            DenseMut::new(dense, changed_tick, sparse, entity_index, current_tick)
         })
     };
 }
@@ -557,7 +606,7 @@ macro_rules! impl_one_combo {
     (@gen $first_flag:ident $First:ident, $($rest_flag:ident $Rest:ident,)+) => {
         #[allow(unsafe_code)]
         impl<$First: Component, $($Rest: Component),+>
-            QueryData for (item_type!($first_flag $First, '_), $(item_type!($rest_flag $Rest, '_),)+)
+            QueryData for (decl_type!($first_flag $First, '_), $(decl_type!($rest_flag $Rest, '_),)+)
         {
             type Item<'w>
                 = (item_type!($first_flag $First, 'w), $(item_type!($rest_flag $Rest, 'w),)+)
@@ -761,7 +810,7 @@ impl_all_tuple!(A, B, C, D, E);
 /// {
 ///     let mut q = Query::<(&mut Position, &Velocity)>::from_world(&world);
 ///     let mut touched = 0;
-///     for (pos, vel) in q.iter_mut() {
+///     for (mut pos, vel) in q.iter_mut() {
 ///         pos.x += vel.x;
 ///         pos.y += vel.y;
 ///         touched += 1;
@@ -869,7 +918,7 @@ impl<'w, D: QueryData + 'w, F: QueryFilter> Query<'w, D, F> {
     ///     // shared read below — two outstanding borrows of the same
     ///     // storage cell (one mut, one shared) would panic.
     ///     let mut q = Query::<&mut Velocity>::from_world(&world);
-    ///     for v in q.iter_mut() {
+    ///     for mut v in q.iter_mut() {
     ///         v.x *= 2.0;
     ///         v.y *= 2.0;
     ///     }
@@ -899,7 +948,7 @@ impl<'w, D: QueryData + 'w, F: QueryFilter> Query<'w, D, F> {
     ///
     /// {
     ///     let mut q = Query::<(&mut Position, &mut Velocity)>::from_world(&world);
-    ///     for (pos, vel) in q.iter_mut() {
+    ///     for (mut pos, mut vel) in q.iter_mut() {
     ///         pos.x += vel.x;
     ///         pos.y += vel.y;
     ///         // Both sides mutable — apply drag on the way out.
@@ -1095,7 +1144,7 @@ impl<'q, 'w, D: ReadOnlyQueryData + 'w, F: QueryFilter> IntoIterator for &'q Que
 ///
 /// {
 ///     let mut q = Query::<(&mut Position, &Velocity)>::from_world(&world);
-///     for (pos, vel) in &mut q {
+///     for (mut pos, vel) in &mut q {
 ///         pos.x += vel.x;
 ///         pos.y += vel.y;
 ///     }
@@ -1176,7 +1225,7 @@ mod tests {
         let (world, _) = world_with_three_movers();
         {
             let mut q = Query::<&mut Position>::from_world(&world);
-            for p in q.iter_mut() {
+            for mut p in q.iter_mut() {
                 p.0 += 100;
             }
         }
@@ -1206,7 +1255,7 @@ mod tests {
         {
             let mut q = Query::<&mut Position>::from_world(&world);
             // `for … in &mut q` is the `IntoIterator for &mut Query` sugar.
-            for p in &mut q {
+            for mut p in &mut q {
                 p.0 += 100;
             }
         }
@@ -1261,7 +1310,7 @@ mod tests {
         let (world, entities) = world_with_three_movers();
         {
             let mut q = Query::<(&mut Position, &Velocity)>::from_world(&world);
-            for (pos, vel) in q.iter_mut() {
+            for (mut pos, vel) in q.iter_mut() {
                 pos.0 += vel.0;
                 pos.1 += vel.1;
             }
@@ -1290,7 +1339,7 @@ mod tests {
         let e1 = world.spawn().insert(Position(99, 99)).id();
         {
             let mut q = Query::<(&mut Position, &Velocity)>::from_world(&world);
-            for (pos, vel) in q.iter_mut() {
+            for (mut pos, vel) in q.iter_mut() {
                 pos.0 += vel.0;
                 pos.1 += vel.1;
             }
@@ -1421,7 +1470,7 @@ mod tests {
             .insert(Velocity(7, 7));
         {
             let mut q = Query::<(&mut Position, &Velocity, &Marker)>::from_world(&world);
-            for (pos, vel, _marker) in q.iter_mut() {
+            for (mut pos, vel, _marker) in q.iter_mut() {
                 pos.0 += vel.0;
                 pos.1 += vel.1;
             }
@@ -1436,7 +1485,7 @@ mod tests {
         // the system fn declares `Query<…>` and the runner builds it.
         let (world, entities) = world_with_three_movers();
         fn step(mut q: Query<(&mut Position, &Velocity)>) {
-            for (pos, vel) in q.iter_mut() {
+            for (mut pos, vel) in q.iter_mut() {
                 pos.0 += vel.0;
                 pos.1 += vel.1;
             }
@@ -1462,7 +1511,7 @@ mod tests {
         let (world, entities) = world_with_three_movers();
         {
             let mut q = Query::<(&mut Position, &mut Velocity)>::from_world(&world);
-            for (pos, vel) in q.iter_mut() {
+            for (mut pos, mut vel) in q.iter_mut() {
                 pos.0 += vel.0;
                 pos.1 += vel.1;
                 // Mutate B too — proves the second slot really is `&mut`.
@@ -1495,7 +1544,7 @@ mod tests {
         let e1 = world.spawn().insert(Position(99, 99)).id();
         {
             let mut q = Query::<(&mut Position, &mut Velocity)>::from_world(&world);
-            for (pos, vel) in q.iter_mut() {
+            for (mut pos, mut vel) in q.iter_mut() {
                 pos.0 += vel.0;
                 pos.1 += vel.1;
                 vel.0 = -1;
@@ -1611,7 +1660,7 @@ mod tests {
             .id();
         {
             let mut q = Query::<(&mut Position, &mut Velocity, &mut Marker)>::from_world(&world);
-            for (pos, vel, _marker) in q.iter_mut() {
+            for (mut pos, mut vel, _marker) in q.iter_mut() {
                 pos.0 += vel.0;
                 pos.1 += vel.1;
                 vel.0 = -5;
@@ -1635,7 +1684,7 @@ mod tests {
             .id();
         {
             let mut q = Query::<(&mut A, &mut B, &mut C, &mut D)>::from_world(&world);
-            for (a, b, c, d) in q.iter_mut() {
+            for (mut a, mut b, mut c, mut d) in q.iter_mut() {
                 a.0 += 100;
                 b.0 += 100;
                 c.0 += 100;
@@ -1665,7 +1714,7 @@ mod tests {
             .id();
         {
             let mut q = Query::<(&A, &mut B, &C, &mut D, &E)>::from_world(&world);
-            for (a, b, c, d, e_item) in q.iter_mut() {
+            for (a, mut b, c, mut d, e_item) in q.iter_mut() {
                 b.0 = a.0 + c.0 + e_item.0; // 1 + 3 + 5 = 9
                 d.0 = a.0 + c.0 + e_item.0; // 9
             }
@@ -1690,7 +1739,7 @@ mod tests {
             .id();
         {
             let mut q = Query::<(&Position, &mut Velocity)>::from_world(&world);
-            for (pos, vel) in q.iter_mut() {
+            for (pos, mut vel) in q.iter_mut() {
                 vel.0 += pos.0;
                 vel.1 += pos.1;
             }
@@ -1713,7 +1762,7 @@ mod tests {
             .id();
         {
             let mut q = Query::<(&Position, &mut Velocity, &Marker)>::from_world(&world);
-            for (pos, vel, _marker) in q.iter_mut() {
+            for (pos, mut vel, _marker) in q.iter_mut() {
                 vel.0 += pos.0;
                 vel.1 += pos.1;
             }
@@ -1760,7 +1809,7 @@ mod tests {
         // (&A, &B, &mut C): only C is mutable.
         {
             let mut q = Query::<(&A, &B, &mut C)>::from_world(&world);
-            for (a, b, c) in q.iter_mut() {
+            for (a, b, mut c) in q.iter_mut() {
                 c.0 = a.0 + b.0;
             }
         }
@@ -1771,7 +1820,7 @@ mod tests {
         // (&mut A, &mut B, &C): A and B mutable, C read.
         {
             let mut q = Query::<(&mut A, &mut B, &C)>::from_world(&world);
-            for (a, b, c) in q.iter_mut() {
+            for (mut a, mut b, c) in q.iter_mut() {
                 a.0 = c.0 * 10;
                 b.0 = c.0 * 20;
             }
@@ -1783,7 +1832,7 @@ mod tests {
         // (&mut A, &B, &mut C): muts at outer positions.
         {
             let mut q = Query::<(&mut A, &B, &mut C)>::from_world(&world);
-            for (a, b, c) in q.iter_mut() {
+            for (mut a, b, mut c) in q.iter_mut() {
                 a.0 = b.0 + 100;
                 c.0 = b.0 + 200;
             }
@@ -1795,7 +1844,7 @@ mod tests {
         // (&A, &mut B, &mut C): read driver, two muts.
         {
             let mut q = Query::<(&A, &mut B, &mut C)>::from_world(&world);
-            for (a, b, c) in q.iter_mut() {
+            for (a, mut b, mut c) in q.iter_mut() {
                 b.0 = a.0 + 1;
                 c.0 = a.0 + 2;
             }
@@ -1823,7 +1872,7 @@ mod tests {
         // (&mut A, &mut B, &C, &D): muts at first two positions.
         {
             let mut q = Query::<(&mut A, &mut B, &C, &D)>::from_world(&world);
-            for (a, b, c, d) in q.iter_mut() {
+            for (mut a, mut b, c, d) in q.iter_mut() {
                 a.0 = c.0 + d.0;
                 b.0 = c.0 * d.0;
             }
@@ -1836,7 +1885,7 @@ mod tests {
         // (&A, &mut B, &mut C, &mut D): read driver, three muts.
         {
             let mut q = Query::<(&A, &mut B, &mut C, &mut D)>::from_world(&world);
-            for (a, b, c, d) in q.iter_mut() {
+            for (a, mut b, mut c, mut d) in q.iter_mut() {
                 b.0 = a.0 + 100;
                 c.0 = a.0 + 200;
                 d.0 = a.0 + 300;
@@ -1850,7 +1899,7 @@ mod tests {
         // (&mut A, &B, &mut C, &mut D): muts at positions 0, 2, 3.
         {
             let mut q = Query::<(&mut A, &B, &mut C, &mut D)>::from_world(&world);
-            for (a, b, c, d) in q.iter_mut() {
+            for (mut a, b, mut c, mut d) in q.iter_mut() {
                 a.0 = b.0 + 1000;
                 c.0 = b.0 + 2000;
                 d.0 = b.0 + 3000;
@@ -1864,7 +1913,7 @@ mod tests {
         // (&A, &mut B, &C, &mut D): alternating mut/read.
         {
             let mut q = Query::<(&A, &mut B, &C, &mut D)>::from_world(&world);
-            for (a, b, c, d) in q.iter_mut() {
+            for (a, mut b, c, mut d) in q.iter_mut() {
                 b.0 = a.0 - c.0;
                 d.0 = a.0 - c.0;
             }
@@ -1905,9 +1954,10 @@ mod tests {
         let mut alloc = EntityAllocator::new();
         let live = alloc.allocate();
         let mut dense = vec![Position(7, 7)];
+        let mut changed = vec![0_u32];
         let sparse = vec![Some(0_u32)];
         let entity_index = vec![live];
-        let view = DenseMut::<Position>::new(&mut dense, &sparse, &entity_index);
+        let view = DenseMut::<Position>::new(&mut dense, &mut changed, &sparse, &entity_index, 1);
         // SAFETY: single call per entity — no aliasing.
         let live_ref = unsafe { view.get(live) };
         assert!(live_ref.is_some());
@@ -1919,7 +1969,7 @@ mod tests {
         let fresh = alloc.allocate();
         assert_eq!(live.index, fresh.index);
         assert_ne!(live, fresh);
-        let view = DenseMut::<Position>::new(&mut dense, &sparse, &entity_index);
+        let view = DenseMut::<Position>::new(&mut dense, &mut changed, &sparse, &entity_index, 1);
         // SAFETY: distinct entity from the call above (different
         // generation); single call.
         let stale_ref = unsafe { view.get(fresh) };
@@ -2026,7 +2076,7 @@ mod tests {
         let plain = world.spawn().insert(Position(2, 2)).id();
         {
             let mut q = Query::<&mut Position, With<Marker>>::from_world(&world);
-            for p in q.iter_mut() {
+            for mut p in q.iter_mut() {
                 p.0 += 100;
             }
         }
@@ -2081,7 +2131,7 @@ mod tests {
         world.spawn().insert(Position(1, 1)).insert(Marker);
         world.spawn().insert(Position(2, 2));
         fn bump_marked(mut q: Query<&mut Position, With<Marker>>) {
-            for p in q.iter_mut() {
+            for mut p in q.iter_mut() {
                 p.0 += 10;
             }
         }
@@ -2093,5 +2143,51 @@ mod tests {
             .collect();
         assert!(xs.contains(&11)); // marked entity moved
         assert!(xs.contains(&2)); // unmarked entity untouched
+    }
+
+    // -------- change detection: precise `Mut` marking --------
+
+    #[test]
+    fn join_does_not_overmark_driver_for_unjoined_entities() {
+        // The headline fix: in `Query<(&mut Position, &mut Velocity)>` the
+        // driver (Position) visits *every* Position entity, but the join
+        // drops those lacking Velocity. With `Mut`, a dropped entity's
+        // Position is never `DerefMut`'d, so it is NOT marked changed.
+        let mut world = World::new();
+        let both = world
+            .spawn()
+            .insert(Position(1, 1))
+            .insert(Velocity(1, 1))
+            .id(); // Position.changed = 2 (clock 1→2)
+        let pos_only = world.spawn().insert(Position(5, 5)).id(); // changed = 3
+        let _bump = world.spawn().insert(Position(0, 0)).id(); // clock → 4
+        {
+            let mut q = Query::<(&mut Position, &mut Velocity)>::from_world(&world);
+            for (mut p, mut v) in q.iter_mut() {
+                p.0 += 1; // marks Position for the joined entity only
+                v.0 += 1;
+            }
+        }
+        let pos = world.storage::<Position>().unwrap();
+        // `both` was written → marked at Position's clock (4).
+        assert_eq!(pos.changed_tick_for(both), Some(4));
+        // `pos_only` was visited by the driver but the join dropped it and
+        // the body never wrote it → its mark stays at its insert tick (3).
+        assert_eq!(pos.changed_tick_for(pos_only), Some(3));
+    }
+
+    #[test]
+    fn read_only_iteration_marks_nothing() {
+        let mut world = World::new();
+        let e = world.spawn().insert(Position(7, 7)).id(); // changed = 2
+        {
+            let q = Query::<&Position>::from_world(&world);
+            assert_eq!(q.iter().count(), 1);
+        }
+        // The read path never takes a `Mut`, so nothing is marked.
+        assert_eq!(
+            world.storage::<Position>().unwrap().changed_tick_for(e),
+            Some(2)
+        );
     }
 }

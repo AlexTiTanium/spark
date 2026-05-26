@@ -46,6 +46,33 @@
 //! conservative on purpose, since the scheduler needs the worst case
 //! even though any single entity may have matched via only one branch.
 //!
+//! # Change detection ([`Changed<T>`] / [`Added<T>`])
+//!
+//! These read the per-component change-detection clock. **Each component
+//! type owns its own clock** ([`ComponentStorage::current_tick`]): it
+//! advances when `T` is inserted, and once before any system that
+//! declares a write of `T`. Every entity's slot records the tick it was
+//! last written (`changed_tick`) and first attached (`added_tick`). A
+//! system carries one *baseline* per component it touches — the tick that
+//! component's clock read when it last ran — which the scheduler parks on
+//! the world via [`World::baseline_for`](crate::World::baseline_for) for
+//! the static [`matches`](QueryFilter::matches) to read.
+//!
+//! [`Changed<T>`] passes when `changed_tick > baseline`; [`Added<T>`]
+//! when `added_tick > baseline` (a one-shot, since `added_tick` never
+//! moves after the attach). Both report a **read** of `T`, like
+//! [`With<T>`], so `Query<&mut T, Changed<T>>` is a self-conflict (use
+//! `&T`, or detect a *different* component).
+//!
+//! Marking is **precise**: a `Query<&mut T>` yields [`Mut<T>`](crate::Mut),
+//! which stamps `changed_tick` only on an actual write (`DerefMut`). An
+//! entity merely visited by a tuple's driver, dropped by the join, or
+//! excluded by a filter is never stamped. And because each component's
+//! clock starts at 1 while a fresh system's baseline is 0, a component
+//! attached before any system ran is seen on that system's first run.
+//!
+//! [`ComponentStorage::current_tick`]: crate::ComponentStorage
+//! [`Mut<T>`]: crate::Mut
 //! [`Query`]: crate::Query
 //! [`QueryData`]: crate::QueryData
 //! [`QueryData::init_state`]: crate::QueryData::init_state
@@ -198,6 +225,101 @@ impl<T: Component> QueryFilter for Without<T> {
 
     fn collect_access(_access: &mut QueryAccess) {
         // Pure exclusion — reports no access. See module docs for why.
+    }
+}
+
+/// Keeps only entities whose `T` was **written** since the calling system
+/// last ran (insert, overwrite, or a `&mut T` write through [`Mut`]).
+///
+/// Zero-sized, like [`With<T>`]. Each component type carries its own
+/// change-detection clock; this compares the entity's `changed_tick`
+/// against [`World::baseline_for::<T>`](crate::World::baseline_for) — the
+/// tick `T`'s clock read when this system last ran — with a strict `>`.
+/// Reports a **read** of `T`, so pairing it with a `&mut T` data shape is
+/// a self-conflict (read with `&T`, or filter on a different component).
+///
+/// Iterating a `Query<&mut T>` marks an entity changed only when the body
+/// actually writes it (via [`Mut`]'s `DerefMut`), so `Changed<T>` is
+/// precise — no over-marking of merely-visited or filtered-out entities.
+///
+/// [`Mut`]: crate::Mut
+///
+/// # Examples
+///
+/// ```
+/// use spark_ecs::{Changed, Component, Query, World};
+///
+/// #[derive(Component)]
+/// struct Health(u32);
+///
+/// let mut world = World::new();
+/// world.spawn().insert(Health(100)); // Health's clock advances on insert
+///
+/// // With no baseline parked (system never ran → baseline 0), the fresh
+/// // insert counts as changed.
+/// let changed = Query::<&Health, Changed<Health>>::from_world(&world)
+///     .iter()
+///     .count();
+/// assert_eq!(changed, 1);
+/// ```
+pub struct Changed<T>(PhantomData<T>);
+
+impl<T: Component> QueryFilter for Changed<T> {
+    fn matches(entity: Entity, world: &World) -> bool {
+        world.storage::<T>().is_some_and(|storage| {
+            storage
+                .changed_tick_for(entity)
+                .is_some_and(|tick| tick > world.baseline_for::<T>())
+        })
+    }
+
+    fn collect_access(access: &mut QueryAccess) {
+        access.add_read::<T>();
+    }
+}
+
+/// Keeps only entities to which `T` was **newly attached** since the
+/// calling system last ran — a one-shot signal, unlike the every-write
+/// [`Changed<T>`].
+///
+/// Zero-sized, like [`With<T>`]. Compares the entity's `added_tick` (set
+/// only on a fresh attach, never re-stamped by overwrite or `&mut`)
+/// against [`World::baseline_for::<T>`](crate::World::baseline_for) with a
+/// strict `>`. Reports a **read** of `T`, same as [`With<T>`].
+///
+/// Because `added_tick` does not move on later writes, an entity matches
+/// `Added<T>` for exactly the run after its `T` was attached and never
+/// again (until the component is removed and re-added).
+///
+/// # Examples
+///
+/// ```
+/// use spark_ecs::{Added, Component, Query, World};
+///
+/// #[derive(Component)]
+/// struct Spawned;
+///
+/// let mut world = World::new();
+/// world.spawn().insert(Spawned);
+///
+/// let added = Query::<&Spawned, Added<Spawned>>::from_world(&world)
+///     .iter()
+///     .count();
+/// assert_eq!(added, 1);
+/// ```
+pub struct Added<T>(PhantomData<T>);
+
+impl<T: Component> QueryFilter for Added<T> {
+    fn matches(entity: Entity, world: &World) -> bool {
+        world.storage::<T>().is_some_and(|storage| {
+            storage
+                .added_tick_for(entity)
+                .is_some_and(|tick| tick > world.baseline_for::<T>())
+        })
+    }
+
+    fn collect_access(access: &mut QueryAccess) {
+        access.add_read::<T>();
     }
 }
 
@@ -421,5 +543,86 @@ mod tests {
         }))
         .is_err();
         assert!(conflicted, "And should union child access (read of B)");
+    }
+
+    // -------- change-detection filters --------
+
+    use crate::Access;
+    use std::any::TypeId;
+
+    /// Evaluates `F::matches(e)` with `baseline` parked as the running
+    /// system's per-component baselines — exactly how the scheduler feeds
+    /// `Changed`/`Added`. Empty access ⇒ no clock advance, no observe.
+    fn matches_with<F: QueryFilter>(
+        world: &mut World,
+        e: Entity,
+        baseline: &[(TypeId, u32)],
+    ) -> bool {
+        let access = Access::new();
+        let mut last_seen = baseline.to_vec();
+        let mut result = false;
+        world.run_system(&access, &mut last_seen, &mut |w| {
+            result = F::matches(e, w);
+        });
+        result
+    }
+
+    #[test]
+    fn changed_matches_when_clock_is_past_baseline() {
+        let mut world = World::new();
+        let e = world.spawn().insert(A).id(); // A's clock 1→2, changed = 2
+        let aid = TypeId::of::<A>();
+        assert!(matches_with::<Changed<A>>(&mut world, e, &[(aid, 1)])); // 2 > 1
+        assert!(!matches_with::<Changed<A>>(&mut world, e, &[(aid, 2)])); // 2 > 2 false
+    }
+
+    #[test]
+    fn added_is_one_shot_but_changed_repeats() {
+        let mut world = World::new();
+        let e = world.spawn().insert(A).id(); // added = changed = 2
+        world.insert(e, A); // overwrite: clock → 3, changed = 3, added stays 2
+        let aid = TypeId::of::<A>();
+        // From baseline 2: Added (2 > 2) is false; Changed (3 > 2) is true.
+        assert!(!matches_with::<Added<A>>(&mut world, e, &[(aid, 2)]));
+        assert!(matches_with::<Changed<A>>(&mut world, e, &[(aid, 2)]));
+    }
+
+    #[test]
+    fn change_filters_compose_with_combinators() {
+        let (mut world, only_a, a_and_b, _a_and_c) = world_abc();
+        let aid = TypeId::of::<A>();
+        let bid = TypeId::of::<B>();
+        let cid = TypeId::of::<C>();
+        // Has A and B was changed since baseline 0.
+        assert!(matches_with::<And<(With<A>, Changed<B>)>>(
+            &mut world,
+            a_and_b,
+            &[(aid, 0), (bid, 0)]
+        ));
+        // only_a lacks B → the And fails.
+        assert!(!matches_with::<And<(With<A>, Changed<B>)>>(
+            &mut world,
+            only_a,
+            &[(aid, 0), (bid, 0)]
+        ));
+        // B or C added since baseline 0 — a_and_b has B.
+        assert!(matches_with::<Or<(Added<B>, Added<C>)>>(
+            &mut world,
+            a_and_b,
+            &[(bid, 0), (cid, 0)]
+        ));
+        assert!(!matches_with::<Or<(Added<B>, Added<C>)>>(
+            &mut world,
+            only_a,
+            &[(bid, 0), (cid, 0)]
+        ));
+    }
+
+    #[test]
+    fn change_filters_on_unknown_component_match_nobody() {
+        let mut world = World::new();
+        let e = world.spawn().insert(A).id();
+        assert!(!matches_with::<Changed<B>>(&mut world, e, &[]));
+        assert!(!matches_with::<Added<B>>(&mut world, e, &[]));
     }
 }
