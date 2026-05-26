@@ -2,11 +2,10 @@
 //! nothing about windowing or logging; every capability is supplied
 //! by a [`Plugin`].
 
-use std::any::TypeId;
 use std::collections::HashMap;
 
 use spark_ecs::{
-    Access, Event, Events, IntoSystem, Resource, Schedule, WorkloadBuilder, WorkloadLabel,
+    Event, Events, IntoSystem, Resource, Schedule, System, WorkloadBuilder, WorkloadLabel,
     WorkloadOrderBuilder, World, swap_events,
 };
 
@@ -16,36 +15,6 @@ use crate::stage::Stage;
 
 type StartupSystem = Box<dyn FnOnce() -> Result<(), EngineError>>;
 type Runner = Box<dyn FnOnce(Application) -> Result<(), EngineError>>;
-
-/// A sequential system: its erased run closure, its declared [`Access`],
-/// and its per-component change-detection baselines.
-///
-/// This is the deliberate sequential-path twin of `spark-ecs`'s
-/// `BoxedSystem` (the workload path) — they can't share one concrete type
-/// because they live in separate crates, but both delegate the tick dance
-/// to the same [`World::run_system`](spark_ecs::World::run_system).
-///
-/// The `last_seen` list is the sequential-path mirror of
-/// `BoxedSystem`'s: [`run`](StageSystem::run) hands it to
-/// [`World::run_system`](spark_ecs::World::run_system), which advances the
-/// clocks of components this system writes, parks `last_seen` as the
-/// [`Changed`](spark_ecs::Changed) / [`Added`](spark_ecs::Added) baseline,
-/// runs, and records where each accessed component's clock landed.
-struct StageSystem {
-    run: Box<dyn FnMut(&World) + 'static>,
-    access: Access,
-    last_seen: Vec<(TypeId, u32)>,
-}
-
-impl StageSystem {
-    /// Runs this system against `world` with per-component change
-    /// detection, updating its `last_seen` baselines. Thin wrapper over
-    /// [`World::run_system`](spark_ecs::World::run_system), shared in
-    /// spirit with the workload path's `BoxedSystem::run`.
-    fn run(&mut self, world: &mut World) {
-        world.run_system(&self.access, &mut self.last_seen, &mut *self.run);
-    }
-}
 
 /// Ordered list of plugins' registered work, plus the optional runner
 /// that takes the main thread after startup.
@@ -86,7 +55,10 @@ pub struct Application {
     startup: Vec<StartupSystem>,
     /// **Sequential** systems per stage: run in registration order, in the
     /// calling thread, no batching. Fed by [`add_system`](Self::add_system).
-    stages: HashMap<Stage, Vec<StageSystem>>,
+    /// Each is a [`spark_ecs::System`] — the same record the workload
+    /// scheduler stores — so the sequential path reuses its construction
+    /// and change-detection wiring rather than duplicating it.
+    stages: HashMap<Stage, Vec<System>>,
     /// **Parallel-capable** workloads per stage, lazily created — a stage
     /// with no workloads has no [`Schedule`]. Fed by
     /// [`add_workload`](Self::add_workload).
@@ -340,13 +312,13 @@ impl Application {
     where
         S: IntoSystem<Marker>,
     {
-        let access = <S as IntoSystem<Marker>>::access();
-        access.assert_no_self_conflict();
-        self.stages.entry(stage).or_default().push(StageSystem {
-            run: system.into_system(),
-            access,
-            last_seen: Vec::new(),
-        });
+        // `System::from_system` extracts the access, refuses a
+        // self-conflict, and wires up change detection — the same path the
+        // workload scheduler uses, so the two never drift.
+        self.stages
+            .entry(stage)
+            .or_default()
+            .push(System::from_system(system));
         self
     }
 
@@ -468,9 +440,9 @@ impl Application {
         if let Some(systems) = self.stages.get_mut(&stage) {
             for system in systems {
                 // Per-component change-detection dance lives in
-                // `StageSystem::run` → `World::run_system`. `self.world`
-                // and `self.stages` are disjoint fields, so the borrow
-                // checker lets `system` and `&mut self.world` coexist.
+                // `System::run` → `World::run_system`. `self.world` and
+                // `self.stages` are disjoint fields, so the borrow checker
+                // lets `system` and `&mut self.world` coexist.
                 system.run(&mut self.world);
             }
         }

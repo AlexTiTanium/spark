@@ -28,7 +28,7 @@ pub use scheduler::{Schedule, WorkloadOrderBuilder};
 pub use storage::{AnyStorage, ComponentStorage, Mut};
 pub use system::{IntoSystem, Res, ResMut, SystemParam};
 pub use workload::{
-    IntoSystemTuple, SystemId, SystemOrderBuilder, SystemRef, WorkloadBuilder, WorkloadId,
+    IntoSystemTuple, System, SystemId, SystemOrderBuilder, SystemRef, WorkloadBuilder, WorkloadId,
     WorkloadLabel,
 };
 pub use world::{EntityMut, World};

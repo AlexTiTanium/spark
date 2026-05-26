@@ -372,7 +372,7 @@ impl Schedule {
             for batch in &batches {
                 for &SystemId(sidx) in batch {
                     // The per-component change-detection tick dance lives
-                    // in `BoxedSystem::run` → `World::run_system`.
+                    // in `System::run` → `World::run_system`.
                     self.workloads[widx].systems[sidx].run(world);
                 }
             }
