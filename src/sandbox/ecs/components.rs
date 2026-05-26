@@ -74,3 +74,13 @@ pub(super) struct Operational;
 /// Marker: the building is down for repairs.
 #[derive(Component)]
 pub(super) struct UnderMaintenance;
+
+// ----- Change-detection-demo component -----
+
+/// Battery charge, 0–100 percent. Drives the
+/// [`super::change_detection`] demo: `recharge_low` tops up only the
+/// cells below full, so the `Mut<Charge>` marks just those — and a
+/// `Changed<Charge>` reactor sees the count fall to zero as the pack
+/// fills, demonstrating precise (not blanket) change marking.
+#[derive(Debug, Component)]
+pub(super) struct Charge(pub(super) u32);

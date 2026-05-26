@@ -41,6 +41,7 @@
 //! shape, and a filtered mutation. Each logs its expected vs actual
 //! matches; see the module docs for the roster and outcome tables.
 
+mod change_detection;
 mod components;
 mod filters;
 mod plugin;

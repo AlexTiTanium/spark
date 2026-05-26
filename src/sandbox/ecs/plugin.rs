@@ -12,6 +12,7 @@
 
 use spark_core::{Application, Plugin, Stage};
 
+use super::change_detection::{recharge_low, report_recharged, seed_batteries};
 use super::filters::{
     and_filter, bump_powered_capacity, filtered_join, nested_filter, or_filter, spawn_filter_demo,
     with_filter, without_filter,
@@ -71,5 +72,15 @@ impl Plugin for EcsSandboxPlugin {
             .add_system(Stage::PreUpdate, nested_filter)
             .add_system(Stage::PreUpdate, filtered_join)
             .add_system(Stage::PreUpdate, bump_powered_capacity);
+
+        // ----- Change-detection demo (`Changed<T>`) -----
+        //
+        // Seed a battery roster in Startup, top up the low cells each
+        // Update, and report (in PostUpdate) how many actually changed —
+        // a count that falls to zero as the pack fills, showing precise
+        // `Mut`-driven marking.
+        app.add_system(Stage::Startup, seed_batteries)
+            .add_system(Stage::Update, recharge_low)
+            .add_system(Stage::PostUpdate, report_recharged);
     }
 }
