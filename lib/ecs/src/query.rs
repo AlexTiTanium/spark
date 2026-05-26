@@ -966,13 +966,16 @@ impl<'w, D: QueryData + 'w, F: QueryFilter> Query<'w, D, F> {
     /// assert!((vy - 0.45).abs() < 1e-6);
     /// ```
     pub fn iter_mut(&mut self) -> impl Iterator<Item = D::Item<'_>> + '_ {
-        // Copy the shared world handle out before borrowing `state`
-        // mutably — disjoint fields, so this doesn't fight the `&mut`.
+        // Fetch the filter's state once (storage borrows + tick baselines)
+        // so per-entity `matches` is a field read, not a fresh lookup.
+        // Copying `world` out first keeps it disjoint from the `&mut state`
+        // borrow below.
         let world = self.world;
+        let filter_state = F::init_state(world);
         // Path B — strip the entity that the trait threads internally
         // for join logic; the filter consumes it first. See module docs.
         D::iter(&mut self.state)
-            .filter(move |(entity, _)| F::matches(*entity, world))
+            .filter(move |(entity, _)| F::matches(*entity, &filter_state))
             .map(|(_entity, item)| item)
     }
 }
@@ -1028,10 +1031,12 @@ impl<'w, D: ReadOnlyQueryData + 'w, F: QueryFilter> Query<'w, D, F> {
     /// for _ in q.iter() {}
     /// ```
     pub fn iter(&self) -> impl Iterator<Item = D::Item<'_>> + '_ {
-        // Path B — see `Query::iter_mut` for the rationale.
+        // Path B — see `Query::iter_mut` for the rationale. Filter state is
+        // fetched once, not per entity.
         let world = self.world;
+        let filter_state = F::init_state(world);
         D::iter_ref(&self.state)
-            .filter(move |(entity, _)| F::matches(*entity, world))
+            .filter(move |(entity, _)| F::matches(*entity, &filter_state))
             .map(|(_entity, item)| item)
     }
 }

@@ -78,11 +78,13 @@
 //! [`QueryData::init_state`]: crate::QueryData::init_state
 //! [`Query::from_world`]: crate::Query::from_world
 
+use std::cell::Ref;
 use std::marker::PhantomData;
 
 use crate::Component;
 use crate::access::QueryAccess;
 use crate::entity::Entity;
+use crate::storage::ComponentStorage;
 use crate::world::World;
 
 /// A predicate over entities that gates a [`Query`] without widening its
@@ -114,11 +116,23 @@ use crate::world::World;
 /// [`And<(…)>`]: And
 /// [`Or<(…)>`]: Or
 pub trait QueryFilter {
-    /// Returns `true` if `entity` passes this filter.
-    ///
-    /// Called once per candidate entity during iteration. Reads
-    /// component presence through `world`; performs no mutation.
-    fn matches(entity: Entity, world: &World) -> bool;
+    /// Per-query state fetched **once** before iteration — the storage
+    /// borrow(s) and tick baseline(s) the filter needs — so the per-entity
+    /// [`matches`](Self::matches) is a cheap field read instead of a fresh
+    /// `HashMap` lookup + `RefCell` borrow each time. Mirrors
+    /// [`QueryData::State`](crate::QueryData::State).
+    type State<'w>
+    where
+        Self: 'w;
+
+    /// Fetches the filter's [`State`](Self::State) from the world, once,
+    /// at the start of iteration.
+    fn init_state(world: &World) -> Self::State<'_>;
+
+    /// Returns `true` if `entity` passes this filter, reading only the
+    /// pre-fetched `state`. Called once per candidate entity; performs no
+    /// mutation and touches the world only through `state`.
+    fn matches(entity: Entity, state: &Self::State<'_>) -> bool;
 
     /// Reports the components this filter inspects into `access`.
     ///
@@ -135,7 +149,11 @@ pub trait QueryFilter {
 /// Matches every entity and reports no access, so `Query<D>` and
 /// `Query<D, ()>` are the same query.
 impl QueryFilter for () {
-    fn matches(_entity: Entity, _world: &World) -> bool {
+    type State<'w> = ();
+
+    fn init_state(_world: &World) -> Self::State<'_> {}
+
+    fn matches(_entity: Entity, _state: &Self::State<'_>) -> bool {
         true
     }
 
@@ -174,9 +192,15 @@ impl QueryFilter for () {
 pub struct With<T>(PhantomData<T>);
 
 impl<T: Component> QueryFilter for With<T> {
-    fn matches(entity: Entity, world: &World) -> bool {
-        world
-            .storage::<T>()
+    type State<'w> = Option<Ref<'w, ComponentStorage<T>>>;
+
+    fn init_state(world: &World) -> Self::State<'_> {
+        world.storage::<T>()
+    }
+
+    fn matches(entity: Entity, state: &Self::State<'_>) -> bool {
+        state
+            .as_ref()
             .is_some_and(|storage| storage.contains(entity))
     }
 
@@ -216,10 +240,16 @@ impl<T: Component> QueryFilter for With<T> {
 pub struct Without<T>(PhantomData<T>);
 
 impl<T: Component> QueryFilter for Without<T> {
-    fn matches(entity: Entity, world: &World) -> bool {
+    type State<'w> = Option<Ref<'w, ComponentStorage<T>>>;
+
+    fn init_state(world: &World) -> Self::State<'_> {
+        world.storage::<T>()
+    }
+
+    fn matches(entity: Entity, state: &Self::State<'_>) -> bool {
         // No storage for `T` → no entity has it → everyone passes.
-        world
-            .storage::<T>()
+        state
+            .as_ref()
             .is_none_or(|storage| !storage.contains(entity))
     }
 
@@ -265,11 +295,18 @@ impl<T: Component> QueryFilter for Without<T> {
 pub struct Changed<T>(PhantomData<T>);
 
 impl<T: Component> QueryFilter for Changed<T> {
-    fn matches(entity: Entity, world: &World) -> bool {
-        world.storage::<T>().is_some_and(|storage| {
-            storage
-                .changed_tick_for(entity)
-                .is_some_and(|tick| tick > world.baseline_for::<T>())
+    /// The `T` storage borrow + the baseline tick, both fetched once.
+    type State<'w> = (Option<Ref<'w, ComponentStorage<T>>>, u32);
+
+    fn init_state(world: &World) -> Self::State<'_> {
+        (world.storage::<T>(), world.baseline_for::<T>())
+    }
+
+    fn matches(entity: Entity, state: &Self::State<'_>) -> bool {
+        let (storage, baseline) = state;
+        storage.as_ref().is_some_and(|s| {
+            s.changed_tick_for(entity)
+                .is_some_and(|tick| tick > *baseline)
         })
     }
 
@@ -310,11 +347,18 @@ impl<T: Component> QueryFilter for Changed<T> {
 pub struct Added<T>(PhantomData<T>);
 
 impl<T: Component> QueryFilter for Added<T> {
-    fn matches(entity: Entity, world: &World) -> bool {
-        world.storage::<T>().is_some_and(|storage| {
-            storage
-                .added_tick_for(entity)
-                .is_some_and(|tick| tick > world.baseline_for::<T>())
+    /// The `T` storage borrow + the baseline tick, both fetched once.
+    type State<'w> = (Option<Ref<'w, ComponentStorage<T>>>, u32);
+
+    fn init_state(world: &World) -> Self::State<'_> {
+        (world.storage::<T>(), world.baseline_for::<T>())
+    }
+
+    fn matches(entity: Entity, state: &Self::State<'_>) -> bool {
+        let (storage, baseline) = state;
+        storage.as_ref().is_some_and(|s| {
+            s.added_tick_for(entity)
+                .is_some_and(|tick| tick > *baseline)
         })
     }
 
@@ -395,8 +439,19 @@ pub struct Or<F>(PhantomData<F>);
 macro_rules! impl_logical_filter {
     ($($F:ident),+) => {
         impl<$($F: QueryFilter),+> QueryFilter for And<($($F,)+)> {
-            fn matches(entity: Entity, world: &World) -> bool {
-                $($F::matches(entity, world))&&+
+            type State<'w>
+                = ($($F::State<'w>,)+)
+            where
+                Self: 'w;
+
+            fn init_state(world: &World) -> Self::State<'_> {
+                ($($F::init_state(world),)+)
+            }
+
+            #[allow(non_snake_case)]
+            fn matches(entity: Entity, state: &Self::State<'_>) -> bool {
+                let ($($F,)+) = state;
+                $($F::matches(entity, $F))&&+
             }
 
             fn collect_access(access: &mut QueryAccess) {
@@ -405,8 +460,19 @@ macro_rules! impl_logical_filter {
         }
 
         impl<$($F: QueryFilter),+> QueryFilter for Or<($($F,)+)> {
-            fn matches(entity: Entity, world: &World) -> bool {
-                $($F::matches(entity, world))||+
+            type State<'w>
+                = ($($F::State<'w>,)+)
+            where
+                Self: 'w;
+
+            fn init_state(world: &World) -> Self::State<'_> {
+                ($($F::init_state(world),)+)
+            }
+
+            #[allow(non_snake_case)]
+            fn matches(entity: Entity, state: &Self::State<'_>) -> bool {
+                let ($($F,)+) = state;
+                $($F::matches(entity, $F))||+
             }
 
             fn collect_access(access: &mut QueryAccess) {
@@ -442,35 +508,41 @@ mod tests {
         (world, only_a, a_and_b, a_and_c)
     }
 
+    /// `F::matches` with its state fetched once — the exact shape
+    /// `Query::iter` uses (`init_state` then `matches`). Presence filters
+    /// need no parked baseline, so a bare `World` is enough.
+    fn passes<F: QueryFilter>(world: &World, e: Entity) -> bool {
+        F::matches(e, &F::init_state(world))
+    }
+
     #[test]
     fn unit_filter_matches_everything() {
         let (world, only_a, a_and_b, _) = world_abc();
-        assert!(<() as QueryFilter>::matches(only_a, &world));
-        assert!(<() as QueryFilter>::matches(a_and_b, &world));
+        assert!(passes::<()>(&world, only_a));
+        assert!(passes::<()>(&world, a_and_b));
     }
 
     #[test]
     fn with_matches_only_entities_having_component() {
         let (world, only_a, a_and_b, _) = world_abc();
-        assert!(With::<B>::matches(a_and_b, &world));
-        assert!(!With::<B>::matches(only_a, &world));
+        assert!(passes::<With<B>>(&world, a_and_b));
+        assert!(!passes::<With<B>>(&world, only_a));
     }
 
     #[test]
     fn with_unknown_component_matches_nobody() {
-        // No entity ever held a `B`-less... rather, a component never
-        // inserted has no storage at all — `With` must say "no match",
-        // not panic.
+        // A component never inserted has no storage at all — `With` must
+        // say "no match", not panic.
         let mut world = World::new();
         let e = world.spawn().insert(A).id();
-        assert!(!With::<B>::matches(e, &world));
+        assert!(!passes::<With<B>>(&world, e));
     }
 
     #[test]
     fn without_matches_entities_lacking_component() {
         let (world, only_a, a_and_b, _) = world_abc();
-        assert!(Without::<B>::matches(only_a, &world));
-        assert!(!Without::<B>::matches(a_and_b, &world));
+        assert!(passes::<Without<B>>(&world, only_a));
+        assert!(!passes::<Without<B>>(&world, a_and_b));
     }
 
     #[test]
@@ -478,24 +550,24 @@ mod tests {
         // No storage for `C` yet → every entity lacks it → all pass.
         let mut world = World::new();
         let e = world.spawn().insert(A).id();
-        assert!(Without::<C>::matches(e, &world));
+        assert!(passes::<Without<C>>(&world, e));
     }
 
     #[test]
     fn and_requires_all_branches() {
         let (world, only_a, a_and_b, _) = world_abc();
         // A present AND B absent.
-        assert!(And::<(With<A>, Without<B>)>::matches(only_a, &world));
-        assert!(!And::<(With<A>, Without<B>)>::matches(a_and_b, &world));
+        assert!(passes::<And<(With<A>, Without<B>)>>(&world, only_a));
+        assert!(!passes::<And<(With<A>, Without<B>)>>(&world, a_and_b));
     }
 
     #[test]
     fn or_requires_any_branch() {
         let (world, only_a, a_and_b, a_and_c) = world_abc();
         // Has B or C.
-        assert!(Or::<(With<B>, With<C>)>::matches(a_and_b, &world));
-        assert!(Or::<(With<B>, With<C>)>::matches(a_and_c, &world));
-        assert!(!Or::<(With<B>, With<C>)>::matches(only_a, &world));
+        assert!(passes::<Or<(With<B>, With<C>)>>(&world, a_and_b));
+        assert!(passes::<Or<(With<B>, With<C>)>>(&world, a_and_c));
+        assert!(!passes::<Or<(With<B>, With<C>)>>(&world, only_a));
     }
 
     #[test]
@@ -503,9 +575,9 @@ mod tests {
         // With<A> AND (With<B> OR With<C>).
         type F = And<(With<A>, Or<(With<B>, With<C>)>)>;
         let (world, only_a, a_and_b, a_and_c) = world_abc();
-        assert!(F::matches(a_and_b, &world));
-        assert!(F::matches(a_and_c, &world));
-        assert!(!F::matches(only_a, &world)); // has A, but neither B nor C
+        assert!(passes::<F>(&world, a_and_b));
+        assert!(passes::<F>(&world, a_and_c));
+        assert!(!passes::<F>(&world, only_a)); // has A, but neither B nor C
     }
 
     #[test]
@@ -562,7 +634,9 @@ mod tests {
         let mut last_seen = baseline.to_vec();
         let mut result = false;
         world.run_system(&access, &mut last_seen, &mut |w| {
-            result = F::matches(e, w);
+            // `init_state` reads the parked baseline (and storage borrow),
+            // exactly as `Query::iter` does, before per-entity `matches`.
+            result = F::matches(e, &F::init_state(w));
         });
         result
     }
