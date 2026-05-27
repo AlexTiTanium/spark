@@ -1326,8 +1326,11 @@ The model is **per-component clocks**. Each component type owns its own
 tick that advances when something writes that type — so `Position`'s clock
 and `Velocity`'s clock move independently. A system remembers, per
 component it touches, the tick it last saw; a write bumps the clock past
-that, and `changed_tick > last_seen` answers "changed since I looked." No
-global frame counter.
+that, and a `changed_tick` *newer than* that baseline answers "changed
+since I looked." No global frame counter. ("Newer than" is a wrapping-aware
+relative-age comparison, not a plain `>`, so it stays correct even when a
+clock wraps past `u32::MAX` — see the change-detection notes in
+`filter.rs`.)
 
 ```rust
 use spark_ecs::{Changed, Component, Query, World};

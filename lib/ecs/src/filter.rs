@@ -86,6 +86,32 @@
 //! clock starts at 1 while a fresh system's baseline is 0, a component
 //! attached before any system ran is seen on that system's first run.
 //!
+//! ## Load-bearing invariant — baselines are past values of `current_tick`
+//!
+//! The wrapping-aware comparison ([`is_changed_since`]) is exact over the
+//! **full `u32` range** *only* because every baseline it is handed is a
+//! value the same component's clock held at some earlier moment — i.e. a
+//! *past* value of `current_tick`. That makes `current` a true upper bound
+//! (in the wrapping sense) on both the write tick and the baseline, which is
+//! what buys the full range instead of the conventional half-range (2³¹)
+//! serial-arithmetic bound. The single-threaded frame model upholds this:
+//! the scheduler parks each system's baseline straight from the storage
+//! clock at the end of its last run ([`World::baseline_for`]).
+//!
+//! **This invariant is not enforced by the type system or the compiler — it
+//! rests on that discipline.** If a baseline is ever sourced from *outside*
+//! the clock's own history — a save-snapshot restore, a hot-reload of
+//! engine state, a replay that re-seeds ticks — `current` may no longer be
+//! an upper bound, and the safe window silently regresses to half-range
+//! (2³¹). Anything that introduces such a path must either preserve this
+//! invariant or clamp tick ages (Bevy-style) and re-derive the window. The
+//! boundary is pinned by the `changed_since_window_is_the_full_u32_range_not_half`
+//! and `changed_since_residual_false_negative_only_at_a_full_lap` tests
+//! below — they will catch a regression if the comparison or the window
+//! assumption ever changes.
+//!
+//! [`is_changed_since`]: is_changed_since
+//! [`World::baseline_for`]: crate::World::baseline_for
 //! [`ComponentStorage::current_tick`]: crate::ComponentStorage
 //! [`Mut<T>`]: crate::Mut
 //! [`Query`]: crate::Query

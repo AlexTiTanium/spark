@@ -476,7 +476,15 @@ first-slot-required `y`/`n` sentinel. The default outcome of a merge is
 "why it's hard" context so they aren't relitigated. Not byte-identical
 codegen-PR material, hence deferred out of #80.
 
----
+  **Folds in the `build_*` W/OW duplication.** `build_non_driver_fetch!` and
+  `build_elem!` (in `query/tuple_codegen.rs`) each carry a `W` arm and an
+  `OW` arm with the same `split_for_join` + `DenseMut::new` body — a real
+  DRY seam left untouched by #80 to keep the split byte-identical.
+  **Revival trigger:** when (and only when) the `kind`-parameterised
+  leaf-macro merge above is accepted, fold the `build_*` W/OW arms into the
+  same `$leaf`/`$kind` parameterisation in the same change. Until then they
+  stay as-is — a standalone dedup would be churn for no behaviour change and
+  would muddy the merge's byte-identical gate.
 
 ## Draft 1 — spark-ecs: finish `Query<&mut T>` iteration — `QueryData` shared/exclusive split (M3 Issue B-fix)
 
