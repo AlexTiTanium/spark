@@ -360,6 +360,37 @@ end-to-end change detection on a *per-component* clock.**
   `D: ReadOnlyQueryData` gate so a `&mut`-containing shape can't be
   iterated through a shared borrow (compile-fail doctest proves it).
 
+**10. ~~Entity-as-data queries — `Query<Entity>` / `Query<(Entity, &A, …)>`~~ — ✅ shipped (#61).**
+- *Shipped:* the entity id is now reachable as query data, on **path B**
+  terms — naming `Entity` as a `QueryData` element rather than re-adding a
+  forced `(Entity, Item)` pair. `Query<Entity>` yields every live entity
+  (components or not); `Query<(Entity, &A, …)>` puts `Entity` **first**,
+  then 1–3 components in any `&` / `&mut` mix. Works through `iter` /
+  `iter_mut`, `for x in &q` / `&mut q`, as a `SystemParam`, and with filters
+  (`Query<Entity, With<T>>`).
+- *As built:* `Entity` rides the `(Entity, Item)` pair the join already
+  threads internally — for tuples the **first component drives** (Entity has
+  no storage) and the closure emits `(entity, (entity, item_first, …))`;
+  `collect_access` is a **no-op**, so `Entity` is invisible to the
+  self-conflict check (`(Entity, &mut A, &A)` still panics on `A`).
+  Standalone `Query<Entity>` snapshots the live set into a `Vec<Entity>` via
+  `EntityAllocator::live()` / `World::live_entities()` — *not* a held
+  `Ref<EntityAllocator>`, which would clash with `Commands::spawn`'s
+  `borrow_mut`. The snapshot is frozen at construction (documented contract:
+  `Commands`-spawned entities aren't yielded this frame; `Commands`-despawned
+  ones still are).
+- *Implementation:* a parallel macro family beside `impl_one_combo!` /
+  `impl_all_tuple!` (`impl_one_combo_entity!` + `impl_all_tuple_entity!`)
+  reusing every per-flag helper unchanged; the "rest" is `*` so `(Entity, &A)`
+  is one arm with the rest. `macro_rules!` can't share a body across the
+  Entity-prefixed and plain arms, so a parallel family (not an extension of
+  the existing macro) is the minimal-duplication shape.
+- *Deferred (on demand):* `Entity` only as the **first** element; arity
+  capped at `(Entity, &A, &B, &C)` (4–5 are one `impl_all_tuple_entity!`
+  line each). `Query<Entity, With<T>>` is correct but iterates the whole
+  live set and tests the filter per entity rather than driving from `T`'s
+  (smaller) storage — a future optimisation, flagged on the impl.
+
 **Then: Render milestone** — does not need parallelism.
 
 **Then: M4 — parallelism (committed, not optional).**

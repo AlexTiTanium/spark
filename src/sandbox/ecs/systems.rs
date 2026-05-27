@@ -18,6 +18,8 @@
 //! - [`report_player_position`]: `Query<(&P, &Player)>` — shared
 //!   two-tuple join with a zero-sized marker filtering down to the
 //!   player.
+//! - [`report_entity_ids`]: `Query<(Entity, &Position)>` —
+//!   **entity-as-data**, the id surfaced alongside the component shape.
 //! - [`report_tick_summary`]: `Res<T>` + two `Query`s in one
 //!   signature — three system params side by side.
 //!
@@ -26,7 +28,7 @@
 //! every `SystemParam` to user fns by value, so the lint can't apply
 //! here.
 
-use spark_ecs::{Commands, Query, Res, ResMut};
+use spark_ecs::{Commands, Entity, Query, Res, ResMut};
 use spark_log::{debug, info};
 
 // Shared spatial / gameplay primitives live at the sandbox crate
@@ -180,6 +182,29 @@ pub(super) fn report_player_position(q: Query<(&Position, &Player)>) {
             "sandbox/ecs: report_player_position — Query<(&Position, &Player)>"
         );
     }
+}
+
+/// **`Query<(Entity, &Position)>`** — **entity-as-data**: the entity id
+/// rides alongside the component instead of being forced onto every shape
+/// (path B). `Entity` goes first; the `Position` storage drives the walk
+/// and the id is the one it already threads per row.
+///
+/// Runs once in `PreUpdate` on the settled startup state. The four demo
+/// entities (`mover_a`, `mover_b`, `player`, `statue`) all carry
+/// `Position`; the filter-demo buildings don't, so they stay out of this
+/// join — hence `expected = 4`. Naming the id is what a real system needs
+/// to despawn an entity, send it in an event, or store it as a relation.
+pub(super) fn report_entity_ids(tick: Res<TickCount>, q: Query<(Entity, &Position)>) {
+    if tick.0 != 0 {
+        return;
+    }
+    let rows: Vec<(Entity, f32, f32)> = q.iter().map(|(e, p)| (e, p.x, p.y)).collect();
+    info!(
+        ?rows,
+        count = rows.len(),
+        expected = 4,
+        "sandbox/ecs: report_entity_ids — Query<(Entity, &Position)> (id + component)"
+    );
 }
 
 /// **`Res<T>` + `Query<&T>` × 2** — two queries in one system, over

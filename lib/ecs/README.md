@@ -23,9 +23,10 @@ other engine crate (including `spark-core`) sits on top.
 > `WorkloadLabel` / `Schedule` / `add_workload` — ship today.) `Query`
 > exists today for `&T` / `&mut T`, every `&` / `&mut` combination
 > of 2-/3-/4-/5-tuples (including multi-mut at any arity, e.g.
-> `(&mut A, &mut B, &mut C)`), and the filter generic `Query<D, F>`
-> (`With` / `Without` / `And` / `Or`); the remaining spec-frozen
-> extensions (`Option<&T>`, `Entity`-as-data) are marked inline as ⏳
+> `(&mut A, &mut B, &mut C)`), the filter generic `Query<D, F>`
+> (`With` / `Without` / `And` / `Or` / `Changed<T>` / `Added<T>`), and
+> **entity-as-data** — `Query<Entity>` and `Query<(Entity, &A, …)>`; the remaining
+> spec-frozen extension (`Option<&T>`) is marked inline as ⏳
 > in the *What's next* section. The forward-looking
 > design is settled — see [`docs/ECS_DESIGN.md`](../../docs/ECS_DESIGN.md)
 > for the full engineering reference and [`docs/PLAN.md`](../../docs/PLAN.md)
@@ -957,8 +958,10 @@ matches the data shape `D`. The shape can be one component (`&T` or
 that hold **every** element in the shape are yielded.
 
 Path B (Bevy-style): `iter()` / `iter_mut()` yield `D::Item<'_>`
-directly — `Query<&T>` yields `&T`, not `(Entity, &T)`. The entity id
-becomes available later via the planned `Query<(Entity, &T)>` shape.
+directly — `Query<&T>` yields `&T`, not `(Entity, &T)`. When a system
+needs the entity id, it asks for it by naming `Entity` in the shape:
+`Query<(Entity, &T)>` yields `(Entity, &T)`, and `Query<Entity>` yields
+the id alone (every live entity). See *Getting the entity id* below.
 
 **Single-component read.** The simplest query — every entity with a
 `Health` component:
@@ -1062,14 +1065,16 @@ assert!((x - 2.0).abs() < f32::EPSILON);
 assert!((y - 4.0).abs() < f32::EPSILON);
 ```
 
-Tuples scale flat to arity 4 (`(&A, &B, &C)`, `(&A, &B, &C, &D)`, with
-the same mut-driver and multi-mut variants as arity 2). Tuples do
+Tuples scale flat to arity 5 (`(&A, &B, &C)`, `(&A, &B, &C, &D)`,
+`(&A, &B, &C, &D, &E)`, with the same mut-driver and multi-mut variants
+as arity 2). Tuples do
 **not** nest: `Query<((&A, &B), &C)>` and `Query<(&A, (&B, &C))>` are
 not supported shapes — flatten to `Query<(&A, &B, &C)>` instead.
-See *Narrowing with filters* just below for `With`/`Without`/`And`/`Or`,
-and *`Query<D, F>`: finding entities* under *What's next* for the full
-data-shape table plus the `Entity`-as-data and `Option<&T>` shapes still
-coming in follow-up PRs.
+See *Getting the entity id* just below for `Query<Entity>` /
+`Query<(Entity, &T)>` (shipped), *Narrowing with filters* for
+`With`/`Without`/`And`/`Or`, and *`Query<D, F>`: finding entities* under
+*What's next* for the full data-shape table plus the `Option<&T>` shape
+still coming in a follow-up PR.
 
 **Two-mut join — both elements mutable.** Useful when one component
 needs to be both read and mutated alongside another (e.g. apply drag to
@@ -1194,6 +1199,95 @@ with a message naming the offending component. The M4 scheduler will
 hoist same-type conflicts *across* systems to registration-time
 errors.
 
+### Getting the entity id
+
+Iteration is **path B**: it yields the data shape, never an `(Entity, …)`
+pair you didn't ask for. When a system *does* need the id — to despawn the
+entity, name it in an event, or store it as a relationship — it puts
+`Entity` as the **first** element of the shape. `Entity` reads no
+component, so it never conflicts with the `&` / `&mut` elements beside it.
+
+**Just the id.** `Query<Entity>` walks *every* live entity, whether or not
+it holds any components:
+
+```rust
+use spark_ecs::{Entity, Query, World};
+
+let mut world = World::new();
+let a = world.spawn().id();
+let b = world.spawn().id();              // no components at all
+
+let ids: Vec<Entity> = Query::<Entity>::from_world(&world).iter().collect();
+assert_eq!(ids.len(), 2);
+assert!(ids.contains(&a) && ids.contains(&b));
+```
+
+**Id + components.** `Entity` first, then 1–3 components in any
+`&` / `&mut` mix. A component drives the join; the id rides along on it:
+
+```rust
+use spark_ecs::{Component, Entity, Query, World};
+
+#[derive(Component)]
+struct Position { x: f32, y: f32 }
+
+let mut world = World::new();
+let player = world.spawn().insert(Position { x: 1.0, y: 2.0 }).id();
+
+let q = Query::<(Entity, &Position)>::from_world(&world);
+for (id, pos) in &q {
+    assert_eq!(id, player);              // the id owns the position it's paired with
+    assert_eq!((pos.x, pos.y), (1.0, 2.0));
+}
+```
+
+`&mut` works the same — use `.iter_mut()`, since the read-only `.iter()`
+is a compile error for any shape containing a `&mut`:
+
+```rust
+use spark_ecs::{Component, Entity, Query, World};
+
+#[derive(Component)]
+struct Health(u32);
+
+let mut world = World::new();
+let e = world.spawn().insert(Health(100)).id();
+
+let mut q = Query::<(Entity, &mut Health)>::from_world(&world);
+for (id, mut hp) in q.iter_mut() {
+    assert_eq!(id, e);
+    hp.0 -= 10;                          // writes through; the id reports who
+}
+```
+
+**Filtering the id set.** A filter narrows which ids iterate, exactly as
+for any other shape:
+
+```rust
+use spark_ecs::{Component, Entity, Query, With, World};
+
+#[derive(Component)]
+struct Powered;
+
+let mut world = World::new();
+let on = world.spawn().insert(Powered).id();
+let _off = world.spawn().id();           // no Powered marker
+
+let ids: Vec<Entity> = Query::<Entity, With<Powered>>::from_world(&world)
+    .iter()
+    .collect();
+assert_eq!(ids, vec![on]);
+```
+
+> **Snapshot semantics.** `Query<Entity>` freezes the live set *once*, when
+> the query is built. An entity `Commands::spawn` creates while you iterate
+> is alive but postdates the snapshot, so it isn't yielded this frame; an
+> entity `Commands::despawn` removes is deferred to the next flush, so it
+> stays alive and *is* still yielded. "Frozen at construction" is what keeps
+> iteration stable against structural edits — and snapshotting the live set
+> (rather than holding the allocator borrow across iteration) is what lets
+> one system take `Query<Entity>` **and** `Commands` without a borrow panic.
+
 ### Narrowing with filters: `Query<D, F>`
 
 A second generic narrows *which* entities iterate without changing what
@@ -1279,9 +1373,11 @@ says how to narrow the set.
 > `&` / `&mut` combination of flat 2-/3-/4-/5-tuples (including
 > multi-mut at any arity) are ✅ shipping today via
 > [`Query<D>`](struct.Query.html), as is the filter generic
-> `Query<D, F>` (`With` / `Without` / `And` / `Or`). `Option<&T>` and
-> `Entity`-as-data remain ⏳ follow-up PRs. Each subsection below calls
-> out which bits are runnable now and which are spec-frozen.
+> `Query<D, F>` (`With` / `Without` / `And` / `Or` / `Changed<T>` /
+> `Added<T>`) and **entity-as-data** (`Query<Entity>`,
+> `Query<(Entity, &A, …)>` for one-to-three trailing components).
+> `Option<&T>` remains a ⏳ follow-up PR. Each subsection
+> below calls out which bits are runnable now and which are spec-frozen.
 
 ### Data shapes
 
@@ -1303,15 +1399,20 @@ Query<(&mut A, &mut B, &mut C, &mut D)>     //   …up to fully mutable
 Query<(&A, &B, &C, &D, &E)>                 // arity 5, same story
 Query<(&mut A, &mut B, &mut C, &mut D, &mut E)>  //   …up to fully mutable
 
+// ✅ today — entity-as-data (Entity as the first element, 1–3 components):
+Query<Entity>                               // just the ID — every live entity
+Query<(Entity, &Position)>                  // ID + one component
+Query<(Entity, &mut Position, &Velocity)>   // ID + mixed &/&mut, up to 3 components
+
 // ⏳ coming:
-Query<(Entity, &Position)>                  // include the Entity ID
 Query<(&Position, Option<&Velocity>)>       // Velocity may be absent
 ```
 
 Iteration shape today is **path B** (Bevy-style): `Query<&T>::iter()`
-yields `&T`, **not** `(Entity, &T)`. If the system needs the entity, it
-will be asked for via the `Query<(Entity, &T)>` shape once that's
-landed.
+yields `&T`, **not** `(Entity, &T)`. When a system needs the entity, it
+asks for it by naming `Entity` in the shape — `Query<(Entity, &T)>`
+yields `(Entity, &T)`, `Query<Entity>` yields the id alone. See
+*Getting the entity id* in the walkthrough above for runnable examples.
 
 ```rust
 // ✅ Compiles and runs today.
@@ -1458,8 +1559,8 @@ Query<(&A, &B, &C, &D)>                      // ✅ arity 4: all 16 combos
 Query<(&mut A, &mut B, &mut C, &mut D)>      // ✅   (incl. fully mutable)
 Query<(&A, &B, &C, &D, &E)>                  // ✅ arity 5: all 32 combos
 Query<(&mut A, &mut B, &mut C, &mut D, &mut E)>  // ✅ (incl. fully mutable)
-Query<Entity>                                // ⏳ just the ID, no component
-Query<(Entity, &Position, &mut Velocity)>    // ⏳ ID + multiple components
+Query<Entity>                                // ✅ just the ID, no component
+Query<(Entity, &Position, &mut Velocity)>    // ✅ ID + 1–3 components, any &/&mut
 Query<&Position, ()>                         // ✅ explicit empty filter (the default)
 
 // — FILTERS —                        ✅ filters + change-detection PRs
@@ -1497,7 +1598,7 @@ cities-with-names runs in 50 iterations, not 50 × 200.
 | Query | Iteration cost |
 |-|-|
 | `Query<&T>` | O(n) over T's dense array; n = entities with T |
-| `Query<(&A, &B)>` | O(min(\|A\|, \|B\|)) — driver picks smaller |
+| `Query<(&A, &B)>` | O(\|A\|) — first element (A) drives today; min-driver is ⏳ |
 | `Query<&A, With<B>>` | O(\|A\|) + one sparse lookup per item |
 | `Query<&A, Without<B>>` | O(\|A\|) + one sparse lookup per item |
 | `Query<&A, And<(With<B>, With<C>)>>` | O(\|A\|) + one sparse lookup per filter term per item |
@@ -2202,13 +2303,16 @@ End of frame. Back to Step 1 for frame 43.
 | `Query<(&A, &B)>` | Entities with both `A` and `B` | `(&A, &B)` |
 | `Query<(&mut A, &B)>` | Entities with both | `(&mut A, &B)` |
 | `Query<(&A, &B, &C)>` | Entities with all three | `(&A, &B, &C)` |
-| `Query<Entity>` ⏳ | Every alive entity | `Entity` |
-| `Query<(Entity, &T)>` ⏳ | Entities with `T`, including ID | `(Entity, &T)` |
+| `Query<Entity>` | Every live entity | `Entity` |
+| `Query<(Entity, &T)>` | Entities with `T`, including ID | `(Entity, &T)` |
+| `Query<(Entity, &A, &B)>` | Entities with `A` and `B`, including ID | `(Entity, &A, &B)` |
 | `Query<(&T, Option<&U>)>` ⏳ | Entities with `T`, `U` if present | `(&T, Option<&U>)` |
 | `Query<&T, With<U>>` | Entities with both `T` and `U`, only fetch `T` | `&T` |
 | `Query<&T, Without<U>>` | Entities with `T` but not `U` | `&T` |
 | `Query<&T, And<(With<U>, Without<V>)>>` | AND of filters | `&T` |
 | `Query<&T, Or<(With<U>, With<V>)>>` | OR of filters | `&T` |
+| `Query<&T, Changed<T>>` | Entities whose `T` was written since this system last ran | `&T` |
+| `Query<&T, Added<T>>` | Entities whose `T` was first attached since this system last ran | `&T` |
 
 Iteration methods on every `Query`:
 
@@ -2219,9 +2323,10 @@ for x in &q { … }                        // sugar for q.iter()
 for x in &mut q { … }                    // sugar for q.iter_mut()
 let count = q.iter().count();
 let first = q.iter().next();
-let one = q.single();                    // panics if 0 or >1 entities
-let maybe = q.get_single();              // Result<_, QuerySingleError>
-let exact = q.get(entity)?;              // fetch one specific entity
+// ⏳ Not yet implemented — shown for the shape they'll take:
+let one = q.single();                    // ⏳ panics if 0 or >1 entities
+let maybe = q.get_single();              // ⏳ Result<_, QuerySingleError>
+let exact = q.get(entity)?;              // ⏳ fetch one specific entity
 ```
 
 ## Configuration

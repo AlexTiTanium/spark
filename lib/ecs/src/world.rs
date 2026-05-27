@@ -664,6 +664,34 @@ impl World {
         }))
     }
 
+    /// Snapshots every currently-live [`Entity`] into an owned `Vec`,
+    /// in slot-index order.
+    ///
+    /// Backs the `Query<Entity>` shape. The snapshot is deliberate, not
+    /// incidental: it borrows the allocator's [`RefCell`], collects, and
+    /// releases the borrow *before returning*, so the resulting `Vec`
+    /// holds no live borrow on the cell. That is what lets a system take
+    /// `Query<Entity>` **and** `Commands` in one signature — a query that
+    /// instead held a `Ref<EntityAllocator>` across iteration would panic
+    /// the moment [`Commands::spawn`](crate::Commands::spawn) called
+    /// `borrow_mut`. The same borrow-release reasoning the crate documents
+    /// for the `Without<T>` mid-iteration footgun.
+    ///
+    /// The set is frozen at this call: entities spawned afterwards are not
+    /// in it, and entities despawned afterwards stay in it. See the
+    /// `Query<Entity>` rustdoc for the full snapshot-semantics contract.
+    #[must_use]
+    pub(crate) fn live_entities(&self) -> Vec<Entity> {
+        let alloc = self.entities.borrow();
+        // Pre-size to the exact live count — `EntityAllocator::len()` is
+        // `generation.len() - free_list.len()`, precisely the number of
+        // handles `live()` yields — so the snapshot fills without a single
+        // reallocation (a bare `.collect()` would double from cap 0).
+        let mut entities = Vec::with_capacity(alloc.len());
+        entities.extend(alloc.live());
+        entities
+    }
+
     // -------- per-component change detection --------
 
     /// Runs one system, driving the per-component change-detection dance,

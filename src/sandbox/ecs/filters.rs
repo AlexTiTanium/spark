@@ -18,7 +18,7 @@
 //! `Startup` seed flushes — the one-shot pattern from
 //! [`super::systems::report_initial`].
 
-use spark_ecs::{And, Commands, Or, Query, Res, With, Without};
+use spark_ecs::{And, Commands, Entity, Or, Query, Res, With, Without};
 use spark_log::info;
 
 use crate::sandbox::resources::TickCount;
@@ -333,5 +333,76 @@ pub(super) fn bump_powered_capacity(
         count = bumped.len(),
         expected = 3,
         "sandbox/ecs/filters: Query<(&Building, &mut Capacity), With<Powered>> — +10 MW to powered only"
+    );
+}
+
+/// **`Query<Entity, With<T>>` — entity ids, narrowed by a filter.**
+///
+/// `Entity` as the *whole* data shape yields every live entity; `Entity`
+/// can't drive a join (it has no storage), so it walks the live-set
+/// snapshot and `With<Building>` filters per entity. The marker is read,
+/// not fetched — `Entity` itself reads nothing, so it never conflicts
+/// with the filter.
+///
+/// Snapshot → this filter (`With<Building>`): every roster member carries
+/// `Building`, so all five ids are kept. (Other live entities — the
+/// physics-demo movers, the change-detection rosters — lack `Building` and
+/// drop out, which is why this pins to the five buildings, not the whole
+/// world.)
+///
+/// **When to reach for it:** you need the *ids* of a tagged set — to
+/// despawn them, send them in an event, or store them as a relationship —
+/// without reading any component data. (Cost note: this iterates the whole
+/// live set and tests `With<Building>` per id; driving from the smaller
+/// `Building` storage instead is a documented future optimisation.)
+pub(super) fn building_ids(tick: Res<TickCount>, q: Query<Entity, With<Building>>) {
+    if tick.0 != 0 {
+        return;
+    }
+    let count = q.iter().count();
+    info!(
+        count,
+        expected = 5,
+        "sandbox/ecs/filters: Query<Entity, With<Building>> — id of every building"
+    );
+}
+
+/// **`Query<(Entity, &Building), With<Powered>>` — id + component, filtered.**
+///
+/// Entity-as-data tuple *under* a filter: the id rides with `&Building`,
+/// `With<Powered>` narrows to powered buildings, and the marker never
+/// enters the item. `Building` drives the join (the first component —
+/// `Entity` can't); `With<Powered>` then filters those rows.
+///
+/// Storage → this filter (`With<Powered>`):
+///
+/// ```text
+/// substation : Building, Powered   → kept   → (id, "substation")
+/// plant-a    : Building, Powered   → kept   → (id, "plant-a")
+/// windfarm   : Building, Backup    → skipped (no Powered)
+/// depot      : Building            → skipped (no Powered)
+/// hybrid     : Building, Powered   → kept   → (id, "hybrid")
+/// ```
+///
+/// The loop body runs for **substation, plant-a, hybrid** only.
+///
+/// **When to reach for it:** you want the id *and* component data, for a
+/// filtered subset — "the id and name of every powered building" — so you
+/// can act on each by id afterwards (despawn it, raise an event about it).
+pub(super) fn powered_building_ids(
+    tick: Res<TickCount>,
+    q: Query<(Entity, &Building), With<Powered>>,
+) {
+    if tick.0 != 0 {
+        return;
+    }
+    // `_id` is the entity handle a real system would keep; here we log the
+    // names so the demo output is stable and readable.
+    let named: Vec<&str> = q.iter().map(|(_id, b)| b.name).collect();
+    info!(
+        ?named,
+        count = named.len(),
+        expected = 3,
+        "sandbox/ecs/filters: Query<(Entity, &Building), With<Powered>> — powered building ids + names"
     );
 }
