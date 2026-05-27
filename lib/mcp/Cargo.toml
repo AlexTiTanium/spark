@@ -1,0 +1,37 @@
+# Debug-only MCP plugin. The crate root is `#![cfg(debug_assertions)]`,
+# so `cargo build --release` compiles nothing here — no symbols, no
+# port, no thread. `tiny_http` is the only HTTP library by design (no
+# async runtime, no `hyper`, no `axum`). `serde` / `serde_json` are
+# pinned locally rather than promoted to `[workspace.dependencies]`
+# because they would otherwise sit unused by every other crate today.
+
+[package]
+name = "spark-mcp"
+version = "0.1.0"
+readme = "README.md"
+
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+spark-core = { path = "../core" }
+spark-ecs = { path = "../ecs" }
+spark-common = { path = "../common" }
+
+tracing.workspace = true
+thiserror.workspace = true
+
+# JSON-RPC envelope + tool arg parsing. Pinned exact patch like the
+# workspace deps; promote to `[workspace.dependencies]` the day a
+# second crate needs serde.
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+
+# Sync HTTP acceptor. The design's single non-stdlib network dep — no
+# async runtime, no TLS, no compression. ~30 KB of code, one transitive
+# (`ascii`).
+tiny_http = "0.12.0"
