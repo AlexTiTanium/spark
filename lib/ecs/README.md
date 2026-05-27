@@ -1716,9 +1716,9 @@ parallel execution.
 > ships ✅ `spawn`, `despawn(entity)`, `EntityCommands::insert<T>`,
 > and `EntityCommands::id()`. Resource-touching commands
 > (`insert_resource`, `update_resource`), event sends (`send_event`),
-> bundle inserts (`spawn((A, B, C))`), component removes
-> (`.remove::<T>()`), and the `cmd.entity(e)` accessor are ⏳
-> follow-up PRs.
+> component removes (`.remove::<T>()`), and the `cmd.entity(e)`
+> accessor are ⏳ follow-up PRs. Tuple-spawn (`spawn((A, B, C))`) was
+> **rejected**, not deferred — see #57.
 
 ```rust
 // ✅ Compiles and runs today.
@@ -1801,7 +1801,6 @@ commands.
 | `commands.despawn(entity)` | Queues `World::despawn(entity)` for the next flush. | ✅ |
 | `commands.spawn().insert::<T>(value)` | Queues an `insert::<T>(entity, value)` on the just-spawned entity. Chainable. | ✅ |
 | `commands.spawn().id()` | Synchronously-allocated `Entity` — usable inside the same system. | ✅ |
-| `commands.spawn((A, B, C))` | Bundle insert — `spawn` with a tuple of components. | ⏳ Bundle PR |
 | `commands.entity(e).insert(c)` / `.remove::<T>()` | Mutate an existing entity. | ⏳ EntityCommands-for-existing-entity PR |
 | `commands.insert_resource(r)` / `.update_resource::<T>(\|t\| …)` | Resource touches via commands. | ⏳ additive |
 | `commands.send_event(e)` | Convenience for `EventWriter<E>::send(e)` from a command. | ⏳ follow-up |
