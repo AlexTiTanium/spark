@@ -571,6 +571,40 @@ impl<T: Component> ComponentStorage<T> {
         self.dense_idx_of(entity).is_some()
     }
 
+    /// The entities holding this component, in dense (packed) order.
+    ///
+    /// This is the storage's *candidate set*: every entity with a `T`, each
+    /// appearing exactly once, in the same order [`iter`](Self::iter) walks.
+    /// Query driver selection (issue #65) reads it to drive iteration off the
+    /// smallest matching storage — the list whose length [`len`](Self::len)
+    /// reports — instead of the live entity set. Returns an empty slice when
+    /// the storage is empty.
+    ///
+    /// Because it is the *same* order `iter` yields, a query that drives off
+    /// this slice and looks up each entity's components produces the same
+    /// rows `iter` would, just for a chosen storage.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use spark_ecs::{Component, ComponentStorage, EntityAllocator};
+    ///
+    /// #[derive(Component)]
+    /// struct Tag;
+    ///
+    /// let mut alloc = EntityAllocator::new();
+    /// let a = alloc.allocate();
+    /// let b = alloc.allocate();
+    /// let mut storage = ComponentStorage::<Tag>::new();
+    /// storage.insert(a, Tag);
+    /// storage.insert(b, Tag);
+    /// assert_eq!(storage.entities(), &[a, b]);
+    /// ```
+    #[must_use]
+    pub fn entities(&self) -> &[Entity] {
+        &self.entity_index
+    }
+
     /// Hands out the parallel arrays for one specific consumer: the
     /// `DenseMut` random-access view that powers the `(D1, &mut T)` tuple
     /// impl — i.e. the multi-mut path (`Query<(&mut A, &mut B)>`).

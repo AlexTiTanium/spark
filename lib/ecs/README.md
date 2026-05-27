@@ -984,7 +984,8 @@ assert_eq!(total, 150);
 ```
 
 **Two-component join — the canonical movement system.** Drives the
-first storage and sparse-looks-up the second. Entities missing either
+**smaller** storage (fewest entities) and sparse-looks-up the other —
+see *Query cost and iteration order* below. Entities missing either
 component are skipped:
 
 ```rust
@@ -1356,6 +1357,46 @@ exactly like `Query<(&mut T, &T)>`. `Without<T>` reports no access — it
 is a pure exclusion. Either way filters ride on top of the safe
 iteration path and add no `unsafe`.
 
+### Query cost and iteration order
+
+A query is a loop, and the *driver* is the list it loops over. The cost of
+a query is proportional to its driver, so the engine drives off the
+**smallest candidate set** it can — never the live entity set, and never
+"whichever element you wrote first". Each part that names a concrete
+component offers a candidate (that component's entities, whose count is
+free to read); driver selection — decided **once**, when the query is
+built — picks the smallest across the whole query and turns every other
+part into a per-entity lookup:
+
+| Part | Candidate set |
+|-|-|
+| `&T` / `&mut T` | `T`'s entities |
+| `With<T>` / `Changed<T>` / `Added<T>` | `T`'s entities |
+| `And<(…)>` | the smallest arm's |
+| `Or<(With<A>, With<B>)>` | the deduplicated union `A ∪ B` |
+| `Entity` (alone), `Without<T>`, `()` | none |
+
+So `Query<(&Position, &Building)>` in a 10 000-entity world with 50
+buildings loops over the **50** buildings and looks up each one's
+position, not the other way round — the same result, 200× less work. And
+`Query<Entity, With<Building>>` loops over those 50 buildings rather than
+filtering all 10 000 ids. You don't write anything special: reorder the
+shape however reads best, add a `With<…>` for clarity — the engine drives
+the cheap side either way. The one exception is shapes that name *no*
+candidate (`Query<Entity>`, `Query<Entity, Without<T>>`): with nothing
+smaller to drive, they walk the live set by necessity.
+
+**Iteration order.** Entities come out in the **driver's** dense order —
+the order the chosen storage happens to hold them, which is a
+deterministic function of the spawn/despawn history (no hashing, so it's
+replayable). Because the driver is the *smallest* candidate, changing a
+query's populations can change which storage drives and therefore the
+order; an `Or` union comes out sorted by entity. **Don't depend on a
+specific order** — only on it being stable for a fixed sequence of
+structural edits. (When candidate populations tie, the earliest part in
+the shape drives, so adding this optimisation didn't reorder the queries
+that were already driving optimally.)
+
 # What's next
 
 The types below are **spec-frozen**. Some ship today (✅) and some
@@ -1585,30 +1626,33 @@ Option<&T>         // fetch T if present, give None otherwise
 The driver-storage trick is what keeps queries fast. To resolve
 `Query<(&A, &B)>` the engine:
 
-1. Today: picks the **first element** as the *driver*. The smaller-
-   storage optimisation (pick the smaller of A's and B's storage) is
-   a planned ⏳ follow-up.
+1. Picks the **smallest candidate set** in the whole query as the
+   *driver* — the storage with the fewest entities, decided once when
+   the query is built (see *Query cost and iteration order* above).
 2. Iterates the driver's `dense` array.
 3. For each entity, looks up the other component via O(1) sparse-set
    access. Skips if absent.
 
-So a `Query<(&Plant, &CityName)>` where there are 50 plants and 200
-cities-with-names runs in 50 iterations, not 50 × 200.
+So a `Query<(&Plant, &CityName)>` with 50 plants and 200
+cities-with-names runs in 50 iterations, not 50 × 200 — and the 50
+drives whether `Plant` is written first or second.
 
 | Query | Iteration cost |
 |-|-|
 | `Query<&T>` | O(n) over T's dense array; n = entities with T |
-| `Query<(&A, &B)>` | O(\|A\|) — first element (A) drives today; min-driver is ⏳ |
-| `Query<&A, With<B>>` | O(\|A\|) + one sparse lookup per item |
-| `Query<&A, Without<B>>` | O(\|A\|) + one sparse lookup per item |
-| `Query<&A, And<(With<B>, With<C>)>>` | O(\|A\|) + one sparse lookup per filter term per item |
+| `Query<(&A, &B)>` | O(min(\|A\|, \|B\|)) — the smaller storage drives |
+| `Query<&A, With<B>>` | O(min(\|A\|, \|B\|)) + one sparse lookup per item (two when the filter drives: fetch `A`, then re-check `B`) |
+| `Query<Entity, With<B>>` | O(\|B\|) — the filter drives |
+| `Query<&A, Without<B>>` | O(\|A\|) + one sparse lookup per item (`Without` offers no candidate) |
+| `Query<&A, And<(With<B>, With<C>)>>` | O(smallest of \|A\|, \|B\|, \|C\|) + one sparse lookup per filter term per item |
 | `Query<(&A, Option<&T>)>` | O(over the rest of the query) — Option doesn't gate (⏳) |
 
-Filters are essentially free: each filter borrows its storage **once**
-per iteration (in `init_state`), then `With<T>` / `Without<T>` do a single
-sparse lookup per candidate entity — no component fetch, no repeated
-`RefCell` borrow. `Changed<T>` / `Added<T>` add one tick compare per item
-against a baseline also fetched once.
+Filters are essentially free: each filter borrows its storage **once at
+query construction** (in `init_state`, stored for the query's lifetime),
+then `With<T>` / `Without<T>` do a single sparse lookup per candidate entity
+on each iteration — no component fetch, no repeated `RefCell` borrow.
+`Changed<T>` / `Added<T>` add one tick compare per item against a baseline
+also fetched once at construction.
 
 > **Every `&` / `&mut` combination ships at arity 2-5.** Reads use
 > the storage's safe `get`; mutable non-driver lookups fetch per

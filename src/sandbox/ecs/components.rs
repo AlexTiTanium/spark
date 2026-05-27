@@ -74,3 +74,28 @@ pub(super) struct Operational;
 /// Marker: the building is down for repairs.
 #[derive(Component)]
 pub(super) struct UnderMaintenance;
+
+// ----- Driver-selection components -----
+//
+// A deliberately *skewed* roster for `super::driver_selection`: many nodes
+// carry the `Telemetry` data component, but only a few carry the `Critical`
+// / `Standby` markers. The skew is the point — the engine drives off the
+// rare marker set (the smallest candidate), never the large `Telemetry`
+// storage, so iteration cost tracks the result, not the query shape (#65).
+
+/// A grid-node telemetry reading. The *data* component every node in the
+/// driver-selection roster carries — the large candidate set the queries
+/// deliberately do **not** drive off.
+#[derive(Debug, Component)]
+pub(super) struct Telemetry(pub(super) i32);
+
+/// Marker: a node flagged critical. Rare relative to [`Telemetry`], so it is
+/// the smaller candidate that *drives* the shapes in
+/// [`super::driver_selection`] (tuple element, filter, `And` arm).
+#[derive(Component)]
+pub(super) struct Critical;
+
+/// Marker: a node on standby. Paired with [`Critical`] to show an `And`
+/// driving its smallest arm and an `Or` driving the deduplicated union.
+#[derive(Component)]
+pub(super) struct Standby;

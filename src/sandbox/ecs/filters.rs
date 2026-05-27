@@ -338,23 +338,22 @@ pub(super) fn bump_powered_capacity(
 
 /// **`Query<Entity, With<T>>` — entity ids, narrowed by a filter.**
 ///
-/// `Entity` as the *whole* data shape yields every live entity; `Entity`
-/// can't drive a join (it has no storage), so it walks the live-set
-/// snapshot and `With<Building>` filters per entity. The marker is read,
-/// not fetched — `Entity` itself reads nothing, so it never conflicts
-/// with the filter.
+/// `Entity` as the *whole* data shape names no component, so it offers no
+/// candidate to drive off — but `With<Building>` does, so the **filter
+/// leads**, driving `Building`'s storage (the 5 buildings) directly rather
+/// than the whole live set (#65). The marker is read, not fetched —
+/// `Entity` itself reads nothing, so it never conflicts with the filter.
 ///
-/// Snapshot → this filter (`With<Building>`): every roster member carries
-/// `Building`, so all five ids are kept. (Other live entities — the
-/// physics-demo movers, the change-detection rosters — lack `Building` and
-/// drop out, which is why this pins to the five buildings, not the whole
-/// world.)
+/// Driver → result (`With<Building>` drives `Building`'s 5 entities): every
+/// roster member carries `Building`, so all five ids are kept. Other live
+/// entities — the physics movers, the change-detection and driver-selection
+/// rosters — lack `Building`, so they were never candidates; the cost is the
+/// 5 buildings, not the whole world.
 ///
-/// **When to reach for it:** you need the *ids* of a tagged set — to
-/// despawn them, send them in an event, or store them as a relationship —
-/// without reading any component data. (Cost note: this iterates the whole
-/// live set and tests `With<Building>` per id; driving from the smaller
-/// `Building` storage instead is a documented future optimisation.)
+/// **When to reach for it:** you need the *ids* of a tagged set — to despawn
+/// them, send them in an event, or store them as a relationship — without
+/// reading any component data; the engine drives off the (smaller) tagged
+/// set, so cost tracks the result.
 pub(super) fn building_ids(tick: Res<TickCount>, q: Query<Entity, With<Building>>) {
     if tick.0 != 0 {
         return;
@@ -371,8 +370,9 @@ pub(super) fn building_ids(tick: Res<TickCount>, q: Query<Entity, With<Building>
 ///
 /// Entity-as-data tuple *under* a filter: the id rides with `&Building`,
 /// `With<Powered>` narrows to powered buildings, and the marker never
-/// enters the item. `Building` drives the join (the first component —
-/// `Entity` can't); `With<Powered>` then filters those rows.
+/// enters the item. The **smaller candidate drives** (#65): `With<Powered>`
+/// (3 of the 5 buildings) leads, `Building` is looked up per entity, and the
+/// id rides along — never the 5-element `Building` storage.
 ///
 /// Storage → this filter (`With<Powered>`):
 ///

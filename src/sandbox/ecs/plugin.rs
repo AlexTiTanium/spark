@@ -13,6 +13,10 @@
 use spark_core::{Application, Plugin, Stage};
 
 use super::change_detection::ChangeDetectionPlugin;
+use super::driver_selection::{
+    and_smallest_arm_drives, entity_without, filter_drives, or_union_drives, spawn_driver_demo,
+    tuple_non_first_drives, without_rejects_per_entity,
+};
 use super::filters::{
     and_filter, building_ids, bump_powered_capacity, filtered_join, nested_filter, or_filter,
     powered_building_ids, spawn_filter_demo, with_filter, without_filter,
@@ -79,6 +83,23 @@ impl Plugin for EcsSandboxPlugin {
             // id + name of just the powered buildings.
             .add_system(Stage::PreUpdate, building_ids)
             .add_system(Stage::PreUpdate, powered_building_ids);
+
+        // ----- Driver-selection demo (#65) -----
+        //
+        // Seed a skewed roster (8 Telemetry nodes, 2 Critical, 2 Standby) in
+        // Startup, then one first-tick-gated report per driver shape in
+        // PreUpdate: the smallest candidate drives — a non-first tuple
+        // element, a filter, an `And` arm, an `Or` union. Each self-checks
+        // its result count and logs a PASS/FAIL verdict.
+        app.add_system(Stage::Startup, spawn_driver_demo)
+            .add_system(Stage::PreUpdate, tuple_non_first_drives)
+            .add_system(Stage::PreUpdate, filter_drives)
+            .add_system(Stage::PreUpdate, and_smallest_arm_drives)
+            .add_system(Stage::PreUpdate, or_union_drives)
+            // `Without` offers no candidate, so a positive part drives and it
+            // rejects per entity — shown plain and with `Entity` as data.
+            .add_system(Stage::PreUpdate, without_rejects_per_entity)
+            .add_system(Stage::PreUpdate, entity_without);
 
         // ----- Change-detection demo (`Changed<T>` / `Added<T>`) -----
         //
