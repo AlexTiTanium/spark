@@ -266,11 +266,24 @@ discussion and the filter generic landed:
   symmetry so `Query<&mut X, Without<U>>` stays conflict-free). `And` /
   `Or` report the conservative union of their children. Filters wrap the
   existing safe driver, so no new `unsafe`.
-- *Deferred:* `Option<&T>` was a goal on the issue but **folded out —
-  added only when a real need appears**. It needs a third "optional"
-  flag on the tuple-Cartesian macro (`2·3^(N-1)` impls), not worth the
-  monomorphisation cost today. `Changed<T>` / `Added<T>` still wait on
-  the change-tick slot (item 7).
+- *~~Deferred~~ → ✅ shipped with #70:* `Option<&T>` (and `Option<&mut T>`)
+  landed once a real need appeared. It took the predicted "optional" flag
+  on the tuple machinery, but scoped to keep the monomorphisation cost
+  trivial (~28 new impls): optionals are allowed only in the **trailing**
+  positions of **arity 2–3** tuples (`(&A, Option<&B>)`,
+  `(&A, &B, Option<&C>)`) plus the standalone `Query<Option<&T>>`. The
+  first element stays required (`R`/`W`) so a driver always exists — that
+  "required-driver" rule sidesteps the all-optional and optional-first
+  corners, at the cost of `(Option<&A>, &B)` not compiling (write the
+  required element first). One consequence: the issue's self-conflict
+  example `(Option<&mut A>, &A)` (optional first) cannot be constructed, so
+  the tested equivalent is `(&A, Option<&mut A>)` — the identical write+read
+  conflict on `A`, panicking the same way via `assert_no_self_conflict`. A
+  separate `impl_all_tuple_opt!` macro emits
+  only the optional-bearing shapes, leaving the shipped
+  `impl_all_tuple!` / `impl_one_combo!` family untouched. Optional in the
+  `Query<(Entity, …)>` family and at arities 4–5 remain follow-ups for
+  when a need appears. `Changed<T>` / `Added<T>` shipped with #62.
 
 **5. ~~Query tuple arity 3–4~~ — ✅ DONE (PR #22, extended by #26).**
 Read-only tuple arities 2/3/4 shipped alongside #11. **#26 then
