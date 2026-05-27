@@ -685,6 +685,9 @@ pub trait IntoSystemTuple<Marker> {
 /// Emits one [`IntoSystemTuple`] impl per arity: destructure the tuple,
 /// box each system, push it. See [`IntoSystem`]'s `impl_into_system!` for
 /// the matching marker-tuple pattern.
+//
+// Codegen census: this is one of the crate's declarative-macro families;
+// see the variant manifest at the top of `query/tuple_codegen.rs`.
 macro_rules! impl_into_system_tuple {
     ($(($S:ident, $M:ident)),+) => {
         impl<$($S, $M),+> IntoSystemTuple<($($M,)+)> for ($($S,)+)

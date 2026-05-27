@@ -1,4 +1,3 @@
-
 //! Deterministic cost-contract checks for issue #65: every shape drives a
 //! number of *driver steps* proportional to its smallest candidate, not to
 //! the live set or to which element was written first. Counting is exact

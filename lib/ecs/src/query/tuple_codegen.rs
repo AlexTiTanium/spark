@@ -2,8 +2,43 @@
 //! [`ReadOnlyQueryData`] impls (arity 2+), kept in one file because
 //! `macro_rules!` is textually scoped — the helper macros, the three leaf
 //! generators, the Cartesian drivers, and their invocations must all sit
-//! together. Phase 2 (issue #80) fronts this file with a *variant
-//! manifest* table.
+//! together.
+//!
+//! # Variant manifest
+//!
+//! Three families are generated below. Flag alphabet: `R` = `&T`,
+//! `W` = `&mut T`, `O` = `Option<&T>`, `OW` = `Option<&mut T>`.
+//!
+//! | Family | Leaf macro | Entry macro | Flags | Arity | `QueryData` | `ReadOnlyQueryData` | read-only gate |
+//! |---|---|---|---|---|---|---|---|
+//! | Plain tuple | `impl_one_combo!` | `impl_all_tuple!` | R, W | 2–5 | 60 | 4 | the all-`R` shape |
+//! | Entity-prefixed | `impl_one_combo_entity!` | `impl_all_tuple_entity!` | R, W (+ `Entity` prefix) | 1–3 components | 14 | 3 | the all-`R` shape |
+//! | Optional | `impl_one_combo_opt!` | `impl_all_tuple_opt!` | R, W, O, OW (first slot required) | 2–3 | 28 | 4 | no `W`/`OW`, via `emit_readonly!` |
+//!
+//! Total: **102 `QueryData` + 11 `ReadOnlyQueryData` = 113 impls.** The
+//! plain and entity families share the `cartesian_rw!` R/W product
+//! (parameterised on the leaf); the optional family keeps its own driver
+//! (`impl_all_tuple_opt_cartesian!` — first slot required, `y`/`n` sentinel
+//! suppressing the pure-R/W combos `impl_all_tuple!` already owns). The
+//! three leaves stay distinct: Entity offsets the driver by `+1`
+//! (`DriveSource::Data(1)`), Option uses `filter_map` + `cand_len!`.
+//!
+//! ## Codegen elsewhere in the crate
+//!
+//! Other declarative codegen lives in sibling files (different traits, no
+//! shared helpers — relocating would couple unrelated layers). Each site
+//! carries a reciprocal back-pointer comment to this manifest:
+//!
+//! | Macro | File | Trait(s) | Arity | Impls |
+//! |---|---|---|---|---|
+//! | `impl_into_system!` | `system.rs` | `IntoSystem<fn(..)>` | 0–4 | 5 |
+//! | `impl_into_system_tuple!` | `workload.rs` | `IntoSystemTuple<(..)>` | 1–8 | 8 |
+//! | `impl_logical_filter!` | `filter.rs` | `QueryFilter` for `And` / `Or` | 2–4 | 6 |
+//!
+//! The `#[derive(Component)]` / `Resource` / `Event` / `WorkloadLabel`
+//! proc-macros live in `lib/ecs/macros/`.
+//!
+//! # Reused machinery
 //!
 //! The generated impls reuse the driver runtime
 //! ([`DriveSource`](super::DriveSource) / [`DriverIter`](super::DriverIter)),
@@ -543,21 +578,28 @@ macro_rules! impl_one_combo {
     };
 }
 
-// ---- impl_all_tuple_cartesian: tt-muncher Cartesian product ----------
+// ---- cartesian_rw!: shared R/W Cartesian product (tt-muncher) --------
 //
 // Recursively assigns each remaining type ident both an `R` and a `W`
 // flag, accumulating the flag-type pairs. When the type list is empty,
-// the accumulator names one specific flag sequence and `impl_one_combo!`
-// emits its impl(s). For N input types this generates 2^N
-// `impl_one_combo!` calls.
-
-macro_rules! impl_all_tuple_cartesian {
-    (@start [$($acc:tt)*]) => {
-        impl_one_combo!($($acc)*);
+// the accumulator names one specific flag sequence and the `$leaf` macro
+// emits its impl(s). For N input types this makes 2^N `$leaf!` calls.
+//
+// `$leaf` is the per-shape leaf generator — `impl_one_combo` for the plain
+// tuple family, `impl_one_combo_entity` for the entity-prefixed family.
+// Those two families' Cartesian drivers were token-for-token identical
+// apart from the leaf they called, so they are unified here; the
+// byte-identical release-profile `cargo expand` diff against the pre-dedup
+// tree is the proof (no generated impl moves). The Option family keeps its
+// own driver — its first-slot-required / `y`-`n` sentinel logic is not a
+// plain R/W product.
+macro_rules! cartesian_rw {
+    ($leaf:ident, @start [$($acc:tt)*]) => {
+        $leaf!($($acc)*);
     };
-    (@start [$($acc:tt)*] $Head:ident, $($Tail:ident,)*) => {
-        impl_all_tuple_cartesian!(@start [$($acc)* R $Head,] $($Tail,)*);
-        impl_all_tuple_cartesian!(@start [$($acc)* W $Head,] $($Tail,)*);
+    ($leaf:ident, @start [$($acc:tt)*] $Head:ident, $($Tail:ident,)*) => {
+        cartesian_rw!($leaf, @start [$($acc)* R $Head,] $($Tail,)*);
+        cartesian_rw!($leaf, @start [$($acc)* W $Head,] $($Tail,)*);
     };
 }
 
@@ -572,7 +614,7 @@ macro_rules! impl_all_tuple_cartesian {
 /// `&T` / `&mut T` impls earlier in the file).
 macro_rules! impl_all_tuple {
     ($A:ident, $($B:ident),+) => {
-        impl_all_tuple_cartesian!(@start [] $A, $($B,)+);
+        cartesian_rw!(impl_one_combo, @start [] $A, $($B,)+);
     };
 }
 
@@ -1097,15 +1139,9 @@ macro_rules! impl_one_combo_entity {
     };
 }
 
-macro_rules! impl_all_tuple_entity_cartesian {
-    (@start [$($acc:tt)*]) => {
-        impl_one_combo_entity!($($acc)*);
-    };
-    (@start [$($acc:tt)*] $Head:ident, $($Tail:ident,)*) => {
-        impl_all_tuple_entity_cartesian!(@start [$($acc)* R $Head,] $($Tail,)*);
-        impl_all_tuple_entity_cartesian!(@start [$($acc)* W $Head,] $($Tail,)*);
-    };
-}
+// The entity-prefixed family shares the [`cartesian_rw!`] driver above,
+// parameterised on the `impl_one_combo_entity` leaf — see that macro's note
+// for why the two families' Cartesian drivers are one and the same.
 
 /// Emits every `QueryData` impl (and the `ReadOnlyQueryData` impl for the
 /// all-read combination) for `(Entity, …)` at *every* `&` / `&mut`
@@ -1119,7 +1155,7 @@ macro_rules! impl_all_tuple_entity_cartesian {
 /// more line, at the usual doubling monomorphisation cost.
 macro_rules! impl_all_tuple_entity {
     ($A:ident $(, $B:ident)*) => {
-        impl_all_tuple_entity_cartesian!(@start [] $A, $($B,)*);
+        cartesian_rw!(impl_one_combo_entity, @start [] $A, $($B,)*);
     };
 }
 

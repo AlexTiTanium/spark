@@ -524,6 +524,9 @@ pub struct Or<F>(PhantomData<F>);
 /// tuple arity. `And` short-circuits on the first non-match (`&&`), `Or`
 /// on the first match (`||`); both report the union of their children's
 /// access. Adding an arity is one more invocation below.
+//
+// Codegen census: this is one of the crate's declarative-macro families;
+// see the variant manifest at the top of `query/tuple_codegen.rs`.
 macro_rules! impl_logical_filter {
     ($($F:ident),+) => {
         impl<$($F: QueryFilter),+> QueryFilter for And<($($F,)+)> {
