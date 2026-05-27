@@ -84,6 +84,13 @@
 //! Note that monomorphisation cost doubles with each step: weigh it
 //! against actual need before extending past 5.
 //!
+//! **Optional elements** — `Option<&T>` / `Option<&mut T>` — are a parallel
+//! family from [`impl_all_tuple_opt!`]: a tuple whose first element is
+//! required (`&T`/`&mut T`, so a driver always exists) and whose trailing
+//! elements may be optional, at arities 2–3. An optional fetches `T` when
+//! present and yields `None` otherwise without dropping the row, so it never
+//! drives. See the `Option<&T>` impl below.
+//!
 //! Entity-prefixed shapes — `Query<(Entity, &A)>` through
 //! `Query<(Entity, &A, &B, &C)>` — come from a parallel
 //! [`impl_all_tuple_entity!`] family (1–3 trailing components, the same
@@ -194,10 +201,11 @@ pub enum DriveSource<'s> {
 #[derive(Clone, Copy)]
 enum DriverPlan {
     /// No part offers a candidate (`Query<Entity>`, `Query<Entity, Without<T>>`,
-    /// `Query<Entity, ()>`): drive the live-entity snapshot via the data
+    /// `Query<Entity, ()>`, standalone `Query<Option<&T>>` /
+    /// `Query<Option<&mut T>>`): drive the live-entity snapshot via the data
     /// shape's own `iter`. The structurally exempt case — a shape naming no
-    /// component has no smaller candidate to drive off, so this is the
-    /// permanent fallback, not a temporary one.
+    /// *required* component has no smaller candidate to drive off, so this is
+    /// the permanent fallback, not a temporary one.
     LiveSet,
     /// A data element holds the smallest candidate; drive it (its index).
     Data(usize),
@@ -254,8 +262,9 @@ macro_rules! counted {
 /// # Examples
 ///
 /// `QueryData` is rarely named in user code — the impls for `&T`,
-/// `&mut T`, and tuples cover every query shape. Naming it is useful
-/// when writing generic helpers; here we just confirm the impl exists:
+/// `&mut T`, `Option<&T>` / `Option<&mut T>`, and tuples cover every query
+/// shape. Naming it is useful when writing generic helpers; here we just
+/// confirm the impl exists:
 ///
 /// ```
 /// use spark_ecs::{Component, QueryData};
@@ -265,6 +274,7 @@ macro_rules! counted {
 /// struct Position { x: f32, y: f32 }
 /// _accepts::<&Position>();
 /// _accepts::<&mut Position>();
+/// _accepts::<Option<&Position>>();
 /// ```
 pub trait QueryData {
     /// What this query yields per entity. `&T`, `&mut T`, or a tuple.
@@ -361,7 +371,10 @@ pub trait QueryData {
 /// struct Velocity { x: f32, y: f32 }
 /// _accepts::<&Position>();
 /// _accepts::<(&Position, &Velocity)>();
-/// // _accepts::<&mut Position>();    // would not compile — exclusive
+/// _accepts::<Option<&Position>>();                  // optional is read-only
+/// _accepts::<(&Position, Option<&Velocity>)>();
+/// // _accepts::<&mut Position>();                   // would not compile — exclusive
+/// // _accepts::<(&Position, Option<&mut Velocity>)>(); // nor this — exclusive
 /// ```
 pub trait ReadOnlyQueryData: QueryData {
     /// Shared iteration over `(Entity, Item)` pairs from `&State`.
@@ -586,6 +599,365 @@ impl<T: Component> QueryData for &mut T {
 }
 
 // No ReadOnlyQueryData for &mut T — that's the entire point of the split.
+
+// -------- Option<&T> / Option<&mut T> (optional fetch) --------
+
+/// Fetches `T` when the entity has it, yields `None` when it doesn't —
+/// `Query<Option<&T>>` and the `Option<&T>` element of a join.
+///
+/// # Logic
+///
+/// `Option<&T>` is **not** a filter: it never removes an entity from the
+/// result, it only decides whether the yielded item is `Some(&T)` or
+/// `None`. A required `&T` skips entities that lack `T` (`fetch` returns
+/// `None` and the join drops the row); `Option<&T>` keeps the row and
+/// reports the absence as a `None` *value*.
+///
+/// # Why it never drives
+///
+/// Because it removes nothing, `Option<&T>` has no smaller candidate set
+/// to offer — it keeps the `None` default of
+/// [`min_data_candidate`](QueryData::min_data_candidate), exactly like
+/// [`Entity`]. In a tuple the first element is always *required* (the
+/// `impl_all_tuple_opt!` shape guarantees it), so a driver always exists —
+/// the smallest required element drives and the optional is looked up per
+/// entity. Standing alone, `Query<Option<&T>>` has no required element, so
+/// driver selection falls to the live-set plan — the `World::live_entities`
+/// snapshot captured in `State` — and every live entity is visited, each
+/// yielding `Some`/`None`. That snapshot is why `State` is a
+/// `(Vec<Entity>, Option<Ref<…>>)` pair rather than the bare storage borrow
+/// `&T` uses.
+///
+/// # Snapshot semantics
+///
+/// Standalone, the snapshot follows the same contract as [`Entity`] (see its
+/// *Snapshot semantics* section): it is frozen at query construction, so an
+/// entity `Commands::despawn`'d mid-iteration is still yielded (despawn is
+/// deferred) and one `Commands::spawn`'d after construction is not. In a join
+/// the optional rides the driver and the snapshot is unused.
+///
+/// # Examples
+///
+/// Optional in a join — present on one entity, absent on the other; both
+/// rows are yielded:
+///
+/// ```
+/// use spark_ecs::{Component, Query, World};
+///
+/// #[derive(Component)]
+/// struct Position { x: f32, y: f32 }
+/// #[derive(Component)]
+/// struct Velocity { x: f32, y: f32 }
+///
+/// let mut world = World::new();
+/// world.spawn().insert(Position { x: 1.0, y: 0.0 }).insert(Velocity { x: 2.0, y: 0.0 });
+/// world.spawn().insert(Position { x: 3.0, y: 0.0 }); // no Velocity
+///
+/// let q = Query::<(&Position, Option<&Velocity>)>::from_world(&world);
+/// let rows: Vec<_> = q.iter().map(|(p, v)| (p.x, v.map(|v| v.x))).collect();
+/// assert!(rows.contains(&(1.0, Some(2.0)))); // Velocity present
+/// assert!(rows.contains(&(3.0, None)));       // Velocity absent — still yielded
+/// ```
+///
+/// Standing alone, it visits every live entity:
+///
+/// ```
+/// use spark_ecs::{Component, Query, World};
+///
+/// #[derive(Component)]
+/// struct Velocity { x: f32, y: f32 }
+///
+/// let mut world = World::new();
+/// world.spawn().insert(Velocity { x: 2.0, y: 0.0 });
+/// world.spawn(); // no components at all
+///
+/// let q = Query::<Option<&Velocity>>::from_world(&world);
+/// assert_eq!(q.iter().count(), 2); // every live entity, Some or None
+/// assert_eq!(q.iter().filter(|v| v.is_some()).count(), 1);
+/// ```
+///
+/// The optional still reports its access, so mixing it with a conflicting
+/// borrow of the same component panics at construction (note: the
+/// `impl_all_tuple_opt!` shape forbids optional in the first slot, so the
+/// reachable conflict shape is `(&A, Option<&mut A>)`, not the reversed
+/// order):
+///
+/// ```should_panic
+/// use spark_ecs::{Component, Query, World};
+///
+/// #[derive(Component)]
+/// struct Position(f32, f32);
+///
+/// let mut world = World::new();
+/// world.spawn().insert(Position(0.0, 0.0));
+/// // `&Position` reads and `Option<&mut Position>` writes the SAME
+/// // component — the per-query self-conflict check panics here.
+/// let _q = Query::<(&Position, Option<&mut Position>)>::from_world(&world);
+/// ```
+///
+/// An optional may only sit in a *trailing* position — the first element
+/// must be required so a driver always exists. Optional-first is a compile
+/// error (write the required element first):
+///
+/// ```compile_fail
+/// use spark_ecs::{Component, Query, World};
+///
+/// #[derive(Component)]
+/// struct Position(f32, f32);
+/// #[derive(Component)]
+/// struct Velocity(f32, f32);
+///
+/// let mut world = World::new();
+/// world.spawn().insert(Position(0.0, 0.0)).insert(Velocity(1.0, 0.0));
+/// // No impl for optional-first — use `(&Velocity, Option<&Position>)` instead.
+/// let _q = Query::<(Option<&Position>, &Velocity)>::from_world(&world);
+/// ```
+impl<T: Component> QueryData for Option<&T> {
+    type Item<'w>
+        = Option<&'w T>
+    where
+        Self: 'w;
+    // (live snapshot, storage borrow): the snapshot drives a standalone
+    // `Query<Option<&T>>` (every live entity); the borrow fetches `T` per
+    // entity. In a join the optional is never the driver, so only the
+    // borrow is touched — the snapshot just rides along unused.
+    type State<'w>
+        = (Vec<Entity>, Option<Ref<'w, ComponentStorage<T>>>)
+    where
+        Self: 'w;
+
+    fn init_state<'w>(world: &'w World) -> Self::State<'w>
+    where
+        Self: 'w,
+    {
+        (world.live_entities(), world.storage::<T>())
+    }
+
+    fn iter<'s, 'w>(
+        state: &'s mut Self::State<'w>,
+    ) -> Box<dyn Iterator<Item = (Entity, Option<&'s T>)> + 's>
+    where
+        Self: 's,
+        Self: 'w,
+        'w: 's,
+    {
+        let (entities, storage) = state;
+        let storage = &*storage;
+        Box::new(
+            counted!(entities.iter()).map(move |&e| (e, storage.as_ref().and_then(|s| s.get(e)))),
+        )
+    }
+
+    fn collect_access(access: &mut QueryAccess) {
+        access.add_read::<T>();
+    }
+
+    // `min_data_candidate` keeps the `None` default — an optional never
+    // drives (it narrows nothing). See the type-level docs.
+
+    fn drive<'s, 'w>(
+        state: &'s mut Self::State<'w>,
+        driver: DriveSource<'s>,
+    ) -> Box<dyn Iterator<Item = (Entity, Option<&'s T>)> + 's>
+    where
+        Self: 's,
+        Self: 'w,
+        'w: 's,
+    {
+        match driver {
+            DriveSource::External(di) => {
+                // The external driver feeds entities; unlike `iter`, the
+                // snapshot is unused here (the join's required element drives).
+                let (_entities, storage) = state;
+                let storage = &*storage;
+                Box::new(counted!(di).map(move |e| (e, storage.as_ref().and_then(|s| s.get(e)))))
+            }
+            // Unreachable in practice: no candidate ⇒ the plan never picks
+            // `Data` for an optional. Falls back to the snapshot drive.
+            // (`<Self as QueryData>` disambiguates from `Option::iter`.)
+            DriveSource::Data(_) => <Self as QueryData>::iter(state),
+        }
+    }
+}
+
+impl<T: Component> ReadOnlyQueryData for Option<&T> {
+    fn iter_ref<'s, 'w>(
+        state: &'s Self::State<'w>,
+    ) -> Box<dyn Iterator<Item = (Entity, Option<&'s T>)> + 's>
+    where
+        Self: 's,
+        Self: 'w,
+        'w: 's,
+    {
+        let (entities, storage) = state;
+        Box::new(
+            counted!(entities.iter()).map(move |&e| (e, storage.as_ref().and_then(|s| s.get(e)))),
+        )
+    }
+
+    fn lookup<'s, 'w>(state: &'s Self::State<'w>, entity: Entity) -> Option<Option<&'s T>>
+    where
+        Self: 's,
+        Self: 'w,
+        'w: 's,
+    {
+        // Always `Some(…)` — an optional never rejects the entity. The
+        // inner `Option` carries the presence/absence of `T`.
+        Some(state.1.as_ref().and_then(|s| s.get(entity)))
+    }
+
+    fn drive_ref<'s, 'w>(
+        state: &'s Self::State<'w>,
+        driver: DriveSource<'s>,
+    ) -> Box<dyn Iterator<Item = (Entity, Option<&'s T>)> + 's>
+    where
+        Self: 's,
+        Self: 'w,
+        'w: 's,
+    {
+        match driver {
+            DriveSource::External(di) => {
+                // The external driver feeds entities; the snapshot is unused.
+                let (_entities, storage) = state;
+                Box::new(counted!(di).map(move |e| (e, storage.as_ref().and_then(|s| s.get(e)))))
+            }
+            DriveSource::Data(_) => Self::iter_ref(state),
+        }
+    }
+}
+
+/// The mutable optional — `Option<&mut T>`. Same never-skips semantics as
+/// `Option<&T>`, but hands out a change-marking [`Mut<T>`](crate::Mut) per
+/// present entity.
+///
+/// Like `&mut T` it does **not** implement [`ReadOnlyQueryData`] (the write
+/// claim is exclusive) and its per-entity lookup goes through the same
+/// unsafe `DenseMut` view. The safety contract — each entity fetched at most
+/// once across `'s` — holds because the live snapshot (standalone, frozen at
+/// construction like `Option<&T>`'s) and every built-in driver list each
+/// entity exactly once (storage entity lists are duplicate-free by the
+/// sparse-set invariant; `Or` dedups its union), and
+/// [`QueryAccess::assert_no_self_conflict`] rules out the component appearing
+/// twice.
+///
+/// # Examples
+///
+/// ```
+/// use spark_ecs::{Component, Query, World};
+///
+/// #[derive(Component)]
+/// struct Health(i32);
+/// #[derive(Component)]
+/// struct Poison(i32);
+///
+/// let mut world = World::new();
+/// world.spawn().insert(Health(100)).insert(Poison(5));
+/// world.spawn().insert(Health(50)); // no Poison
+///
+/// {
+///     let mut q = Query::<(&mut Health, Option<&mut Poison>)>::from_world(&world);
+///     for (mut hp, poison) in q.iter_mut() {
+///         if let Some(mut p) = poison {
+///             hp.0 -= p.0; // apply poison damage…
+///             p.0 = 0;     // …and consume it
+///         }
+///     }
+/// }
+///
+/// let hps: Vec<i32> = Query::<&Health>::from_world(&world).iter().map(|h| h.0).collect();
+/// assert!(hps.contains(&95)); // 100 - 5, had Poison
+/// assert!(hps.contains(&50)); // untouched, no Poison
+/// ```
+///
+/// A shape containing `Option<&mut T>` is exclusive, so it is **not**
+/// [`ReadOnlyQueryData`] — `.iter()` is a compile error (use `.iter_mut()`):
+///
+/// ```compile_fail
+/// use spark_ecs::{Component, Query, World};
+///
+/// #[derive(Component)]
+/// struct Position(i32, i32);
+/// #[derive(Component)]
+/// struct Velocity(i32, i32);
+///
+/// let mut world = World::new();
+/// world.spawn().insert(Position(0, 0)).insert(Velocity(1, 0));
+///
+/// let q = Query::<(&Position, Option<&mut Velocity>)>::from_world(&world);
+/// for _ in q.iter() {} // ← `Option<&mut Velocity>` ⇒ not read-only: compile error
+/// ```
+#[allow(unsafe_code)] // per-entity `&mut T` lookup goes through `DenseMut`.
+impl<T: Component> QueryData for Option<&mut T> {
+    type Item<'w>
+        = Option<Mut<'w, T>>
+    where
+        Self: 'w;
+    type State<'w>
+        = (Vec<Entity>, Option<RefMut<'w, ComponentStorage<T>>>)
+    where
+        Self: 'w;
+
+    fn init_state<'w>(world: &'w World) -> Self::State<'w>
+    where
+        Self: 'w,
+    {
+        (world.live_entities(), world.storage_mut::<T>())
+    }
+
+    fn iter<'s, 'w>(
+        state: &'s mut Self::State<'w>,
+    ) -> Box<dyn Iterator<Item = (Entity, Option<Mut<'s, T>>)> + 's>
+    where
+        Self: 's,
+        Self: 'w,
+        'w: 's,
+    {
+        let (entities, storage) = state;
+        let view = storage.as_mut().map(|refmut| {
+            let (dense, changed, sparse, ents, tick) = refmut.split_for_join();
+            DenseMut::new(dense, changed, sparse, ents, tick)
+        });
+        Box::new(counted!(entities.iter()).map(move |&e| {
+            // SAFETY: the live snapshot lists each entity once, so `get`
+            // runs at most once per entity across `'s`. See `DenseMut::get`.
+            (e, unsafe { view.as_ref().and_then(|v| v.get(e)) })
+        }))
+    }
+
+    fn collect_access(access: &mut QueryAccess) {
+        access.add_write::<T>();
+    }
+
+    // `min_data_candidate` keeps the `None` default — never drives.
+
+    fn drive<'s, 'w>(
+        state: &'s mut Self::State<'w>,
+        driver: DriveSource<'s>,
+    ) -> Box<dyn Iterator<Item = (Entity, Option<Mut<'s, T>>)> + 's>
+    where
+        Self: 's,
+        Self: 'w,
+        'w: 's,
+    {
+        match driver {
+            DriveSource::External(di) => {
+                // The external driver feeds entities; unlike `iter`, the
+                // snapshot is unused here (the join's required element drives).
+                let (_entities, storage) = state;
+                let view = storage.as_mut().map(|refmut| {
+                    let (dense, changed, sparse, ents, tick) = refmut.split_for_join();
+                    DenseMut::new(dense, changed, sparse, ents, tick)
+                });
+                Box::new(counted!(di).map(move |e| {
+                    // SAFETY: the external driver lists each entity once, so
+                    // `get` runs at most once per entity across `'s`.
+                    (e, unsafe { view.as_ref().and_then(|v| v.get(e)) })
+                }))
+            }
+            DriveSource::Data(_) => <Self as QueryData>::iter(state),
+        }
+    }
+}
 
 // -------- Entity (the id itself, as data) --------
 
@@ -899,7 +1271,9 @@ impl<'s, T> DenseMut<'s, T> {
 // **Extending arity past 5.** Add one line below:
 // `impl_all_tuple!(A, B, C, D, E, F);` unlocks arity 6 (64 combos).
 // Monomorphisation cost doubles with each step — weigh it against
-// real need before extending.
+// real need before extending. Optional-bearing shapes live in the
+// companion `impl_all_tuple_opt!` family further down (currently arities
+// 2–3); extending *those* past 3 means adding a line there too.
 
 // ---- Helper macros (file-private) -----------------------------------
 //
@@ -913,6 +1287,8 @@ impl<'s, T> DenseMut<'s, T> {
 macro_rules! decl_type {
     (R $T:ident, $w:lifetime) => { &$w $T };
     (W $T:ident, $w:lifetime) => { &$w mut $T };
+    (O $T:ident, $w:lifetime) => { Option<&$w $T> };
+    (OW $T:ident, $w:lifetime) => { Option<&$w mut $T> };
 }
 
 /// `&'w T` for `R`, `Mut<'w, T>` for `W` — the type iteration *yields*
@@ -922,6 +1298,8 @@ macro_rules! decl_type {
 macro_rules! item_type {
     (R $T:ident, $w:lifetime) => { &$w $T };
     (W $T:ident, $w:lifetime) => { Mut<$w, $T> };
+    (O $T:ident, $w:lifetime) => { Option<&$w $T> };
+    (OW $T:ident, $w:lifetime) => { Option<Mut<$w, $T>> };
 }
 
 /// `Option<Ref<'w, ComponentStorage<T>>>` for `R`, `Option<RefMut<…>>`
@@ -930,6 +1308,8 @@ macro_rules! item_type {
 macro_rules! state_type {
     (R $T:ident, $w:lifetime) => { Option<Ref<$w, ComponentStorage<$T>>> };
     (W $T:ident, $w:lifetime) => { Option<RefMut<$w, ComponentStorage<$T>>> };
+    (O $T:ident, $w:lifetime) => { Option<Ref<$w, ComponentStorage<$T>>> };
+    (OW $T:ident, $w:lifetime) => { Option<RefMut<$w, ComponentStorage<$T>>> };
 }
 
 /// `world.storage::<T>()` for `R`, `world.storage_mut::<T>()` for `W`.
@@ -940,14 +1320,28 @@ macro_rules! init_storage {
     (W $T:ident, $world:expr) => {
         $world.storage_mut::<$T>()
     };
+    (O $T:ident, $world:expr) => {
+        $world.storage::<$T>()
+    };
+    (OW $T:ident, $world:expr) => {
+        $world.storage_mut::<$T>()
+    };
 }
 
-/// `access.add_read::<T>()` for `R`, `access.add_write::<T>()` for `W`.
+/// `access.add_read::<T>()` for `R`/`O`, `access.add_write::<T>()` for
+/// `W`/`OW` — an optional borrows its component exactly like the required
+/// form, so `(&A, Option<&mut A>)` still trips the self-conflict check.
 macro_rules! access_call {
     (R $T:ident, $access:expr) => {
         $access.add_read::<$T>();
     };
     (W $T:ident, $access:expr) => {
+        $access.add_write::<$T>();
+    };
+    (O $T:ident, $access:expr) => {
+        $access.add_read::<$T>();
+    };
+    (OW $T:ident, $access:expr) => {
         $access.add_write::<$T>();
     };
 }
@@ -959,11 +1353,24 @@ macro_rules! access_call {
 /// - `W`: build an `Option<DenseMut<'s, T>>` from
 ///   [`ComponentStorage::split_for_join`]. The closure reads through
 ///   the `unsafe fn` [`DenseMut::get`].
+///
+/// `O` is identical to `R` and `OW` to `W` — the optional/required
+/// difference lives in [`fetch_non_driver!`], not in how the handle is
+/// built.
 macro_rules! build_non_driver_fetch {
     (R, $state:ident) => {
         &*$state
     };
     (W, $state:ident) => {
+        $state.as_mut().map(|refmut| {
+            let (dense, changed_tick, sparse, entity_index, current_tick) = refmut.split_for_join();
+            DenseMut::new(dense, changed_tick, sparse, entity_index, current_tick)
+        })
+    };
+    (O, $state:ident) => {
+        &*$state
+    };
+    (OW, $state:ident) => {
         $state.as_mut().map(|refmut| {
             let (dense, changed_tick, sparse, entity_index, current_tick) = refmut.split_for_join();
             DenseMut::new(dense, changed_tick, sparse, entity_index, current_tick)
@@ -980,6 +1387,11 @@ macro_rules! build_non_driver_fetch {
 ///   check in `Query::from_world` rules out the same component
 ///   appearing twice. See the *Joins* section in the module-level
 ///   docs for the full argument.
+///
+/// The `O`/`OW` arms are the heart of optional fetch: they drop the
+/// trailing `?`, so an absent component yields a `None` *value* in the
+/// tuple instead of short-circuiting the whole row away. (`R`/`W` keep the
+/// `?` — a missing required component skips the entity.)
 macro_rules! fetch_non_driver {
     (R, $fetch:expr, $entity:expr) => {
         $fetch.as_ref()?.get($entity)?
@@ -989,6 +1401,14 @@ macro_rules! fetch_non_driver {
         // guarantees disjoint storages. Module-level docs for details.
         unsafe { $fetch.as_ref()?.get($entity)? }
     };
+    (O, $fetch:expr, $entity:expr) => {
+        $fetch.as_ref().and_then(|s| s.get($entity))
+    };
+    (OW, $fetch:expr, $entity:expr) => {
+        // SAFETY: same contract as the `W` arm — the driver visits each
+        // entity once and the self-conflict check rules out a duplicate.
+        unsafe { $fetch.as_ref().and_then(|v| v.get($entity)) }
+    };
 }
 
 /// Driver iterator for the **first-element** path — `iter` / `iter_ref`, and
@@ -996,6 +1416,10 @@ macro_rules! fetch_non_driver {
 /// `.iter()`, `W` uses safe `.iter_mut()` (both from `ComponentStorage`).
 /// Driving a *non-first* element goes through `build_elem!` + [`DriverIter`]
 /// instead.
+///
+/// No `O`/`OW` arms: an optional element never sits in the first (driver)
+/// position — `impl_all_tuple_opt_cartesian!` only ever assigns `R`/`W` to
+/// the first slot — so this macro is never invoked with an optional flag.
 macro_rules! drive_iter {
     (R, $state:ident) => {
         match $state {
@@ -1036,6 +1460,10 @@ macro_rules! slice_of_read {
 ///   [`DenseMut::get`]. The slice comes from the *same* `split_for_join` as
 ///   the `DenseMut`, so the shared `entity_index` borrow (driver) and the
 ///   `&mut dense` borrow (lookup) are disjoint — no aliasing.
+///
+/// For `O`/`OW` the entity slice is always empty (`&[][..]`): an optional
+/// never wins driver selection (its `cand_len!` is `None`), so its slice is
+/// never indexed as the driver. Only the fetch handle is used.
 macro_rules! build_elem {
     (R, $state:ident) => {{
         let fetch = &*$state;
@@ -1060,6 +1488,75 @@ macro_rules! build_elem {
             }
             None => (&[][..], None),
         }
+    };
+    (O, $state:ident) => {{
+        let fetch = &*$state;
+        (&[][..], fetch)
+    }};
+    (OW, $state:ident) => {
+        match $state.as_mut() {
+            Some(refmut) => {
+                let (dense, changed_tick, sparse, entity_index, current_tick) =
+                    refmut.split_for_join();
+                (
+                    &[][..],
+                    Some(DenseMut::new(
+                        dense,
+                        changed_tick,
+                        sparse,
+                        entity_index,
+                        current_tick,
+                    )),
+                )
+            }
+            None => (&[][..], None),
+        }
+    };
+}
+
+/// Candidate population for driver selection: `Some(len)` for the required
+/// flags `R`/`W`, `None` for the optional flags `O`/`OW`. An optional
+/// contributes no candidate — it narrows nothing, so it must never win the
+/// driver. Used by `impl_one_combo_opt!`'s `min_data_candidate`.
+macro_rules! cand_len {
+    (R, $state:expr) => {
+        Some($state.as_ref().map_or(0, |s| s.len()))
+    };
+    // Same as `R` — both required flags expose a candidate.
+    (W, $state:expr) => {
+        Some($state.as_ref().map_or(0, |s| s.len()))
+    };
+    (O, $state:expr) => {
+        None::<usize>
+    };
+    // Same as `O` — both optional flags narrow nothing, so no candidate.
+    (OW, $state:expr) => {
+        None::<usize>
+    };
+}
+
+/// Per-entity lookup on the shared (`ReadOnlyQueryData`) path, reading the
+/// raw `&Option<Ref<…>>` state element directly. `R` keeps the `?` (a
+/// missing required component skips the row); `O` drops it (a missing
+/// optional yields a `None` value). The read-only side never sees `W`/`OW`.
+macro_rules! fetch_ro {
+    (R, $state:expr, $entity:expr) => {
+        $state.as_ref()?.get($entity)?
+    };
+    (O, $state:expr, $entity:expr) => {
+        $state.as_ref().and_then(|s| s.get($entity))
+    };
+}
+
+/// Read-only (`drive_ref`) mirror of `build_elem!`'s slice: `R` yields the
+/// storage's own entity slice, `O` an empty one (an optional never wins
+/// `min_data_candidate`, so its slot is never the chosen driver index).
+macro_rules! slice_ro {
+    (R, $state:expr) => {
+        slice_of_read!($state)
+    };
+    (O, $state:expr) => {
+        &[][..]
     };
 }
 
@@ -1306,6 +1803,292 @@ impl_all_tuple!(A, B);
 impl_all_tuple!(A, B, C);
 impl_all_tuple!(A, B, C, D);
 impl_all_tuple!(A, B, C, D, E);
+
+// ---- Optional-bearing tuples: Query<(&A, Option<&B>)> ----------------
+//
+// A second family beside impl_one_combo! / impl_all_tuple!, covering
+// tuples whose trailing elements may be `Option<&T>` (`O`) or
+// `Option<&mut T>` (`OW`). It reuses every per-flag helper (decl_type!,
+// item_type!, state_type!, init_storage!, access_call!,
+// build_non_driver_fetch!, fetch_non_driver!, drive_iter!, build_elem!)
+// — those gained `O`/`OW` arms — and adds two: `cand_len!` (optionals
+// offer no driver candidate) and `fetch_ro!` (read-only optional lookup).
+//
+// THE FIRST ELEMENT IS ALWAYS REQUIRED (`R`/`W`). An optional narrows
+// nothing, so it can never *drive*; keeping a required element first
+// guarantees a driver always exists, which is why the all-optional and
+// optional-first corners simply don't arise here. (Standalone
+// `Query<Option<&T>>` is handled by the hand-written impl above, which
+// drives the live-entity snapshot.)
+//
+// `impl_all_tuple_opt!` emits ONLY shapes with at least one optional —
+// the pure-`R`/`W` combinations are already covered by `impl_all_tuple!`,
+// so re-emitting them would collide. Arities 2–3 only: arity 2 adds 4
+// impls, arity 3 adds 24.
+
+/// Emits `impl_one_combo_opt!(@readonly …)` iff every flag in the scanned
+/// list is read-only (`R` or `O`); a `W`/`OW` aborts emission. `macro_rules`
+/// can't test "is any flag a write?" inside a repetition, so this walks the
+/// flag/type list as a tt-muncher, carrying the full combo to replay at the
+/// base case.
+macro_rules! emit_readonly {
+    (@scan [] -> [$($combo:tt)+]) => {
+        impl_one_combo_opt!(@readonly $($combo)+);
+    };
+    (@scan [W $T:ident, $($rest:tt)*] -> [$($combo:tt)+]) => {};
+    (@scan [OW $T:ident, $($rest:tt)*] -> [$($combo:tt)+]) => {};
+    (@scan [R $T:ident, $($rest:tt)*] -> [$($combo:tt)+]) => {
+        emit_readonly!(@scan [$($rest)*] -> [$($combo)+]);
+    };
+    (@scan [O $T:ident, $($rest:tt)*] -> [$($combo:tt)+]) => {
+        emit_readonly!(@scan [$($rest)*] -> [$($combo)+]);
+    };
+}
+
+macro_rules! impl_one_combo_opt {
+    (@gen $first_flag:ident $First:ident, $($rest_flag:ident $Rest:ident,)+) => {
+        #[allow(unsafe_code)]
+        impl<$First: Component, $($Rest: Component),+>
+            QueryData for (decl_type!($first_flag $First, '_), $(decl_type!($rest_flag $Rest, '_),)+)
+        {
+            type Item<'w>
+                = (item_type!($first_flag $First, 'w), $(item_type!($rest_flag $Rest, 'w),)+)
+            where
+                Self: 'w;
+            type State<'w>
+                = (state_type!($first_flag $First, 'w), $(state_type!($rest_flag $Rest, 'w),)+)
+            where
+                Self: 'w;
+
+            fn init_state<'w>(world: &'w World) -> Self::State<'w>
+            where
+                Self: 'w,
+            {
+                (init_storage!($first_flag $First, world), $(init_storage!($rest_flag $Rest, world),)+)
+            }
+
+            #[allow(non_snake_case)]
+            fn iter<'s, 'w>(
+                state: &'s mut Self::State<'w>,
+            ) -> Box<dyn Iterator<Item = (Entity, Self::Item<'s>)> + 's>
+            where
+                Self: 's,
+                Self: 'w,
+                'w: 's,
+            {
+                let ($First, $($Rest,)+) = state;
+                $(let $Rest = build_non_driver_fetch!($rest_flag, $Rest);)+
+                let driver: Box<dyn Iterator<Item = (Entity, item_type!($first_flag $First, 's))> + 's> =
+                    drive_iter!($first_flag, $First);
+                // `filter_map` (not `map`): a required (`R`/`W`) non-driver
+                // still short-circuits the row via its `?`; an optional
+                // (`O`/`OW`) yields a `None` value and keeps the row.
+                Box::new(counted!(driver).filter_map(move |(entity, item_first)| {
+                    Some((
+                        entity,
+                        (
+                            item_first,
+                            $(fetch_non_driver!($rest_flag, $Rest, entity),)+
+                        ),
+                    ))
+                }))
+            }
+
+            fn collect_access(access: &mut QueryAccess) {
+                access_call!($first_flag $First, access);
+                $(access_call!($rest_flag $Rest, access);)+
+            }
+
+            // `unused_variables`: `cand_len!` ignores its binding for
+            // optional positions, so an `O`/`OW` element's name is unused.
+            #[allow(non_snake_case, unused_variables)]
+            fn min_data_candidate<'w>(state: &Self::State<'w>) -> Option<(usize, usize)>
+            where
+                Self: 'w,
+            {
+                let ($First, $($Rest,)+) = state;
+                // Optionals report `None` (they narrow nothing); required
+                // elements compete on population, earliest wins ties (strict
+                // `<` in `reduce`). The first element is always required, so
+                // this never returns `None` for a tuple.
+                [cand_len!($first_flag, $First), $(cand_len!($rest_flag, $Rest),)+]
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(i, c)| c.map(|p| (i, p)))
+                    .reduce(|best, cur| if cur.1 < best.1 { cur } else { best })
+            }
+
+            #[allow(non_snake_case)]
+            fn drive<'s, 'w>(
+                state: &'s mut Self::State<'w>,
+                driver: DriveSource<'s>,
+            ) -> Box<dyn Iterator<Item = (Entity, Self::Item<'s>)> + 's>
+            where
+                Self: 's,
+                Self: 'w,
+                'w: 's,
+            {
+                if let DriveSource::Data(0) = driver {
+                    return Self::iter(state);
+                }
+                let ($First, $($Rest,)+) = state;
+                let $First = build_elem!($first_flag, $First);
+                $(let $Rest = build_elem!($rest_flag, $Rest);)+
+                // Optionals contribute an empty slice here; they are never the
+                // chosen `Data(k)` (their `cand_len!` is `None`).
+                let slices = [$First.0, $($Rest.0,)+];
+                let di: DriverIter<'s> = match driver {
+                    DriveSource::Data(k) => DriverIter::new(slices[k]),
+                    DriveSource::External(di) => di,
+                };
+                Box::new(counted!(di).filter_map(move |entity| {
+                    Some((
+                        entity,
+                        (
+                            fetch_non_driver!($first_flag, $First.1, entity),
+                            $(fetch_non_driver!($rest_flag, $Rest.1, entity),)+
+                        ),
+                    ))
+                }))
+            }
+        }
+    };
+
+    (@readonly $first_flag:ident $First:ident, $($rest_flag:ident $Rest:ident,)+) => {
+        impl<$First: Component, $($Rest: Component),+>
+            ReadOnlyQueryData for (decl_type!($first_flag $First, '_), $(decl_type!($rest_flag $Rest, '_),)+)
+        {
+            #[allow(non_snake_case)]
+            fn iter_ref<'s, 'w>(
+                state: &'s Self::State<'w>,
+            ) -> Box<dyn Iterator<Item = (Entity, Self::Item<'s>)> + 's>
+            where
+                Self: 's,
+                Self: 'w,
+                'w: 's,
+            {
+                let ($First, $($Rest,)+) = state;
+                // The first element is `R` in any read-only shape (the
+                // Cartesian forbids `O` first, and this arm fires only with no
+                // `W`/`OW`), so it drives off its own storage.
+                let driver: Box<dyn Iterator<Item = (Entity, &'s $First)> + 's> = match $First {
+                    Some(s) => Box::new(s.iter()),
+                    None => Box::new(std::iter::empty()),
+                };
+                Box::new(counted!(driver).filter_map(move |(entity, item_first)| {
+                    Some((
+                        entity,
+                        (
+                            item_first,
+                            $(fetch_ro!($rest_flag, $Rest, entity),)+
+                        ),
+                    ))
+                }))
+            }
+
+            #[allow(non_snake_case)]
+            fn lookup<'s, 'w>(
+                state: &'s Self::State<'w>,
+                entity: Entity,
+            ) -> Option<Self::Item<'s>>
+            where
+                Self: 's,
+                Self: 'w,
+                'w: 's,
+            {
+                let ($First, $($Rest,)+) = state;
+                Some((
+                    fetch_ro!($first_flag, $First, entity),
+                    $(fetch_ro!($rest_flag, $Rest, entity),)+
+                ))
+            }
+
+            // `unused_variables`: `slice_ro!` ignores its binding for optional
+            // positions (it yields `&[][..]`), so an `O` element's name is
+            // unused in the `slices` array below.
+            #[allow(non_snake_case, unused_variables)]
+            fn drive_ref<'s, 'w>(
+                state: &'s Self::State<'w>,
+                driver: DriveSource<'s>,
+            ) -> Box<dyn Iterator<Item = (Entity, Self::Item<'s>)> + 's>
+            where
+                Self: 's,
+                Self: 'w,
+                'w: 's,
+            {
+                if let DriveSource::Data(0) = driver {
+                    return Self::iter_ref(state);
+                }
+                let di: DriverIter<'s> = match driver {
+                    DriveSource::Data(k) => {
+                        let ($First, $($Rest,)+) = state;
+                        // Optionals contribute an empty slice (`slice_ro!`); they
+                        // never win `min_data_candidate`, so `k` is always a
+                        // required index here.
+                        let slices = [slice_ro!($first_flag, $First), $(slice_ro!($rest_flag, $Rest),)+];
+                        DriverIter::new(slices[k])
+                    }
+                    DriveSource::External(di) => di,
+                };
+                Box::new(counted!(di).filter_map(move |entity| {
+                    Self::lookup(state, entity).map(|item| (entity, item))
+                }))
+            }
+        }
+    };
+
+    // Entry: emit QueryData always; emit ReadOnlyQueryData iff every flag
+    // is read-only (the `emit_readonly!` scan decides).
+    ($first_flag:ident $First:ident, $($rest_flag:ident $Rest:ident,)+) => {
+        impl_one_combo_opt!(@gen $first_flag $First, $($rest_flag $Rest,)+);
+        emit_readonly!(
+            @scan [$first_flag $First, $($rest_flag $Rest,)+]
+            -> [$first_flag $First, $($rest_flag $Rest,)+]
+        );
+    };
+}
+
+// ---- impl_all_tuple_opt_cartesian: first {R,W}, rest {R,W,O,OW} -------
+//
+// Like impl_all_tuple_cartesian! but the first slot is restricted to the
+// required flags and the rest admit the optional flags. The `y`/`n`
+// sentinel tracks whether any optional has been chosen so the base case
+// can skip pure-`R`/`W` combinations (already covered by impl_all_tuple!).
+macro_rules! impl_all_tuple_opt_cartesian {
+    // ≥1 optional → emit; pure R/W → skip (impl_all_tuple! owns it).
+    (@done y [$($acc:tt)*]) => { impl_one_combo_opt!($($acc)*); };
+    (@done n [$($acc:tt)*]) => {};
+    // First slot: required only.
+    (@first $Head:ident, $($Tail:ident,)*) => {
+        impl_all_tuple_opt_cartesian!(@rest n [R $Head,] $($Tail,)*);
+        impl_all_tuple_opt_cartesian!(@rest n [W $Head,] $($Tail,)*);
+    };
+    // Trailing slot: R/W keep the sentinel, O/OW flip it to `y`.
+    (@rest $opt:tt [$($acc:tt)*] $Head:ident, $($Tail:ident,)*) => {
+        impl_all_tuple_opt_cartesian!(@rest $opt [$($acc)* R $Head,] $($Tail,)*);
+        impl_all_tuple_opt_cartesian!(@rest $opt [$($acc)* W $Head,] $($Tail,)*);
+        impl_all_tuple_opt_cartesian!(@rest y [$($acc)* O $Head,] $($Tail,)*);
+        impl_all_tuple_opt_cartesian!(@rest y [$($acc)* OW $Head,] $($Tail,)*);
+    };
+    // Trailing slots exhausted.
+    (@rest $opt:tt [$($acc:tt)*]) => {
+        impl_all_tuple_opt_cartesian!(@done $opt [$($acc)*]);
+    };
+}
+
+/// Emits every optional-bearing `QueryData` impl (and `ReadOnlyQueryData`
+/// for the all-read shapes) for a tuple of the given type parameters: the
+/// first element required (`&T`/`&mut T`), the rest any of
+/// `&T`/`&mut T`/`Option<&T>`/`Option<&mut T>`, restricted to combinations
+/// with at least one optional.
+macro_rules! impl_all_tuple_opt {
+    ($A:ident, $($B:ident),+) => {
+        impl_all_tuple_opt_cartesian!(@first $A, $($B,)+);
+    };
+}
+
+impl_all_tuple_opt!(A, B);
+impl_all_tuple_opt!(A, B, C);
 
 // ---- Entity-prefixed tuples: Query<(Entity, &A, …)> ------------------
 //
@@ -2583,6 +3366,415 @@ mod tests {
         access.assert_no_self_conflict();
     }
 
+    // -------- Optional fetch: Option<&T> / Option<&mut T> (issue #70) -----
+
+    /// A join with an optional second element keeps every row the required
+    /// element drives — present rows carry `Some`, absent rows carry `None`.
+    #[test]
+    fn query_optional_ref_yields_some_when_present_none_when_absent() {
+        let mut world = World::new();
+        let both = world
+            .spawn()
+            .insert(Position(1, 0))
+            .insert(Velocity(2, 0))
+            .id();
+        let lonely = world.spawn().insert(Position(3, 0)).id(); // no Velocity
+
+        let q = Query::<(&Position, Option<&Velocity>)>::from_world(&world);
+        let rows: Vec<(i32, Option<i32>)> = q.iter().map(|(p, v)| (p.0, v.map(|v| v.0))).collect();
+
+        assert_eq!(rows.len(), 2); // both rows kept — Option never gates
+        assert!(rows.contains(&(1, Some(2)))); // `both` carries Velocity
+        assert!(rows.contains(&(3, None))); // `lonely` is still yielded
+        let _ = (both, lonely);
+    }
+
+    /// Standing alone, `Query<Option<&T>>` visits every live entity, with
+    /// or without `T` — the same no-candidate / live-set path as
+    /// `Query<Entity>`.
+    #[test]
+    fn query_optional_standalone_visits_every_live_entity() {
+        let mut world = World::new();
+        world.spawn().insert(Velocity(2, 0));
+        world.spawn().insert(Position(1, 0)); // no Velocity
+        world.spawn(); // no components at all
+
+        let q = Query::<Option<&Velocity>>::from_world(&world);
+        assert_eq!(q.iter().count(), 3); // every live entity, with or without Velocity
+        assert_eq!(q.iter().flatten().count(), 1); // exactly one carries Velocity
+    }
+
+    /// Standalone mutable mirror: `Query<Option<&mut T>>` visits every live
+    /// entity (snapshot-driven) and writes through the present ones — a
+    /// distinct branch from the tuple-trailing `Option<&mut T>` cases.
+    #[test]
+    fn query_optional_standalone_mut_visits_all_and_writes_through() {
+        let mut world = World::new();
+        let has_v = world.spawn().insert(Velocity(5, 0)).id();
+        world.spawn().insert(Position(1, 0)); // no Velocity
+        world.spawn(); // no components
+
+        {
+            let mut q = Query::<Option<&mut Velocity>>::from_world(&world);
+            assert_eq!(q.iter_mut().count(), 3); // every live entity
+            for mut vel in q.iter_mut().flatten() {
+                vel.0 = 99; // write-through on the present one only
+            }
+        }
+        assert_eq!(world.get::<Velocity>(has_v).unwrap().0, 99);
+    }
+
+    /// `Option<&mut T>` writes through on entities that have `T`, and leaves
+    /// the rest untouched while still yielding them.
+    #[test]
+    fn query_optional_mut_writes_through_present_only() {
+        let mut world = World::new();
+        let poisoned = world
+            .spawn()
+            .insert(Position(100, 0))
+            .insert(Velocity(5, 0))
+            .id();
+        let clean = world.spawn().insert(Position(50, 0)).id(); // no Velocity
+
+        let mut yielded = 0;
+        {
+            let mut q = Query::<(&mut Position, Option<&mut Velocity>)>::from_world(&world);
+            for (mut pos, vel) in q.iter_mut() {
+                yielded += 1;
+                if let Some(mut v) = vel {
+                    pos.0 -= v.0; // apply…
+                    v.0 = 0; // …and consume
+                }
+            }
+        }
+        assert_eq!(yielded, 2); // both rows visited
+        assert_eq!(world.get::<Position>(poisoned).unwrap().0, 95); // 100 - 5
+        assert_eq!(world.get::<Velocity>(poisoned).unwrap().0, 0); // consumed
+        assert_eq!(world.get::<Position>(clean).unwrap().0, 50); // untouched
+    }
+
+    /// `Option<&T>` is read-only, so an all-read optional shape implements
+    /// `ReadOnlyQueryData` and `.iter()` is available.
+    #[test]
+    fn query_optional_read_shape_is_read_only() {
+        fn assert_read_only<D: ReadOnlyQueryData>() {}
+        assert_read_only::<(&Position, Option<&Velocity>)>();
+        assert_read_only::<Option<&Position>>();
+    }
+
+    /// The optional reports its access, so `(&A, Option<&mut A>)` trips the
+    /// per-query self-conflict check — a write+read conflict on `Position`,
+    /// caught at construction before any storage is borrowed. (Issue #70 pins
+    /// `(Option<&mut A>, &A)`; optional-first doesn't compile under the
+    /// required-first rule, so this is the equivalent reachable shape.)
+    #[test]
+    #[should_panic(expected = "conflicting access to component")]
+    fn query_optional_mut_self_conflict_panics() {
+        let mut world = World::new();
+        world.spawn().insert(Position(0, 0));
+        let _q = Query::<(&Position, Option<&mut Position>)>::from_world(&world);
+    }
+
+    /// Driver and trailing optional both *write* the same component
+    /// (`(&mut A, Option<&mut A>)`) — the write+write branch of the conflict
+    /// check, distinct from the write+read case above; both reach it through
+    /// the `O`/`OW` arms of `access_call!`.
+    #[test]
+    #[should_panic(expected = "conflicting access to component")]
+    fn query_optional_mut_driver_and_opt_both_write_same_type_panics() {
+        let mut world = World::new();
+        world.spawn().insert(Position(0, 0));
+        let _q = Query::<(&mut Position, Option<&mut Position>)>::from_world(&world);
+    }
+
+    /// Arity-3 with a trailing optional: the required intersection drives,
+    /// the optional rides along as `Some`/`None`.
+    #[test]
+    fn query_optional_arity_three_required_intersection_plus_optional() {
+        let mut world = World::new();
+        // Has Position + Velocity + Marker.
+        world
+            .spawn()
+            .insert(Position(1, 0))
+            .insert(Velocity(1, 0))
+            .insert(Marker);
+        // Has Position + Velocity, no Marker.
+        world.spawn().insert(Position(2, 0)).insert(Velocity(2, 0));
+        // Has only Position — excluded (Velocity is required).
+        world.spawn().insert(Position(3, 0));
+
+        let q = Query::<(&Position, &Velocity, Option<&Marker>)>::from_world(&world);
+        let rows: Vec<(i32, bool)> = q.iter().map(|(p, _v, m)| (p.0, m.is_some())).collect();
+
+        assert_eq!(rows.len(), 2); // only the Position∩Velocity intersection
+        assert!(rows.contains(&(1, true))); // Marker present
+        assert!(rows.contains(&(2, false))); // Marker absent — still yielded
+        assert!(!rows.iter().any(|(x, _)| *x == 3)); // no Velocity → excluded
+    }
+
+    /// The optional's *storage* never existing (no entity ever had it) is a
+    /// distinct branch from "this entity lacks it": `init_state` returns
+    /// `None`, so every lookup yields `None` — without panicking.
+    #[test]
+    fn query_optional_ref_absent_storage_yields_all_none() {
+        let mut world = World::new();
+        world.spawn().insert(Position(1, 0));
+        world.spawn().insert(Position(2, 0));
+        // Velocity storage was never created.
+        let q = Query::<(&Position, Option<&Velocity>)>::from_world(&world);
+        let rows: Vec<(i32, bool)> = q.iter().map(|(p, v)| (p.0, v.is_some())).collect();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|(_, has_v)| !has_v)); // None for every row
+    }
+
+    /// Same absent-storage branch for the mutable optional (`view` is `None`).
+    #[test]
+    fn query_optional_mut_absent_storage_yields_all_none() {
+        let mut world = World::new();
+        world.spawn().insert(Position(10, 0));
+        // Velocity storage was never created.
+        let mut q = Query::<(&mut Position, Option<&mut Velocity>)>::from_world(&world);
+        let mut count = 0;
+        for (pos, vel) in q.iter_mut() {
+            assert_eq!(pos.0, 10); // the required driver still yields its value
+            assert!(vel.is_none());
+            count += 1;
+        }
+        assert_eq!(count, 1);
+    }
+
+    /// Standalone `Query<Option<&T>>` on an empty world drives an empty
+    /// snapshot — zero rows, no panic.
+    #[test]
+    fn query_optional_standalone_on_empty_world_yields_nothing() {
+        let world = World::new();
+        let q = Query::<Option<&Velocity>>::from_world(&world);
+        assert_eq!(q.iter().count(), 0);
+    }
+
+    /// An optional composes with a filter: the filter narrows the set, the
+    /// optional rides along on whatever survives.
+    #[test]
+    fn query_optional_with_filter_narrows_by_filter_optional_rides_along() {
+        let mut world = World::new();
+        // Marker + Velocity → kept, Velocity Some.
+        world
+            .spawn()
+            .insert(Position(1, 0))
+            .insert(Velocity(10, 0))
+            .insert(Marker);
+        // Marker, no Velocity → kept, Velocity None.
+        world.spawn().insert(Position(2, 0)).insert(Marker);
+        // Velocity but no Marker → excluded by the filter.
+        world.spawn().insert(Position(3, 0)).insert(Velocity(30, 0));
+
+        let q = Query::<(&Position, Option<&Velocity>), With<Marker>>::from_world(&world);
+        let rows: Vec<(i32, Option<i32>)> = q.iter().map(|(p, v)| (p.0, v.map(|v| v.0))).collect();
+
+        assert_eq!(rows.len(), 2); // only the two Marker-holders
+        assert!(rows.contains(&(1, Some(10))));
+        assert!(rows.contains(&(2, None)));
+        assert!(!rows.iter().any(|(x, _)| *x == 3)); // no Marker → excluded
+    }
+
+    /// `Without` offers no candidate, so the data element drives (Data(0)) and
+    /// the filter narrows per entity via `matches` — distinct from the `With`
+    /// case where the filter can drive. The optional still rides along.
+    #[test]
+    fn query_optional_without_filter_data_drives_optional_rides() {
+        let mut world = World::new();
+        // No Marker → kept; Velocity Some.
+        world.spawn().insert(Position(1, 0)).insert(Velocity(10, 0));
+        // No Marker, no Velocity → kept; Velocity None.
+        world.spawn().insert(Position(2, 0));
+        // Has Marker → excluded by Without<Marker>.
+        world
+            .spawn()
+            .insert(Position(3, 0))
+            .insert(Velocity(30, 0))
+            .insert(Marker);
+
+        let q = Query::<(&Position, Option<&Velocity>), Without<Marker>>::from_world(&world);
+        let rows: Vec<(i32, Option<i32>)> = q.iter().map(|(p, v)| (p.0, v.map(|v| v.0))).collect();
+
+        assert_eq!(rows.len(), 2); // the two Marker-free entities
+        assert!(rows.contains(&(1, Some(10))));
+        assert!(rows.contains(&(2, None)));
+        assert!(!rows.iter().any(|(x, _)| *x == 3)); // has Marker → excluded
+    }
+
+    /// An `Or` filter that wins driver selection feeds entities through the
+    /// `DriveSource::External` path. This pins that the optional resolves to
+    /// the correct `Some`/`None` *value* under external drive — the existing
+    /// driver-cost test only counts steps, not values.
+    #[test]
+    fn query_optional_or_filter_external_drive_resolves_values() {
+        let mut world = World::new();
+        // Matches via the Velocity arm only → Marker None.
+        world.spawn().insert(Position(1, 0)).insert(Velocity(1, 0));
+        // Matches via the Marker arm only → Marker Some.
+        world.spawn().insert(Position(2, 0)).insert(Marker);
+        // Matches both arms → Marker Some, visited once.
+        world
+            .spawn()
+            .insert(Position(3, 0))
+            .insert(Velocity(3, 0))
+            .insert(Marker);
+        // Matches neither → excluded.
+        world.spawn().insert(Position(4, 0));
+
+        let q =
+            Query::<(&Position, Option<&Marker>), Or<(With<Velocity>, With<Marker>)>>::from_world(
+                &world,
+            );
+        let rows: Vec<(i32, bool)> = q.iter().map(|(p, m)| (p.0, m.is_some())).collect();
+
+        assert_eq!(rows.len(), 3); // the Or union, deduplicated
+        assert!(rows.contains(&(1, false))); // Velocity arm — Marker absent
+        assert!(rows.contains(&(2, true))); // Marker arm — Marker present
+        assert!(rows.contains(&(3, true))); // both arms — present, once
+        assert!(!rows.iter().any(|(x, _)| *x == 4));
+    }
+
+    /// Mut driver + read optional (`(&mut A, Option<&B>)`) — a different macro
+    /// path from `(&mut A, Option<&mut B>)`. The driver writes through; the
+    /// optional read rides along.
+    #[test]
+    fn query_optional_read_with_mut_driver_writes_through() {
+        let mut world = World::new();
+        let mover = world
+            .spawn()
+            .insert(Position(5, 0))
+            .insert(Velocity(3, 0))
+            .id();
+        let still = world.spawn().insert(Position(9, 0)).id(); // no Velocity
+
+        {
+            let mut q = Query::<(&mut Position, Option<&Velocity>)>::from_world(&world);
+            for (mut pos, vel) in q.iter_mut() {
+                if let Some(v) = vel {
+                    pos.0 += v.0;
+                }
+            }
+        }
+        assert_eq!(world.get::<Position>(mover).unwrap().0, 8); // 5 + 3
+        assert_eq!(world.get::<Position>(still).unwrap().0, 9); // untouched
+    }
+
+    /// Arity-3 with TWO trailing optionals — both `O` positions exercised
+    /// together; the required first element drives all rows.
+    #[test]
+    fn query_optional_arity_three_two_trailing_optionals() {
+        let mut world = World::new();
+        world
+            .spawn()
+            .insert(Position(1, 0))
+            .insert(Velocity(10, 0))
+            .insert(Marker); // both Some
+        world.spawn().insert(Position(2, 0)).insert(Velocity(20, 0)); // Velocity Some, Marker None
+        world.spawn().insert(Position(3, 0)); // both None
+
+        let q = Query::<(&Position, Option<&Velocity>, Option<&Marker>)>::from_world(&world);
+        let rows: Vec<(i32, Option<i32>, bool)> = q
+            .iter()
+            .map(|(p, v, m)| (p.0, v.map(|v| v.0), m.is_some()))
+            .collect();
+
+        assert_eq!(rows.len(), 3); // all three — Position is the required driver
+        assert!(rows.contains(&(1, Some(10), true)));
+        assert!(rows.contains(&(2, Some(20), false)));
+        assert!(rows.contains(&(3, None, false)));
+    }
+
+    /// Writing through `Option<&mut T>` marks the component changed (via the
+    /// same `Mut` guard as `&mut T`); a present-but-unwritten row does not.
+    #[test]
+    fn query_optional_mut_marks_changed_only_when_written() {
+        let mut world = World::new();
+        let written = world
+            .spawn()
+            .insert(Position(1, 0))
+            .insert(Velocity(5, 0))
+            .id();
+        let untouched = world
+            .spawn()
+            .insert(Position(2, 0))
+            .insert(Velocity(7, 0))
+            .id();
+        // Advance Velocity's clock past both inserts (a third Velocity bumps
+        // it), so a write later stamps a STRICTLY higher tick. Without this the
+        // write would land on the same tick as the last insert and the
+        // assertion below would pass only by coincidence of insertion order.
+        world.spawn().insert(Velocity(0, 0));
+        // Capture the pre-write marks (after the bump).
+        let before_written = world
+            .storage::<Velocity>()
+            .unwrap()
+            .changed_tick_for(written);
+        let before_untouched = world
+            .storage::<Velocity>()
+            .unwrap()
+            .changed_tick_for(untouched);
+
+        {
+            let mut q = Query::<(&Position, Option<&mut Velocity>)>::from_world(&world);
+            for (pos, vel) in q.iter_mut() {
+                if pos.0 == 1
+                    && let Some(mut v) = vel
+                {
+                    v.0 = 99; // DerefMut → marks Velocity changed for `written`
+                }
+                // `untouched`'s Velocity is Some but never written through.
+            }
+        }
+        let velo = world.storage::<Velocity>().unwrap();
+        assert!(velo.changed_tick_for(written) > before_written); // marked
+        assert_eq!(velo.changed_tick_for(untouched), before_untouched); // untouched
+    }
+
+    /// Arity-3 with TWO trailing *mutable* optionals — exercises the
+    /// `build_elem!(OW, …)` + `fetch_non_driver!(OW, …)` `DenseMut` lookup for
+    /// two optional positions at once, with write-through on the present one.
+    #[test]
+    fn query_optional_arity_three_two_trailing_mut_optionals() {
+        let mut world = World::new();
+        let both = world
+            .spawn()
+            .insert(Position(1, 0))
+            .insert(Velocity(10, 0))
+            .insert(Marker)
+            .id();
+        let vel_only = world
+            .spawn()
+            .insert(Position(2, 0))
+            .insert(Velocity(20, 0))
+            .id();
+        let neither = world.spawn().insert(Position(3, 0)).id();
+
+        let mut markers_seen = 0;
+        {
+            let mut q =
+                Query::<(&mut Position, Option<&mut Velocity>, Option<&mut Marker>)>::from_world(
+                    &world,
+                );
+            for (mut pos, vel, marker) in q.iter_mut() {
+                pos.0 += 100; // required driver writes through
+                if marker.is_some() {
+                    markers_seen += 1;
+                }
+                if let Some(mut v) = vel {
+                    v.0 += 1; // OW write-through
+                }
+            }
+        }
+        assert_eq!(markers_seen, 1); // only `both` has a Marker
+        assert_eq!(world.get::<Position>(both).unwrap().0, 101); // driver wrote all 3
+        assert_eq!(world.get::<Position>(vel_only).unwrap().0, 102);
+        assert_eq!(world.get::<Position>(neither).unwrap().0, 103);
+        assert_eq!(world.get::<Velocity>(both).unwrap().0, 11); // OW wrote the present ones
+        assert_eq!(world.get::<Velocity>(vel_only).unwrap().0, 21);
+    }
+
     // -------- Wider multi-mut + mut-not-first (the unified macro) --------
 
     #[test]
@@ -3688,6 +4880,78 @@ mod driver_cost_tests {
             assert_eq!(q.iter().count(), SMALL);
         });
         assert_eq!(n, SMALL);
+    }
+
+    #[test]
+    fn optional_element_offers_no_candidate_and_never_drives() {
+        let w = world();
+        // `Small` (50) is the smaller storage, but as `Option<&Small>` it
+        // narrows nothing — it must NOT drive, or the 9_950 `Big`-only
+        // entities would be wrongly dropped. `Big` drives all 10_000 rows.
+        let n = steps(|| {
+            let q = Query::<(&Big, Option<&Small>)>::from_world(&w);
+            assert_eq!(q.iter().count(), BIG); // every Big entity, not just 50
+        });
+        assert_eq!(n, BIG); // drives Big, never the optional Small
+    }
+
+    #[test]
+    fn required_drives_with_optional_riding_along() {
+        let w = world();
+        // `Small` required drives (50); the huge `Big` rides as `Option`.
+        let n = steps(|| {
+            let q = Query::<(&Small, Option<&Big>)>::from_world(&w);
+            assert_eq!(q.iter().count(), SMALL);
+        });
+        assert_eq!(n, SMALL); // not BIG, not LIVE
+    }
+
+    #[test]
+    fn optional_at_arity_three_never_drives_smallest_required_does() {
+        let w = world();
+        // `Small` (50) is the smallest *required* element and drives even from
+        // the second position; `Option<&One>` offers no candidate. Cost is 50,
+        // not BIG, not LIVE — and this exercises the `drive_ref(Data(k>0))`
+        // slice path with an optional sitting in the slices array.
+        let n = steps(|| {
+            let q = Query::<(&Big, &Small, Option<&One>)>::from_world(&w);
+            assert_eq!(q.iter().count(), SMALL);
+        });
+        assert_eq!(n, SMALL);
+    }
+
+    #[test]
+    fn non_first_driver_resolves_optional_values_correctly() {
+        // Value-correctness companion to the step-count test above: when a
+        // non-first required element drives (`Small` at index 1), the optional
+        // at index 2 must still resolve per the driven entities.
+        let mut w = world();
+        // One entity carries Big + Small + One, so its optional yields `Some`.
+        w.spawn().insert(Big).insert(Small).insert(One);
+        let q = Query::<(&Big, &Small, Option<&One>)>::from_world(&w);
+        let (mut some, mut none) = (0usize, 0usize);
+        for (_b, _s, one) in q.iter() {
+            if one.is_some() {
+                some += 1;
+            } else {
+                none += 1;
+            }
+        }
+        assert_eq!(some, 1); // exactly the entity we just added
+        assert_eq!(none, SMALL); // the original 50 Small-holders lack One
+    }
+
+    #[test]
+    fn filter_drives_optional_bearing_data_shape() {
+        let w = world();
+        // `With<Small>` (50) beats the `&Big` data candidate (10_000), so the
+        // FILTER drives even though the data shape carries an optional. The
+        // `Option<&One>` rides along (always `None` here) and never gates.
+        let n = steps(|| {
+            let q = Query::<(&Big, Option<&One>), With<Small>>::from_world(&w);
+            assert_eq!(q.iter().count(), SMALL);
+        });
+        assert_eq!(n, SMALL); // filter-driven, not the 10_000 Big data set
     }
 
     #[test]

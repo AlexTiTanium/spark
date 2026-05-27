@@ -25,9 +25,9 @@ other engine crate (including `spark-core`) sits on top.
 > of 2-/3-/4-/5-tuples (including multi-mut at any arity, e.g.
 > `(&mut A, &mut B, &mut C)`), the filter generic `Query<D, F>`
 > (`With` / `Without` / `And` / `Or` / `Changed<T>` / `Added<T>`), and
-> **entity-as-data** — `Query<Entity>` and `Query<(Entity, &A, …)>`; the remaining
-> spec-frozen extension (`Option<&T>`) is marked inline as ⏳
-> in the *What's next* section. The forward-looking
+> **entity-as-data** — `Query<Entity>` and `Query<(Entity, &A, …)>` — and
+> **optional fetch** — `Option<&T>` / `Option<&mut T>`, standalone or as a
+> trailing element of a required-first 2-/3-tuple. The forward-looking
 > design is settled — see [`docs/ECS_DESIGN.md`](../../docs/ECS_DESIGN.md)
 > for the full engineering reference and [`docs/PLAN.md`](../../docs/PLAN.md)
 > for the milestone plan.
@@ -914,7 +914,7 @@ Three parameter types ship today:
 |-|-|
 | `Res<T>` | Immutable borrow of resource `T`. Derefs to `&T`. |
 | `ResMut<T>` | Mutable borrow of resource `T`. Derefs to `&mut T`. |
-| `Query<D, F>` | Walks every entity matching the data shape `D` (a single `&T`/`&mut T` or a tuple of those), optionally narrowed by a filter `F` (`With`/`Without`/`And`/`Or`; defaults to no filter). See *Walking entities with `Query<D>`* below. |
+| `Query<D, F>` | Walks every entity matching the data shape `D` (a single `&T`/`&mut T`, a standalone `Option<&T>`/`Option<&mut T>`, or a required-first tuple whose trailing elements may be `Option<&T>`/`Option<&mut T>`), optionally narrowed by a filter `F` (`With`/`Without`/`And`/`Or`; defaults to no filter). See *Walking entities with `Query<D>`* below. |
 
 The wrapper supports arities 0..=4. Adding a fifth would mean adding
 one more line to the `impl_into_system!` macro list.
@@ -1073,9 +1073,8 @@ as arity 2). Tuples do
 not supported shapes — flatten to `Query<(&A, &B, &C)>` instead.
 See *Getting the entity id* just below for `Query<Entity>` /
 `Query<(Entity, &T)>` (shipped), *Narrowing with filters* for
-`With`/`Without`/`And`/`Or`, and *`Query<D, F>`: finding entities* under
-*What's next* for the full data-shape table plus the `Option<&T>` shape
-still coming in a follow-up PR.
+`With`/`Without`/`And`/`Or`, and *Optional components* below for
+`Query<(&A, Option<&B>)>` (also shipped).
 
 **Two-mut join — both elements mutable.** Useful when one component
 needs to be both read and mutated alongside another (e.g. apply drag to
@@ -1289,6 +1288,56 @@ assert_eq!(ids, vec![on]);
 > (rather than holding the allocator borrow across iteration) is what lets
 > one system take `Query<Entity>` **and** `Commands` without a borrow panic.
 
+### Optional components: `Option<&T>`
+
+Sometimes you want a component *if the entity has it*, without excluding
+entities that don't. That's `Option<&T>` (and `Option<&mut T>` to write):
+it fetches `T` when present and yields `None` otherwise, **never removing a
+row from the result**. Contrast a required `&T`, which silently skips any
+entity lacking `T`.
+
+```rust
+use spark_ecs::{Component, Query, World};
+
+#[derive(Component)]
+struct Position { x: f32, y: f32 }
+// Velocity is optional: stationary entities simply don't have one.
+#[derive(Component)]
+struct Velocity { x: f32, y: f32 }
+
+let mut world = World::new();
+world.spawn().insert(Position { x: 0.0, y: 0.0 }).insert(Velocity { x: 1.0, y: 0.0 });
+world.spawn().insert(Position { x: 9.0, y: 0.0 }); // no Velocity — still iterated
+
+let mut q = Query::<(&mut Position, Option<&Velocity>)>::from_world(&world);
+for (mut pos, vel) in q.iter_mut() {
+    if let Some(v) = vel {
+        pos.x += v.x; // movers advance
+        pos.y += v.y;
+    }
+    // entities without Velocity fall through untouched — but are still visited
+}
+```
+
+Two rules make this predictable:
+
+- **An optional never drives.** `Position` (required) drives the loop;
+  `Option<&Velocity>` is looked up per entity. So the cost is
+  `O(|Position|)` regardless of how many entities have `Velocity` — even
+  if `Velocity` is the smaller storage, it can't pull the driver down and
+  drop the `Position`-only rows. (See *Iteration and cost*.)
+- **The first element must be required.** Optionals are only allowed in the
+  *trailing* positions of a 2-/3-tuple (`(&A, Option<&B>)`,
+  `(&A, &B, Option<&C>)`), guaranteeing a driver always exists. Standalone
+  `Query<Option<&T>>` is the one exception — with nothing to drive off, it
+  walks every live entity (like `Query<Entity>`), yielding `Some`/`None`.
+  Writing the optional first (`(Option<&A>, &B)`) is a compile error;
+  put the required element first.
+
+An optional reports its access exactly like the required form, so a query
+that both reads and writes the same component still panics at construction:
+`Query<(&A, Option<&mut A>)>` trips the self-conflict check on `A`.
+
 ### Narrowing with filters: `Query<D, F>`
 
 A second generic narrows *which* entities iterate without changing what
@@ -1417,8 +1466,11 @@ says how to narrow the set.
 > `Query<D, F>` (`With` / `Without` / `And` / `Or` / `Changed<T>` /
 > `Added<T>`) and **entity-as-data** (`Query<Entity>`,
 > `Query<(Entity, &A, …)>` for one-to-three trailing components).
-> `Option<&T>` remains a ⏳ follow-up PR. Each subsection
-> below calls out which bits are runnable now and which are spec-frozen.
+> **Optional fetch** — `Option<&T>` / `Option<&mut T>` — is ✅ shipping
+> too: standalone (`Query<Option<&T>>`) and as a trailing element of a
+> 2-/3-tuple whose first element is required (`Query<(&A, Option<&B>)>`).
+> Each subsection below calls out which bits are runnable now and which
+> are spec-frozen.
 
 ### Data shapes
 
@@ -1445,8 +1497,11 @@ Query<Entity>                               // just the ID — every live entity
 Query<(Entity, &Position)>                  // ID + one component
 Query<(Entity, &mut Position, &Velocity)>   // ID + mixed &/&mut, up to 3 components
 
-// ⏳ coming:
-Query<(&Position, Option<&Velocity>)>       // Velocity may be absent
+// ✅ today — optional fetch (first element required, 2-/3-tuples):
+Query<Option<&Velocity>>                    // every live entity, Some/None
+Query<(&Position, Option<&Velocity>)>       // Velocity may be absent — row still yielded
+Query<(&mut Position, Option<&mut Velocity>)> // optional mutable too
+Query<(&A, &B, Option<&C>)>                 // arity 3, trailing optional
 ```
 
 Iteration shape today is **path B** (Bevy-style): `Query<&T>::iter()`
@@ -1612,8 +1667,9 @@ Or<(F1, F2, …)>    // OR of filters — nests with And
 Changed<T>         // ✅ T written since this system last ran
 Added<T>           // ✅ T first attached since this system last ran
 
-// — OPTIONAL DATA —                  ⏳ optional-fetch PR (added when needed)
-Option<&T>         // fetch T if present, give None otherwise
+// — OPTIONAL DATA —                  ✅ optional-fetch (issue #70)
+Option<&T>         // fetch T if present, give None otherwise; never gates the row
+Option<&mut T>     // mutable variant; trailing element of a required-first tuple
 
 // — ARITY 6+ —                       follow-up (one line per arity)
 // Add `impl_all_tuple!(A, B, C, D, E, F);` in query.rs to unlock all
@@ -1645,7 +1701,8 @@ drives whether `Plant` is written first or second.
 | `Query<Entity, With<B>>` | O(\|B\|) — the filter drives |
 | `Query<&A, Without<B>>` | O(\|A\|) + one sparse lookup per item (`Without` offers no candidate) |
 | `Query<&A, And<(With<B>, With<C>)>>` | O(smallest of \|A\|, \|B\|, \|C\|) + one sparse lookup per filter term per item |
-| `Query<(&A, Option<&T>)>` | O(over the rest of the query) — Option doesn't gate (⏳) |
+| `Query<(&A, Option<&T>)>` | O(\|A\|) — the required element drives; `Option` adds one sparse lookup per item but never gates |
+| `Query<Option<&T>>` | O(live entities) — no required element, so it walks the live-set snapshot like `Query<Entity>` |
 
 Filters are essentially free: each filter borrows its storage **once at
 query construction** (in `init_state`, stored for the query's lifetime),
@@ -2349,7 +2406,8 @@ End of frame. Back to Step 1 for frame 43.
 | `Query<Entity>` | Every live entity | `Entity` |
 | `Query<(Entity, &T)>` | Entities with `T`, including ID | `(Entity, &T)` |
 | `Query<(Entity, &A, &B)>` | Entities with `A` and `B`, including ID | `(Entity, &A, &B)` |
-| `Query<(&T, Option<&U>)>` ⏳ | Entities with `T`, `U` if present | `(&T, Option<&U>)` |
+| `Query<(&T, Option<&U>)>` | Entities with `T`, each carrying `U` if present | `(&T, Option<&U>)` |
+| `Query<Option<&T>>` | Every live entity, `T` if present | `Option<&T>` |
 | `Query<&T, With<U>>` | Entities with both `T` and `U`, only fetch `T` | `&T` |
 | `Query<&T, Without<U>>` | Entities with `T` but not `U` | `&T` |
 | `Query<&T, And<(With<U>, Without<V>)>>` | AND of filters | `&T` |
