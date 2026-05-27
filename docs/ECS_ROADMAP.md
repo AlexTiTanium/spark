@@ -30,6 +30,18 @@ expanded into full drafts in the project's `#10–#12` format below.
   membership by derive; no blanket impls.
 - **#31 — Query filters.** `Query<'w, D, F = ()>` + a `QueryFilter`
   trait (`With` / `Without` / `And<(…)>` / `Or<(…)>`); see item 4 below.
+- **#80 — `query.rs` → `query/` submodule refactor.** Split the
+  ~5,400-line `query.rs` into single-concern files (`data` traits +
+  single-component impls, `dense_mut` the one `unsafe fn`, `tuple_codegen`
+  the macro families, `runner` the public `Query`, themed `tests/`). Adds a
+  *variant manifest* fronting the codegen and unifies the plain/entity R/W
+  Cartesian generators into one `cartesian_rw!` (release-profile `cargo
+  expand` byte-identical). Hardens `DenseMut` with a debug once-per-entity
+  tripwire + a crate-scoped Miri CI job (no UB found). One intentional
+  behaviour change: `Changed`/`Added` now use wrapping-correct relative-age
+  detection (the safe window is the full `u32` range — wider than the 2³¹
+  the issue assumed; see the commit). No public-API change
+  (`cargo public-api` clean).
 
 ### To create — in order
 
@@ -450,6 +462,19 @@ This is the generalized **leading-storage `min`** optimisation deferred since
 `World` becomes `Sync`; storages `RefCell → UnsafeCell` under the scheduler's
 proven-disjoint access; `EntityAllocator` thread-safe; per-system
 `CommandQueue` merged at flush; thread-pool executor; `par_iter()`.
+
+**Follow-up to #80 — merge the three query leaf macros into one
+`kind`-parameterised macro. ⚠️ Discuss before opening an implementation
+issue.** #80 unified the *Cartesian drivers* (`cartesian_rw!`) but left the
+three leaf generators (`impl_one_combo!` / `impl_one_combo_opt!` /
+`impl_one_combo_entity!`) distinct on purpose — they are *three algorithms*,
+not three copies: Entity offsets the driver by `+1`
+(`DriveSource::Data(1)`), Option uses `filter_map` + `cand_len!` and a
+first-slot-required `y`/`n` sentinel. The default outcome of a merge is
+**revert**; it would carry the same objective gate as #80 (release-profile
+`cargo expand` byte-identical) and inherits those divergence notes as the
+"why it's hard" context so they aren't relitigated. Not byte-identical
+codegen-PR material, hence deferred out of #80.
 
 ---
 
