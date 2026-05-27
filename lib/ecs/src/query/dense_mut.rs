@@ -40,6 +40,14 @@ pub(crate) struct DenseMut<'s, T> {
     sparse: &'s [Option<u32>],
     entity_index: &'s [Entity],
     _marker: PhantomData<&'s mut [T]>,
+    /// Debug-only once-per-entity tripwire (Phase 3, issue #80): records
+    /// which dense slots [`get`](Self::get) has handed out. A second fetch
+    /// of the same slot — two `&mut T` aliasing one entity, the exact bug
+    /// the `# Safety` contract forbids — trips a `debug_assert!` in every
+    /// `cargo test` instead of becoming silent UB. The field and the check
+    /// are `#[cfg(debug_assertions)]`, so release builds carry neither.
+    #[cfg(debug_assertions)]
+    seen: std::cell::RefCell<Vec<bool>>,
 }
 
 // The whole point of `DenseMut` is to host one carefully-contracted
@@ -74,6 +82,8 @@ impl<'s, T> DenseMut<'s, T> {
             sparse,
             entity_index,
             _marker: PhantomData,
+            #[cfg(debug_assertions)]
+            seen: std::cell::RefCell::new(vec![false; dense.len()]),
         }
     }
 
@@ -97,6 +107,13 @@ impl<'s, T> DenseMut<'s, T> {
     /// borrows below sound: each slot (value + `changed_tick`) is handed
     /// out at most once across `'s`, so no live borrow overlaps.
     ///
+    /// This contract is not merely trusted: the structural leg is a
+    /// *checked* leg. The `#[cfg(debug_assertions)]` `seen`-set tripwire
+    /// below trips in every `cargo test` if a slot is fetched twice, and
+    /// the crate-scoped Miri CI job (`cargo +nightly miri test -p
+    /// spark-ecs`) machine-checks the raw-pointer aliasing under
+    /// Stacked/Tree Borrows.
+    ///
     /// Also assumes `ComponentStorage`'s sparse/dense parallel-array
     /// invariant: every `Some(idx)` in `sparse` points at an in-bounds
     /// `dense` slot, and `changed_tick` is the same length as `dense`.
@@ -118,6 +135,20 @@ impl<'s, T> DenseMut<'s, T> {
         // dense.len() == changed_tick.len() == self.len`.
         if self.entity_index[dense_idx] != entity {
             return None;
+        }
+        // Debug-only "fetched at most once" tripwire: turns the structural
+        // driver-scan leg of the safety contract into a *checked* leg. A
+        // repeat fetch of `dense_idx` (two `&mut T` aliasing one slot) trips
+        // here in every `cargo test`; compiled out entirely in release.
+        #[cfg(debug_assertions)]
+        {
+            let mut seen = self.seen.borrow_mut();
+            debug_assert!(
+                !seen[dense_idx],
+                "DenseMut::get fetched dense slot {dense_idx} twice — the \
+                 'fetched at most once' contract is violated (would alias &mut T)"
+            );
+            seen[dense_idx] = true;
         }
         // SAFETY: bounds for BOTH borrows:
         //   1. The `entity_index[dense_idx]` access above is bounds-checked,

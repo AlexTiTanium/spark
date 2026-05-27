@@ -209,16 +209,26 @@ macro_rules! fetch_non_driver {
         $fetch.as_ref()?.get($entity)?
     };
     (W, $fetch:expr, $entity:expr) => {
-        // SAFETY: driver visits each entity once, conflict check
-        // guarantees disjoint storages. Module-level docs for details.
+        // SAFETY: `DenseMut::get`'s "fetched at most once" contract holds.
+        // Three enforced checks, not reviewer trust: (1) the driver's
+        // linear scan visits each entity once — `DenseMut::get`'s debug
+        // `seen`-set tripwire asserts this in every `cargo test`, and the
+        // Miri CI job machine-checks the aliasing; (2) `QueryAccess::`
+        // `assert_no_self_conflict` at `Query::from_world` rules out the
+        // same component appearing twice, so distinct elements hit distinct
+        // storages; (3) the generation check inside `get` rejects stale
+        // handles. Distinct entity → distinct slot ⇒ no two live `&mut`.
         unsafe { $fetch.as_ref()?.get($entity)? }
     };
     (O, $fetch:expr, $entity:expr) => {
         $fetch.as_ref().and_then(|s| s.get($entity))
     };
     (OW, $fetch:expr, $entity:expr) => {
-        // SAFETY: same contract as the `W` arm — the driver visits each
-        // entity once and the self-conflict check rules out a duplicate.
+        // SAFETY: identical contract to the `W` arm — the driver visits
+        // each entity once (debug tripwire + Miri), `assert_no_self_conflict`
+        // rules out a duplicate component, and `get`'s generation check
+        // rejects stale handles. The only difference is the optional
+        // `and_then`, which fetches at most once per entity just the same.
         unsafe { $fetch.as_ref().and_then(|v| v.get($entity)) }
     };
 }
