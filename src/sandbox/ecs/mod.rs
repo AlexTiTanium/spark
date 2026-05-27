@@ -58,8 +58,11 @@
 //! drives every shape: a non-first tuple element
 //! (`Query<(&Telemetry, &Critical)>`), a filter
 //! (`Query<Entity, With<Critical>>`), an `And` arm, and a deduplicated
-//! `Or` union. Each logs a `verdict` (PASS/FAIL) against the count the
-//! skewed roster implies.
+//! `Or` union. `Without` is the counter-example — it offers no candidate,
+//! so a positive part drives and it rejects per entity, shown plain
+//! (`Query<&Telemetry, Without<Critical>>`) and with `Entity` as data
+//! (`Query<(Entity, &Telemetry), Without<Critical>>`). Each logs a
+//! `verdict` (PASS/FAIL) against the count the skewed roster implies.
 
 mod change_detection;
 mod components;

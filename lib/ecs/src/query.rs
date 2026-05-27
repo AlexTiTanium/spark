@@ -4078,4 +4078,47 @@ mod driver_cost_tests {
         assert_eq!(results, 2); // only the 2 re-inserted Smalls
         assert_eq!(driver_steps, 5); // but the driver walked all 5 Small, never Big's 15
     }
+
+    // ---- `Without` as a per-entity reject within a driven query ----
+
+    #[test]
+    fn without_rejects_within_data_driven_query() {
+        let w = world();
+        // `Without<Small>` offers no candidate, so the positive `&Big`
+        // (10_000) drives and `Without` rejects the 50 Small-holders per
+        // entity. The exclusion shrinks the *result*, not the driver.
+        let n = steps(|| {
+            let q = Query::<&Big, Without<Small>>::from_world(&w);
+            assert_eq!(q.iter().count(), BIG - SMALL);
+        });
+        assert_eq!(n, BIG); // driver is the data element; `Without` can't shrink it
+    }
+
+    #[test]
+    fn entity_prefixed_without_rejects_per_entity() {
+        let w = world();
+        // `Query<(Entity, &Big), Without<Small>>`: `Entity` and `Without`
+        // offer no candidate, so `&Big` drives and the id rides along while
+        // `Without<Small>` rejects per entity.
+        let n = steps(|| {
+            let q = Query::<(Entity, &Big), Without<Small>>::from_world(&w);
+            assert_eq!(q.iter().count(), BIG - SMALL);
+        });
+        assert_eq!(n, BIG);
+    }
+
+    #[test]
+    fn and_changed_with_without_drives_the_changed_arm() {
+        let w = world();
+        // `And<(Changed<Small>, Without<One>)>`: `Changed<Small>` surfaces
+        // Small's 50 entities; `Without<One>` surfaces nothing — so the `And`
+        // drives the change-filter arm (50), never the 10_000-element `&Big`.
+        // No system ran, so baseline 0 makes every Small "changed"; none of
+        // the Small-holders carry `One`, so all 50 survive both arms.
+        let n = steps(|| {
+            let q = Query::<&Big, And<(Changed<Small>, Without<One>)>>::from_world(&w);
+            assert_eq!(q.iter().count(), SMALL);
+        });
+        assert_eq!(n, SMALL); // the Changed arm drives, not the data element
+    }
 }

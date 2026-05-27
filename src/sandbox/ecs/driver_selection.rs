@@ -19,7 +19,7 @@
 //! First-tick gated, runs in `PreUpdate` after the `Startup` seed flushes —
 //! the one-shot pattern from [`super::systems::report_initial`].
 
-use spark_ecs::{And, Commands, Entity, Or, Query, Res, With};
+use spark_ecs::{And, Commands, Entity, Or, Query, Res, With, Without};
 use spark_log::info;
 
 use crate::sandbox::resources::TickCount;
@@ -182,5 +182,61 @@ pub(super) fn or_union_drives(tick: Res<TickCount>, q: Query<&Telemetry, Critica
         expected = 3,
         verdict = verdict(count, 3),
         "sandbox/ecs/driver-selection: Or<(With<Critical>, With<Standby>)> — deduplicated union drives (3)"
+    );
+}
+
+/// **`Without` rejects per entity — a positive part still drives.**
+///
+/// `Without<Critical>` can't enumerate "lacks `Critical`", so it offers **no**
+/// candidate set (a #65 non-goal — there's no smaller list of "everyone
+/// except"). The positive data element `&Telemetry` (8) therefore drives, and
+/// `Without<Critical>` rejects the 2 critical nodes per entity → 6 results.
+/// The exclusion narrows the *result*, not the driver: cost stays ∝ the data
+/// element it's paired with, exactly as for an unfiltered `Query<&Telemetry>`.
+///
+/// **When it matters:** the complement of a tag ("every node *not* flagged
+/// critical"). It rides on whatever positive part drives; with nothing
+/// positive at all (`Query<Entity, Without<Critical>>`) it would fall back to
+/// the live set, which is why this pairs it with `&Telemetry`.
+pub(super) fn without_rejects_per_entity(
+    tick: Res<TickCount>,
+    q: Query<&Telemetry, Without<Critical>>,
+) {
+    if tick.0 != 0 {
+        return;
+    }
+    let count = q.iter().count();
+    info!(
+        count,
+        expected = 6,
+        verdict = verdict(count, 6),
+        "sandbox/ecs/driver-selection: Query<&Telemetry, Without<Critical>> — Telemetry drives, Without rejects (6)"
+    );
+}
+
+/// **Entity-as-data under `Without` — id + a negative filter.**
+///
+/// `Query<(Entity, &Telemetry), Without<Critical>>`: `Entity` and
+/// `Without<Critical>` both offer no candidate, so `&Telemetry` (8) drives,
+/// the id rides along on it, and `Without` rejects the 2 critical nodes →
+/// 6 ids of non-critical nodes. The driver is the data element, never the
+/// live set; the negative filter only trims which of those ids survive.
+///
+/// **When it matters:** you want the *ids* of "everything except the tagged
+/// ones" together with some data — to despawn them, alert on them, etc. —
+/// and you already have a data component to drive off.
+pub(super) fn entity_without(
+    tick: Res<TickCount>,
+    q: Query<(Entity, &Telemetry), Without<Critical>>,
+) {
+    if tick.0 != 0 {
+        return;
+    }
+    let count = q.iter().count();
+    info!(
+        count,
+        expected = 6,
+        verdict = verdict(count, 6),
+        "sandbox/ecs/driver-selection: Query<(Entity, &Telemetry), Without<Critical>> — id + Without, Telemetry drives (6)"
     );
 }

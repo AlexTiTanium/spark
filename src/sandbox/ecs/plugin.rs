@@ -14,8 +14,8 @@ use spark_core::{Application, Plugin, Stage};
 
 use super::change_detection::ChangeDetectionPlugin;
 use super::driver_selection::{
-    and_smallest_arm_drives, filter_drives, or_union_drives, spawn_driver_demo,
-    tuple_non_first_drives,
+    and_smallest_arm_drives, entity_without, filter_drives, or_union_drives, spawn_driver_demo,
+    tuple_non_first_drives, without_rejects_per_entity,
 };
 use super::filters::{
     and_filter, building_ids, bump_powered_capacity, filtered_join, nested_filter, or_filter,
@@ -95,7 +95,11 @@ impl Plugin for EcsSandboxPlugin {
             .add_system(Stage::PreUpdate, tuple_non_first_drives)
             .add_system(Stage::PreUpdate, filter_drives)
             .add_system(Stage::PreUpdate, and_smallest_arm_drives)
-            .add_system(Stage::PreUpdate, or_union_drives);
+            .add_system(Stage::PreUpdate, or_union_drives)
+            // `Without` offers no candidate, so a positive part drives and it
+            // rejects per entity — shown plain and with `Entity` as data.
+            .add_system(Stage::PreUpdate, without_rejects_per_entity)
+            .add_system(Stage::PreUpdate, entity_without);
 
         // ----- Change-detection demo (`Changed<T>` / `Added<T>`) -----
         //
