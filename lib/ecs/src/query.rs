@@ -67,8 +67,10 @@
 //!
 //! # Joins
 //!
-//! Tuple queries drive the first element and look the rest up per
-//! entity. **Every `&` / `&mut` combination** at arities 2–5 is
+//! Tuple queries drive the **smallest** element (by entity count; the
+//! earliest element breaks a tie) and look the rest up per entity — driver
+//! selection is frozen once at [`Query::from_world`] (see *Driver selection*
+//! below and issue #65). **Every `&` / `&mut` combination** at arities 2–5 is
 //! supported: a single [`impl_all_tuple!`] invocation per arity
 //! Cartesian-products the flag positions and emits one `QueryData`
 //! impl for each combination (plus a `ReadOnlyQueryData` impl for the
@@ -110,13 +112,15 @@
 //! (always true), so `Query<D>` is shorthand for `Query<D, ()>`. A
 //! filter narrows *which* entities iterate without touching the yielded
 //! item: `Query<&Position, With<Powered>>` still yields `&Position`,
-//! just for fewer entities. Iteration calls [`QueryFilter::init_state`]
-//! once (fetching the filter's storage borrows + tick baselines), then
-//! wraps the data driver in a `.filter(…)` that calls
-//! [`QueryFilter::matches`] per candidate against that state;
-//! [`Query::from_world`] folds [`QueryFilter::collect_access`] into the
-//! same self-conflict check the data shape runs. See the [`filter`]
-//! module for the filter set and the access-reporting rules.
+//! just for fewer entities. [`Query::from_world`] calls
+//! [`QueryFilter::init_state`] once (fetching the filter's storage borrows +
+//! tick baselines, kept for the query's lifetime) and folds
+//! [`QueryFilter::collect_access`] into the same self-conflict check the
+//! data shape runs; each `iter` then wraps the driver in a `.filter(…)` that
+//! calls [`QueryFilter::matches`] per candidate against that state. A filter
+//! can also *lead* the loop when it holds the smallest candidate — see
+//! *Driver selection*. See the [`filter`] module for the filter set and the
+//! access-reporting rules.
 //!
 //! [`filter`]: crate::filter
 //! [`QueryFilter::matches`]: crate::QueryFilter::matches
@@ -132,6 +136,112 @@ use crate::filter::QueryFilter;
 use crate::storage::{ComponentStorage, Mut};
 use crate::system::SystemParam;
 use crate::world::World;
+
+// -------- Driver selection (issue #65) --------
+
+/// The entity stream a [`Query`] loops over — the *driver* — once driver
+/// selection has picked the smallest candidate set ([`Query::from_world`]).
+///
+/// Always a borrowed slice into a dense entity list, so driving costs nothing
+/// beyond walking it: usually a storage's own list (a data element's or a
+/// filter's), and for an [`Or`](crate::Or) filter a slice into the union
+/// materialized **once** at `from_world` (the [`Query`] owns the `Vec`). The
+/// live-entity-set fallback doesn't go through here — it drives via the data
+/// shape's own `iter`.
+///
+/// You only name this when hand-implementing [`QueryData::drive`]; the shipped
+/// impls construct it for you.
+pub struct DriverIter<'s>(std::slice::Iter<'s, Entity>);
+
+impl<'s> DriverIter<'s> {
+    /// Wraps a dense entity slice as a driver. `Entity` is `Copy`, so yielding
+    /// is a plain copy out of the slice.
+    fn new(entities: &'s [Entity]) -> Self {
+        Self(entities.iter())
+    }
+}
+
+impl Iterator for DriverIter<'_> {
+    type Item = Entity;
+
+    fn next(&mut self) -> Option<Entity> {
+        self.0.next().copied()
+    }
+}
+
+/// How a [`QueryData`] shape should be driven, handed to
+/// [`QueryData::drive`] / [`ReadOnlyQueryData::drive_ref`] once
+/// [`Query::from_world`] has chosen the smallest candidate across the whole
+/// query.
+///
+/// You only name this when hand-implementing [`QueryData`]; the shipped impls
+/// receive it from the [`Query`] dispatch.
+pub enum DriveSource<'s> {
+    /// Drive off the data element at this index (the data shape itself owns
+    /// the smallest candidate). The impl walks that element's entities and
+    /// looks the rest up per entity.
+    Data(usize),
+    /// Drive off an external entity stream — a filter's candidate. Every data
+    /// element is looked up per entity. (The live-set fallback does *not* use
+    /// this — it drives via the data shape's own `iter`; see [`DriverPlan`].)
+    External(DriverIter<'s>),
+}
+
+/// The driver decision frozen at [`Query::from_world`], replayed on every
+/// `iter` / `iter_mut`. Computed once from the data shape's per-element
+/// populations and the filter's candidate population; it never depends on a
+/// per-call lookup.
+#[derive(Clone, Copy)]
+enum DriverPlan {
+    /// No part offers a candidate (`Query<Entity>`, `Query<Entity, Without<T>>`,
+    /// `Query<Entity, ()>`): drive the live-entity snapshot via the data
+    /// shape's own `iter`. The structurally exempt case — a shape naming no
+    /// component has no smaller candidate to drive off, so this is the
+    /// permanent fallback, not a temporary one.
+    LiveSet,
+    /// A data element holds the smallest candidate; drive it (its index).
+    Data(usize),
+    /// The filter holds the smallest candidate; it leads the loop.
+    Filter,
+}
+
+// Counts one driver advance per yielded candidate, for the deterministic
+// cost-contract tests (issue #65). `counted!` wraps each driver iterator; in
+// non-test builds it expands to the iterator unchanged, so there is provably
+// zero per-iteration overhead in release.
+#[cfg(test)]
+thread_local! {
+    static DRIVER_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Records one driver advance. Test-only; see [`take_driver_steps`].
+#[cfg(test)]
+pub(crate) fn record_driver_step() {
+    DRIVER_STEPS.with(|c| c.set(c.get() + 1));
+}
+
+/// Returns the driver-advance count since the last call and resets it to 0.
+/// The cost-contract tests assert this tracks the smallest candidate
+/// population, never the live set.
+#[cfg(test)]
+pub(crate) fn take_driver_steps() -> usize {
+    DRIVER_STEPS.with(|c| c.replace(0))
+}
+
+/// Wraps a driver iterator so each advance is counted in test builds; expands
+/// to the iterator untouched otherwise (zero release overhead).
+#[cfg(test)]
+macro_rules! counted {
+    ($it:expr) => {
+        $it.inspect(|_| $crate::query::record_driver_step())
+    };
+}
+#[cfg(not(test))]
+macro_rules! counted {
+    ($it:expr) => {
+        $it
+    };
+}
 
 /// Type-level description of what a [`Query`] fetches.
 ///
@@ -193,6 +303,44 @@ pub trait QueryData {
     /// any storage is borrowed. The scheduler (roadmap item 3) reuses
     /// the same call to aggregate access at `SystemParam` level.
     fn collect_access(access: &mut QueryAccess);
+
+    /// The smallest *candidate* among this shape's component elements: the
+    /// `(element index, population)` of the data element with the fewest
+    /// entities, ties broken toward the earliest element. `None` when the
+    /// shape names no component ([`Entity`] alone) — it then offers nothing
+    /// to drive off.
+    ///
+    /// Read once at [`Query::from_world`] to pick the query-wide driver
+    /// (issue #65); each population is an O(1) `len()`. The default returns
+    /// `None`, so a shape that does not override it simply never wins driver
+    /// selection and falls back to today's behavior.
+    fn min_data_candidate<'w>(_state: &Self::State<'w>) -> Option<(usize, usize)>
+    where
+        Self: 'w,
+    {
+        None
+    }
+
+    /// Exclusive iteration driven by `driver` — the generalization of
+    /// [`iter`](Self::iter) that lets the *smallest* candidate lead the loop
+    /// instead of always the first element (issue #65).
+    ///
+    /// [`DriveSource::Data(k)`](DriveSource::Data) drives off element `k`'s
+    /// entities; [`DriveSource::External`] drives off a filter's candidate,
+    /// looking every element up per entity. The shipped impls override this;
+    /// the default ignores `driver` and falls back to [`iter`](Self::iter) —
+    /// correct, just unoptimized, so any external impl keeps working.
+    fn drive<'s, 'w>(
+        state: &'s mut Self::State<'w>,
+        _driver: DriveSource<'s>,
+    ) -> Box<dyn Iterator<Item = (Entity, Self::Item<'s>)> + 's>
+    where
+        Self: 's,
+        Self: 'w,
+        'w: 's,
+    {
+        Self::iter(state)
+    }
 }
 
 /// [`QueryData`] that borrows nothing mutably — the marker that gates
@@ -231,6 +379,21 @@ pub trait ReadOnlyQueryData: QueryData {
         Self: 's,
         Self: 'w,
         'w: 's;
+
+    /// Shared mirror of [`QueryData::drive`] for [`Query::iter`]. The shipped
+    /// impls override it; the default ignores `driver` and falls back to
+    /// [`iter_ref`](Self::iter_ref).
+    fn drive_ref<'s, 'w>(
+        state: &'s Self::State<'w>,
+        _driver: DriveSource<'s>,
+    ) -> Box<dyn Iterator<Item = (Entity, Self::Item<'s>)> + 's>
+    where
+        Self: 's,
+        Self: 'w,
+        'w: 's,
+    {
+        Self::iter_ref(state)
+    }
 }
 
 // -------- &T --------
@@ -261,13 +424,44 @@ impl<T: Component> QueryData for &T {
         'w: 's,
     {
         match state {
-            Some(storage) => Box::new(storage.iter()),
+            Some(storage) => Box::new(counted!(storage.iter())),
             None => Box::new(std::iter::empty()),
         }
     }
 
     fn collect_access(access: &mut QueryAccess) {
         access.add_read::<T>();
+    }
+
+    fn min_data_candidate<'w>(state: &Self::State<'w>) -> Option<(usize, usize)>
+    where
+        Self: 'w,
+    {
+        Some((0, state.as_ref().map_or(0, |s| s.len())))
+    }
+
+    fn drive<'s, 'w>(
+        state: &'s mut Self::State<'w>,
+        driver: DriveSource<'s>,
+    ) -> Box<dyn Iterator<Item = (Entity, &'s T)> + 's>
+    where
+        Self: 's,
+        Self: 'w,
+        'w: 's,
+    {
+        match driver {
+            // Single element: the only driver is itself, whatever index the
+            // plan chose — delegate to `iter` (yields the value directly, no
+            // redundant lookup).
+            DriveSource::Data(_) => Self::iter(state),
+            DriveSource::External(di) => match state {
+                Some(storage) => {
+                    let storage = &*storage;
+                    Box::new(counted!(di).filter_map(move |e| storage.get(e).map(|v| (e, v))))
+                }
+                None => Box::new(std::iter::empty()),
+            },
+        }
     }
 }
 
@@ -281,7 +475,7 @@ impl<T: Component> ReadOnlyQueryData for &T {
         'w: 's,
     {
         match state {
-            Some(storage) => Box::new(storage.iter()),
+            Some(storage) => Box::new(counted!(storage.iter())),
             None => Box::new(std::iter::empty()),
         }
     }
@@ -294,10 +488,31 @@ impl<T: Component> ReadOnlyQueryData for &T {
     {
         state.as_ref().and_then(|s| s.get(entity))
     }
+
+    fn drive_ref<'s, 'w>(
+        state: &'s Self::State<'w>,
+        driver: DriveSource<'s>,
+    ) -> Box<dyn Iterator<Item = (Entity, &'s T)> + 's>
+    where
+        Self: 's,
+        Self: 'w,
+        'w: 's,
+    {
+        match driver {
+            DriveSource::Data(_) => Self::iter_ref(state),
+            DriveSource::External(di) => match state {
+                Some(storage) => {
+                    Box::new(counted!(di).filter_map(move |e| storage.get(e).map(|v| (e, v))))
+                }
+                None => Box::new(std::iter::empty()),
+            },
+        }
+    }
 }
 
 // -------- &mut T --------
 
+#[allow(unsafe_code)] // `drive`'s external path looks up `&mut T` via `DenseMut`.
 impl<T: Component> QueryData for &mut T {
     type Item<'w>
         = Mut<'w, T>
@@ -324,13 +539,49 @@ impl<T: Component> QueryData for &mut T {
         'w: 's,
     {
         match state {
-            Some(storage) => Box::new(storage.iter_mut()),
+            Some(storage) => Box::new(counted!(storage.iter_mut())),
             None => Box::new(std::iter::empty()),
         }
     }
 
     fn collect_access(access: &mut QueryAccess) {
         access.add_write::<T>();
+    }
+
+    fn min_data_candidate<'w>(state: &Self::State<'w>) -> Option<(usize, usize)>
+    where
+        Self: 'w,
+    {
+        Some((0, state.as_ref().map_or(0, |s| s.len())))
+    }
+
+    fn drive<'s, 'w>(
+        state: &'s mut Self::State<'w>,
+        driver: DriveSource<'s>,
+    ) -> Box<dyn Iterator<Item = (Entity, Mut<'s, T>)> + 's>
+    where
+        Self: 's,
+        Self: 'w,
+        'w: 's,
+    {
+        match driver {
+            DriveSource::Data(_) => Self::iter(state),
+            DriveSource::External(di) => match state.as_mut() {
+                Some(storage) => {
+                    let (dense, changed, sparse, ents, tick) = storage.split_for_join();
+                    let view = DenseMut::new(dense, changed, sparse, ents, tick);
+                    Box::new(counted!(di).filter_map(move |e| {
+                        // SAFETY: the external driver visits each entity at
+                        // most once (any entity list holds each entity once),
+                        // and the self-conflict check ruled out `&mut T`
+                        // appearing twice — so `get` runs at most once per
+                        // entity across `'s`. See `DenseMut::get`.
+                        unsafe { view.get(e) }.map(|v| (e, v))
+                    }))
+                }
+                None => Box::new(std::iter::empty()),
+            },
+        }
     }
 }
 
@@ -422,12 +673,34 @@ impl QueryData for Entity {
         Self: 'w,
         'w: 's,
     {
-        Box::new(state.iter().map(|&e| (e, e)))
+        Box::new(counted!(state.iter()).map(|&e| (e, e)))
     }
 
     fn collect_access(_access: &mut QueryAccess) {
         // Entity reads no component — invisible to the self-conflict
         // check, so `Query<(Entity, &mut A, &A)>` still panics on `A`.
+    }
+
+    // `Entity` names no component, so it keeps the `None` default for
+    // `min_data_candidate` — it offers no candidate to drive off. But it
+    // *can* be driven externally: when a filter wins, `drive` yields the
+    // filter's entities, not the live snapshot.
+    fn drive<'s, 'w>(
+        state: &'s mut Self::State<'w>,
+        driver: DriveSource<'s>,
+    ) -> Box<dyn Iterator<Item = (Entity, Entity)> + 's>
+    where
+        Self: 's,
+        Self: 'w,
+        'w: 's,
+    {
+        match driver {
+            DriveSource::External(di) => Box::new(counted!(di).map(|e| (e, e))),
+            // Unreachable in practice: `Entity` returns `None` from
+            // `min_data_candidate`, so the plan never picks `Data` for it.
+            // Falls back to the snapshot drive as a defensive default.
+            DriveSource::Data(_) => Self::iter(state),
+        }
     }
 }
 
@@ -440,7 +713,7 @@ impl ReadOnlyQueryData for Entity {
         Self: 'w,
         'w: 's,
     {
-        Box::new(state.iter().map(|&e| (e, e)))
+        Box::new(counted!(state.iter()).map(|&e| (e, e)))
     }
 
     fn lookup<'s, 'w>(_state: &'s Self::State<'w>, entity: Entity) -> Option<Entity>
@@ -454,6 +727,22 @@ impl ReadOnlyQueryData for Entity {
         // read side of a tuple join, where `Entity` is never a non-driver.)
         Some(entity)
     }
+
+    fn drive_ref<'s, 'w>(
+        state: &'s Self::State<'w>,
+        driver: DriveSource<'s>,
+    ) -> Box<dyn Iterator<Item = (Entity, Entity)> + 's>
+    where
+        Self: 's,
+        Self: 'w,
+        'w: 's,
+    {
+        match driver {
+            DriveSource::External(di) => Box::new(counted!(di).map(|e| (e, e))),
+            // Unreachable in practice (no candidate ⇒ never `Data`); defensive.
+            DriveSource::Data(_) => Self::iter_ref(state),
+        }
+    }
 }
 
 // -------- DenseMut: the single `unsafe fn` powering (D1, &mut T) --------
@@ -462,11 +751,11 @@ impl ReadOnlyQueryData for Entity {
 /// non-driver `&mut T` positions in every tuple join (arities 2–5, and
 /// the `(Entity, …)` family) to hand out `&mut T` by entity.
 ///
-/// The driver walks D1 with its normal `iter`; this view is the
-/// random-access lookup for the second element, which needs a raw
-/// `*mut T` + index (the price of leaving the borrow checker). The full
-/// soundness argument lives on [`DenseMut::get`]'s `# Safety` block and
-/// the module-level *Joins* docs.
+/// The chosen driver element walks its entities; this view is the
+/// random-access lookup for each non-driver `&mut T` position, which needs a
+/// raw `*mut T` + index (the price of leaving the borrow checker). The full
+/// soundness argument lives on [`DenseMut::get`]'s `# Safety` block and the
+/// module-level *Joins* docs.
 ///
 /// `PhantomData<&'s mut [T]>` ties the view's lifetime to the
 /// storage's exclusive borrow (so it cannot dangle) and gives `T` the
@@ -702,8 +991,11 @@ macro_rules! fetch_non_driver {
     };
 }
 
-/// Driver iterator over the first storage. `R` uses safe `.iter()`,
-/// `W` uses safe `.iter_mut()` (both inherited from `ComponentStorage`).
+/// Driver iterator for the **first-element** path — `iter` / `iter_ref`, and
+/// the `DriveSource::Data(0)` fast path that delegates to them. `R` uses safe
+/// `.iter()`, `W` uses safe `.iter_mut()` (both from `ComponentStorage`).
+/// Driving a *non-first* element goes through `build_elem!` + [`DriverIter`]
+/// instead.
 macro_rules! drive_iter {
     (R, $state:ident) => {
         match $state {
@@ -715,6 +1007,58 @@ macro_rules! drive_iter {
         match $state {
             Some(s) => Box::new(s.iter_mut()),
             None => Box::new(std::iter::empty()),
+        }
+    };
+}
+
+/// Population of one element's storage (`0` if absent), flag-agnostic — used
+/// by `min_data_candidate` to size each element's candidate set in O(1).
+macro_rules! len_of {
+    ($state:expr) => {
+        $state.as_ref().map_or(0, |s| s.len())
+    };
+}
+
+/// One read element's dense entity slice (empty if the storage is absent) —
+/// the driver slice for a `&T` element in the shared (`drive_ref`) path.
+macro_rules! slice_of_read {
+    ($state:expr) => {
+        $state.as_ref().map_or(&[][..], |s| s.entities())
+    };
+}
+
+/// Builds `(entity slice, fetch handle)` for one element in the exclusive
+/// (`drive`) path. The slice is a standalone `&[Entity]` (so it can drive the
+/// loop) and the handle looks the element up per entity:
+///
+/// - `R`: `(entities, &Option<Ref<…>>)` — looked up via `storage.get`.
+/// - `W`: `(entities, Option<DenseMut<…>>)` — looked up via the `unsafe`
+///   [`DenseMut::get`]. The slice comes from the *same* `split_for_join` as
+///   the `DenseMut`, so the shared `entity_index` borrow (driver) and the
+///   `&mut dense` borrow (lookup) are disjoint — no aliasing.
+macro_rules! build_elem {
+    (R, $state:ident) => {{
+        let fetch = &*$state;
+        let ents: &[Entity] = slice_of_read!(fetch);
+        (ents, fetch)
+    }};
+    (W, $state:ident) => {
+        match $state.as_mut() {
+            Some(refmut) => {
+                let (dense, changed_tick, sparse, entity_index, current_tick) =
+                    refmut.split_for_join();
+                (
+                    entity_index,
+                    Some(DenseMut::new(
+                        dense,
+                        changed_tick,
+                        sparse,
+                        entity_index,
+                        current_tick,
+                    )),
+                )
+            }
+            None => (&[][..], None),
         }
     };
 }
@@ -773,7 +1117,7 @@ macro_rules! impl_one_combo {
                 $(let $Rest = build_non_driver_fetch!($rest_flag, $Rest);)+
                 let driver: Box<dyn Iterator<Item = (Entity, item_type!($first_flag $First, 's))> + 's> =
                     drive_iter!($first_flag, $First);
-                Box::new(driver.filter_map(move |(entity, item_first)| {
+                Box::new(counted!(driver).filter_map(move |(entity, item_first)| {
                     Some((
                         entity,
                         (
@@ -787,6 +1131,62 @@ macro_rules! impl_one_combo {
             fn collect_access(access: &mut QueryAccess) {
                 access_call!($first_flag $First, access);
                 $(access_call!($rest_flag $Rest, access);)+
+            }
+
+            #[allow(non_snake_case)]
+            fn min_data_candidate<'w>(state: &Self::State<'w>) -> Option<(usize, usize)>
+            where
+                Self: 'w,
+            {
+                let ($First, $($Rest,)+) = state;
+                // Positional array → array index *is* the element index; the
+                // first minimum wins ties (strict `<`), so the earliest
+                // element leads on a tie.
+                let pops = [len_of!($First), $(len_of!($Rest),)+];
+                let mut best = (0usize, pops[0]);
+                for (i, &p) in pops.iter().enumerate().skip(1) {
+                    if p < best.1 {
+                        best = (i, p);
+                    }
+                }
+                Some(best)
+            }
+
+            #[allow(non_snake_case)]
+            fn drive<'s, 'w>(
+                state: &'s mut Self::State<'w>,
+                driver: DriveSource<'s>,
+            ) -> Box<dyn Iterator<Item = (Entity, Self::Item<'s>)> + 's>
+            where
+                Self: 's,
+                Self: 'w,
+                'w: 's,
+            {
+                // First element is the natural driver: keep the zero-overhead
+                // direct path (yields its value, no redundant lookup).
+                if let DriveSource::Data(0) = driver {
+                    return Self::iter(state);
+                }
+                let ($First, $($Rest,)+) = state;
+                // `build_elem!` yields `(entity slice, fetch handle)` per
+                // element; shadow each ident with that pair.
+                let $First = build_elem!($first_flag, $First);
+                $(let $Rest = build_elem!($rest_flag, $Rest);)+
+                // Positional slice array, indexed by the chosen data index.
+                let slices = [$First.0, $($Rest.0,)+];
+                let di: DriverIter<'s> = match driver {
+                    DriveSource::Data(k) => DriverIter::new(slices[k]),
+                    DriveSource::External(di) => di,
+                };
+                Box::new(counted!(di).filter_map(move |entity| {
+                    Some((
+                        entity,
+                        (
+                            fetch_non_driver!($first_flag, $First.1, entity),
+                            $(fetch_non_driver!($rest_flag, $Rest.1, entity),)+
+                        ),
+                    ))
+                }))
             }
         }
     };
@@ -809,7 +1209,7 @@ macro_rules! impl_one_combo {
                     Some(s) => Box::new(s.iter()),
                     None => Box::new(std::iter::empty()),
                 };
-                Box::new(driver.filter_map(move |(entity, item_first)| {
+                Box::new(counted!(driver).filter_map(move |(entity, item_first)| {
                     Some((
                         entity,
                         (
@@ -835,6 +1235,35 @@ macro_rules! impl_one_combo {
                     $First.as_ref()?.get(entity)?,
                     $($Rest.as_ref()?.get(entity)?,)+
                 ))
+            }
+
+            #[allow(non_snake_case)]
+            fn drive_ref<'s, 'w>(
+                state: &'s Self::State<'w>,
+                driver: DriveSource<'s>,
+            ) -> Box<dyn Iterator<Item = (Entity, Self::Item<'s>)> + 's>
+            where
+                Self: 's,
+                Self: 'w,
+                'w: 's,
+            {
+                if let DriveSource::Data(0) = driver {
+                    return Self::iter_ref(state);
+                }
+                // Read shapes look every element up via `lookup`, so the
+                // driver just supplies entities — a borrowed slice (data /
+                // filter) or an owned list (`Or` union / live set).
+                let di: DriverIter<'s> = match driver {
+                    DriveSource::Data(k) => {
+                        let ($First, $($Rest,)+) = state;
+                        let slices = [slice_of_read!($First), $(slice_of_read!($Rest),)+];
+                        DriverIter::new(slices[k])
+                    }
+                    DriveSource::External(di) => di,
+                };
+                Box::new(counted!(di).filter_map(move |entity| {
+                    Self::lookup(state, entity).map(|item| (entity, item))
+                }))
             }
         }
     };
@@ -954,7 +1383,7 @@ macro_rules! impl_one_combo_entity {
                 $(let $Rest = build_non_driver_fetch!($rest_flag, $Rest);)*
                 let driver: Box<dyn Iterator<Item = (Entity, item_type!($first_flag $First, 's))> + 's> =
                     drive_iter!($first_flag, $First);
-                Box::new(driver.filter_map(move |(entity, item_first)| {
+                Box::new(counted!(driver).filter_map(move |(entity, item_first)| {
                     Some((
                         entity,
                         (
@@ -969,6 +1398,64 @@ macro_rules! impl_one_combo_entity {
             fn collect_access(access: &mut QueryAccess) {
                 access_call!($first_flag $First, access);
                 $(access_call!($rest_flag $Rest, access);)*
+            }
+
+            #[allow(non_snake_case)]
+            fn min_data_candidate<'w>(state: &Self::State<'w>) -> Option<(usize, usize)>
+            where
+                Self: 'w,
+            {
+                let ($First, $($Rest,)*) = state;
+                // Components only — `Entity` (global index 0) offers no
+                // candidate. Local array index `i` maps to global index
+                // `i + 1`; first minimum wins ties.
+                let pops = [len_of!($First), $(len_of!($Rest),)*];
+                let mut best = (1usize, pops[0]);
+                for (i, &p) in pops.iter().enumerate().skip(1) {
+                    if p < best.1 {
+                        best = (i + 1, p);
+                    }
+                }
+                Some(best)
+            }
+
+            #[allow(non_snake_case)]
+            fn drive<'s, 'w>(
+                state: &'s mut Self::State<'w>,
+                driver: DriveSource<'s>,
+            ) -> Box<dyn Iterator<Item = (Entity, Self::Item<'s>)> + 's>
+            where
+                Self: 's,
+                Self: 'w,
+                'w: 's,
+            {
+                // First *component* (global index 1) is the natural driver.
+                if let DriveSource::Data(1) = driver {
+                    return Self::iter(state);
+                }
+                let ($First, $($Rest,)*) = state;
+                // `build_elem!` yields `(entity slice, fetch handle)` per
+                // element; shadow each ident with that pair (so `$First.1` is
+                // now the lookup handle, not the `Option<Ref<…>>` state).
+                let $First = build_elem!($first_flag, $First);
+                $(let $Rest = build_elem!($rest_flag, $Rest);)*
+                // Slot 0 is `Entity` (no storage) — an empty placeholder keeps
+                // the array indexed by the global element index.
+                let slices = [&[][..], $First.0, $($Rest.0,)*];
+                let di: DriverIter<'s> = match driver {
+                    DriveSource::Data(k) => DriverIter::new(slices[k]),
+                    DriveSource::External(di) => di,
+                };
+                Box::new(counted!(di).filter_map(move |entity| {
+                    Some((
+                        entity,
+                        (
+                            entity,
+                            fetch_non_driver!($first_flag, $First.1, entity),
+                            $(fetch_non_driver!($rest_flag, $Rest.1, entity),)*
+                        ),
+                    ))
+                }))
             }
         }
     };
@@ -991,7 +1478,7 @@ macro_rules! impl_one_combo_entity {
                     Some(s) => Box::new(s.iter()),
                     None => Box::new(std::iter::empty()),
                 };
-                Box::new(driver.filter_map(move |(entity, item_first)| {
+                Box::new(counted!(driver).filter_map(move |(entity, item_first)| {
                     Some((
                         entity,
                         (
@@ -1019,6 +1506,32 @@ macro_rules! impl_one_combo_entity {
                     $First.as_ref()?.get(entity)?,
                     $($Rest.as_ref()?.get(entity)?,)*
                 ))
+            }
+
+            #[allow(non_snake_case)]
+            fn drive_ref<'s, 'w>(
+                state: &'s Self::State<'w>,
+                driver: DriveSource<'s>,
+            ) -> Box<dyn Iterator<Item = (Entity, Self::Item<'s>)> + 's>
+            where
+                Self: 's,
+                Self: 'w,
+                'w: 's,
+            {
+                if let DriveSource::Data(1) = driver {
+                    return Self::iter_ref(state);
+                }
+                let di: DriverIter<'s> = match driver {
+                    DriveSource::Data(k) => {
+                        let ($First, $($Rest,)*) = state;
+                        let slices = [&[][..], slice_of_read!($First), $(slice_of_read!($Rest),)*];
+                        DriverIter::new(slices[k])
+                    }
+                    DriveSource::External(di) => di,
+                };
+                Box::new(counted!(di).filter_map(move |entity| {
+                    Self::lookup(state, entity).map(|item| (entity, item))
+                }))
             }
         }
     };
@@ -1139,18 +1652,49 @@ impl_all_tuple_entity!(A, B, C); // (Entity, &A, &B, &C) + all combos
 /// assert!(xs.contains(&1.0));
 /// assert!(xs.contains(&99.0));
 /// ```
-pub struct Query<'w, D: QueryData + 'w, F: QueryFilter = ()> {
-    /// Retained so [`QueryFilter::init_state`] can build the filter's
-    /// state — one borrow of the relevant storages and tick baselines —
-    /// at the start of each `iter` / `iter_mut`, before any entity is
-    /// visited. Shared, so it coexists with the `Ref`/`RefMut` storage
-    /// guards in `state`.
-    world: &'w World,
+pub struct Query<'w, D: QueryData + 'w, F: QueryFilter + 'w = ()> {
+    /// The data shape's storage borrows, held for the query's lifetime.
     state: D::State<'w>,
-    _filter: PhantomData<F>,
+    /// The filter's storage borrows + tick baselines, fetched once at
+    /// [`from_world`](Self::from_world) (issue #65 moved this here from a
+    /// per-`iter` fetch so a filter-driven loop can borrow its candidate
+    /// slice at query lifetime). Shared with `state` against the `RefCell`
+    /// rules — `With<A>` + `&mut A` is caught earlier by the self-conflict
+    /// check; the only behavior shift is that the nonsensical
+    /// `Query<&mut T, Without<T>>` now panics here at construction rather
+    /// than at first iteration.
+    filter_state: F::State<'w>,
+    /// The driver chosen once from the data + filter candidate populations.
+    /// Replayed on every `iter` / `iter_mut`; never recomputed per call.
+    plan: DriverPlan,
+    /// The `Or`-union driver, materialized **once** at
+    /// [`from_world`](Self::from_world) and owned for the query's lifetime, so
+    /// `iter` / `iter_mut` borrow a slice of it rather than re-sorting and
+    /// re-allocating the union on every call. `None` unless the filter both
+    /// drives *and* has no single-storage candidate (i.e. it is an `Or`).
+    /// Frozen at construction, like the `Query<Entity>` live snapshot.
+    materialized_driver: Option<Vec<Entity>>,
 }
 
-impl<'w, D: QueryData + 'w, F: QueryFilter> Query<'w, D, F> {
+/// Builds the entity stream for a filter-driven query: a borrowed slice into a
+/// single-storage candidate (`With`/`Changed`/`Added`/`And`), or into the
+/// `Or` union materialized once at `from_world` and passed here as
+/// `materialized`. Only reached when [`QueryFilter::candidate_len`] was
+/// `Some`, so one branch always applies.
+fn build_filter_driver<'s, F: QueryFilter>(
+    filter_state: &'s F::State<'_>,
+    materialized: Option<&'s [Entity]>,
+) -> DriverIter<'s> {
+    if let Some(slice) = F::candidate_slice(filter_state) {
+        DriverIter::new(slice)
+    } else {
+        // No single-storage candidate ⇒ an `Or`, whose union was materialized
+        // at construction (its `candidate_len` was `Some`, so it must exist).
+        DriverIter::new(materialized.expect("Or driver materialized at from_world"))
+    }
+}
+
+impl<'w, D: QueryData + 'w, F: QueryFilter + 'w> Query<'w, D, F> {
     /// Fetches a `Query` directly from a [`World`]. Convenience for
     /// tests and doc examples; system fns receive their `Query` from
     /// the runner via [`SystemParam::fetch`].
@@ -1203,10 +1747,49 @@ impl<'w, D: QueryData + 'w, F: QueryFilter> Query<'w, D, F> {
         D::collect_access(&mut access);
         F::collect_access(&mut access);
         access.assert_no_self_conflict();
+
+        let state = D::init_state(world);
+        let filter_state = F::init_state(world);
+
+        // Freeze the driver once: the smallest candidate across the data
+        // shape and the filter leads the loop. A tie favors the data shape
+        // (earlier in `Query<D, F>` than the filter); within the data shape
+        // the earliest element wins (see `min_data_candidate`). Reading each
+        // population is O(1); the choice never depends on a per-`iter` lookup.
+        let plan = match (
+            D::min_data_candidate(&state),
+            F::candidate_len(&filter_state),
+        ) {
+            // Nothing names a candidate (`Query<Entity>`, `…, Without<T>>`,
+            // `…, ()>`): drive the live snapshot via the data shape's own
+            // iter — the contract-exempt fallback.
+            (None, None) => DriverPlan::LiveSet,
+            (None, Some(_)) => DriverPlan::Filter,
+            (Some((idx, _)), None) => DriverPlan::Data(idx),
+            (Some((idx, data_pop)), Some(filter_pop)) => {
+                if data_pop <= filter_pop {
+                    DriverPlan::Data(idx)
+                } else {
+                    DriverPlan::Filter
+                }
+            }
+        };
+
+        // If the filter drives via a composite candidate (an `Or` union),
+        // materialize it once here; `iter` / `iter_mut` then borrow it instead
+        // of rebuilding the sorted, deduplicated union on every call.
+        // Single-storage filters return `None` (they drive via a borrowed
+        // slice), and so do non-filter plans.
+        let materialized_driver = match plan {
+            DriverPlan::Filter => F::candidate_materialize(&filter_state),
+            DriverPlan::Data(_) | DriverPlan::LiveSet => None,
+        };
+
         Self {
-            world,
-            state: D::init_state(world),
-            _filter: PhantomData,
+            state,
+            filter_state,
+            plan,
+            materialized_driver,
         }
     }
 
@@ -1281,21 +1864,28 @@ impl<'w, D: QueryData + 'w, F: QueryFilter> Query<'w, D, F> {
     /// assert!((vy - 0.45).abs() < 1e-6);
     /// ```
     pub fn iter_mut(&mut self) -> impl Iterator<Item = D::Item<'_>> + '_ {
-        // Fetch the filter's state once (storage borrows + tick baselines)
-        // so per-entity `matches` is a field read, not a fresh lookup.
-        // Copying `world` out first keeps it disjoint from the `&mut state`
-        // borrow below.
-        let world = self.world;
-        let filter_state = F::init_state(world);
-        // Path B — strip the entity that the trait threads internally
-        // for join logic; the filter consumes it first. See module docs.
-        D::iter(&mut self.state)
-            .filter(move |(entity, _)| F::matches(*entity, &filter_state))
+        // The driver was chosen at construction; `state` (mut), `filter_state`
+        // and `materialized_driver` (shared) are disjoint fields, so the
+        // driver and the per-entity `matches` reject borrow them side by side.
+        let filter_state = &self.filter_state;
+        let materialized = self.materialized_driver.as_deref();
+        let driven = match self.plan {
+            DriverPlan::LiveSet => D::iter(&mut self.state),
+            DriverPlan::Data(idx) => D::drive(&mut self.state, DriveSource::Data(idx)),
+            DriverPlan::Filter => {
+                let driver = build_filter_driver::<F>(filter_state, materialized);
+                D::drive(&mut self.state, DriveSource::External(driver))
+            }
+        };
+        // Path B — strip the entity that the trait threads internally for
+        // join logic; the filter consumes it first. See module docs.
+        driven
+            .filter(move |(entity, _)| F::matches(*entity, filter_state))
             .map(|(_entity, item)| item)
     }
 }
 
-impl<'w, D: ReadOnlyQueryData + 'w, F: QueryFilter> Query<'w, D, F> {
+impl<'w, D: ReadOnlyQueryData + 'w, F: QueryFilter + 'w> Query<'w, D, F> {
     /// Shared iteration. Available only for `D: ReadOnlyQueryData`
     /// (no `&mut T` anywhere in the shape).
     ///
@@ -1363,12 +1953,20 @@ impl<'w, D: ReadOnlyQueryData + 'w, F: QueryFilter> Query<'w, D, F> {
     /// for _ in q.iter() {}
     /// ```
     pub fn iter(&self) -> impl Iterator<Item = D::Item<'_>> + '_ {
-        // Path B — see `Query::iter_mut` for the rationale. Filter state is
-        // fetched once, not per entity.
-        let world = self.world;
-        let filter_state = F::init_state(world);
-        D::iter_ref(&self.state)
-            .filter(move |(entity, _)| F::matches(*entity, &filter_state))
+        // Path B — see `Query::iter_mut`. Shared mirror: every borrow here is
+        // shared, so the driver slice and the `matches` reject coexist freely.
+        let filter_state = &self.filter_state;
+        let materialized = self.materialized_driver.as_deref();
+        let driven = match self.plan {
+            DriverPlan::LiveSet => D::iter_ref(&self.state),
+            DriverPlan::Data(idx) => D::drive_ref(&self.state, DriveSource::Data(idx)),
+            DriverPlan::Filter => {
+                let driver = build_filter_driver::<F>(filter_state, materialized);
+                D::drive_ref(&self.state, DriveSource::External(driver))
+            }
+        };
+        driven
+            .filter(move |(entity, _)| F::matches(*entity, filter_state))
             .map(|(_entity, item)| item)
     }
 }
@@ -1645,9 +2243,11 @@ mod tests {
     }
 
     #[test]
-    fn query_two_tuple_mut_drives_first_storage_and_writes_through() {
-        // The canonical movement example. Drives Position (mut),
-        // sparse-looks-up Velocity (shared).
+    fn query_two_tuple_mut_drives_and_writes_through() {
+        // The canonical movement example. Position and Velocity have equal
+        // populations here (3 each), so the tie breaks to the first element:
+        // Position (mut) drives, Velocity (shared) is sparse-looked-up. With
+        // unequal populations the smaller would drive — see `driver_cost_tests`.
         let (world, entities) = world_with_three_movers();
         {
             let mut q = Query::<(&mut Position, &Velocity)>::from_world(&world);
@@ -1724,7 +2324,7 @@ mod tests {
     // Plain `i32` newtypes so equality checks stay clippy-clean.
     //
     // These are independent test fixtures — *not* related to the
-    // `$D1, $D, ...` macro variables in `impl_query_data_tuple!`.
+    // `$first_flag $First, ...` macro variables in `impl_all_tuple!`.
     #[derive(Debug, PartialEq, Component)]
     struct A(i32);
     #[derive(Debug, PartialEq, Component)]
@@ -2450,19 +3050,18 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "already mutably borrowed")]
-    fn query_mut_data_without_same_component_panics_at_iter_start() {
+    fn query_mut_data_without_same_component_panics_at_from_world() {
         // The flip side of the test above. When `Position`'s storage is
-        // *non-empty*, `D::init_state` takes a `RefMut` on its cell inside
-        // `iter_mut`; then `Without<Position>::init_state` tries a shared
-        // borrow of the same cell — the `RefCell` "already mutably
-        // borrowed" panic fires at the `iter_mut` call, before any entity
-        // is visited. The query is nonsensical (it could never yield
-        // anything), but the failure mode is exactly what `Without`'s
-        // no-access decision implies.
+        // *non-empty*, `from_world` first takes a `RefMut` on its cell
+        // (`D::init_state`), then `Without<Position>::init_state` tries a
+        // shared borrow of the same cell — issue #65 moved filter-state
+        // fetching into `from_world`, so the `RefCell` "already mutably
+        // borrowed" panic now fires at *construction*, before iteration.
+        // The query is nonsensical (it could never yield anything), but the
+        // failure mode is exactly what `Without`'s no-access decision implies.
         let mut world = World::new();
         world.spawn().insert(Position(1, 1));
-        let mut q = Query::<&mut Position, Without<Position>>::from_world(&world);
-        let _ = q.iter_mut().count();
+        let _q = Query::<&mut Position, Without<Position>>::from_world(&world);
     }
 
     #[test]
@@ -2968,5 +3567,515 @@ mod tests {
         let ids: Vec<Entity> = Query::<Entity>::from_world(&world).iter().collect();
         assert_eq!(ids, vec![b]);
         assert!(!ids.contains(&a)); // stale handle excluded
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::items_after_statements,
+    reason = "test components sit beside the assertions that use them."
+)]
+mod driver_cost_tests {
+    //! Deterministic cost-contract checks for issue #65: every shape drives a
+    //! number of *driver steps* proportional to its smallest candidate, not to
+    //! the live set or to which element was written first. Counting is exact
+    //! (a `#[cfg(test)]` per-advance counter), so these assertions are
+    //! noise-free — wall-clock benchmarks are deferred to #63.
+
+    use super::*;
+    use crate::filter::{Added, And, Changed, Or, With, Without};
+
+    #[derive(Component)]
+    struct Big;
+    #[derive(Component)]
+    struct Small;
+    #[derive(Component)]
+    struct One;
+    /// Never inserted — its storage is absent (population 0).
+    #[derive(Component)]
+    struct Phantom;
+    /// A valued component, for tests that assert *written values*, not just
+    /// driver-step counts.
+    #[derive(Component)]
+    struct Val(i32);
+    #[derive(Component)]
+    struct Tag;
+
+    // 10_000 entities hold `Big`; the first 50 of those also hold `Small`; a
+    // single separate entity holds only `One`. So the populations are
+    // distinct — Big 10_000, Small 50, One 1 — and the live set is 10_001.
+    const BIG: usize = 10_000;
+    const SMALL: usize = 50;
+    const LIVE: usize = BIG + 1;
+
+    fn world() -> World {
+        let mut w = World::new();
+        for i in 0..BIG {
+            let e = w.spawn().insert(Big).id();
+            if i < SMALL {
+                w.insert(e, Small);
+            }
+        }
+        w.spawn().insert(One);
+        w
+    }
+
+    /// Runs `body` (which must fully consume a query iterator) and returns how
+    /// many driver advances it cost.
+    fn steps(body: impl FnOnce()) -> usize {
+        let _ = take_driver_steps(); // clear any residue
+        body();
+        take_driver_steps()
+    }
+
+    // ---- the contract matrix: driver steps ∝ smallest candidate ----
+
+    #[test]
+    fn entity_with_filter_drives_filter_population() {
+        let w = world();
+        let n = steps(|| {
+            let q = Query::<Entity, With<Small>>::from_world(&w);
+            assert_eq!(q.iter().count(), SMALL); // result correctness
+        });
+        assert_eq!(n, SMALL); // not LIVE
+    }
+
+    #[test]
+    fn ref_with_filter_drives_smaller_of_data_and_filter() {
+        let w = world();
+        // Filter (50) beats data (10_000): the filter leads.
+        let n = steps(|| {
+            let q = Query::<&Big, With<Small>>::from_world(&w);
+            assert_eq!(q.iter().count(), SMALL);
+        });
+        assert_eq!(n, SMALL);
+    }
+
+    #[test]
+    fn tuple_drives_smallest_component_even_when_not_first() {
+        let w = world();
+        // `Small` is the *second* element yet drives — the headline win.
+        let n = steps(|| {
+            let q = Query::<(&Big, &Small)>::from_world(&w);
+            assert_eq!(q.iter().count(), SMALL);
+        });
+        assert_eq!(n, SMALL); // not BIG
+    }
+
+    #[test]
+    fn tuple_first_element_smallest_keeps_direct_path() {
+        let w = world();
+        // `Small` first: today's direct path, same step count.
+        let n = steps(|| {
+            let q = Query::<(&Small, &Big)>::from_world(&w);
+            assert_eq!(q.iter().count(), SMALL);
+        });
+        assert_eq!(n, SMALL);
+    }
+
+    #[test]
+    fn entity_prefixed_tuple_drives_smallest_component() {
+        let w = world();
+        let n = steps(|| {
+            let q = Query::<(Entity, &Big, &Small)>::from_world(&w);
+            assert_eq!(q.iter().count(), SMALL);
+        });
+        assert_eq!(n, SMALL);
+    }
+
+    #[test]
+    fn mut_tuple_drives_smallest_component() {
+        let w = world();
+        // `&mut Big` first, `&Small` second and smaller — the smaller leads,
+        // `Big` is reached through the `DenseMut` lookup.
+        let n = steps(|| {
+            let mut q = Query::<(&mut Big, &Small)>::from_world(&w);
+            assert_eq!(q.iter_mut().count(), SMALL);
+        });
+        assert_eq!(n, SMALL);
+    }
+
+    #[test]
+    fn and_drives_smallest_arm() {
+        let w = world();
+        // min(|Small| 50, |One| 1) = 1. No entity has both, so 0 results —
+        // but the driver still costs only the smallest arm.
+        let n = steps(|| {
+            let q = Query::<Entity, And<(With<Small>, With<One>)>>::from_world(&w);
+            assert_eq!(q.iter().count(), 0);
+        });
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn and_with_data_drives_smallest_candidate_across_all() {
+        let w = world();
+        // min over &Big (10_000), Small (50), One (1) = 1.
+        let n = steps(|| {
+            let q = Query::<&Big, And<(With<Small>, With<One>)>>::from_world(&w);
+            let _ = q.iter().count();
+        });
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn shallow_or_drives_deduplicated_union() {
+        let w = world();
+        // Small (50) and One (1) are disjoint → union is 51.
+        let n = steps(|| {
+            let q = Query::<Entity, Or<(With<Small>, With<One>)>>::from_world(&w);
+            assert_eq!(q.iter().count(), SMALL + 1);
+        });
+        assert_eq!(n, SMALL + 1);
+    }
+
+    #[test]
+    fn changed_drives_component_population_never_live_set() {
+        let w = world();
+        // No system has run → baseline 0 → all 50 `Small` count as changed.
+        // Driver is Small (50), never the live set, even paired with &Big.
+        let n = steps(|| {
+            let q = Query::<&Big, Changed<Small>>::from_world(&w);
+            assert_eq!(q.iter().count(), SMALL);
+        });
+        assert_eq!(n, SMALL);
+    }
+
+    #[test]
+    fn added_drives_component_population() {
+        let w = world();
+        let n = steps(|| {
+            let q = Query::<&Big, Added<Small>>::from_world(&w);
+            assert_eq!(q.iter().count(), SMALL);
+        });
+        assert_eq!(n, SMALL);
+    }
+
+    // ---- exempt shapes: no candidate ⇒ live-set drive (by necessity) ----
+
+    #[test]
+    fn standalone_entity_drives_live_set() {
+        let w = world();
+        let n = steps(|| {
+            let q = Query::<Entity>::from_world(&w);
+            assert_eq!(q.iter().count(), LIVE);
+        });
+        assert_eq!(n, LIVE);
+    }
+
+    #[test]
+    fn without_only_falls_back_to_live_set() {
+        let w = world();
+        // `Without` enumerates no candidate; with nothing positive elsewhere
+        // it drives the live set and rejects per entity (exempt by design).
+        let n = steps(|| {
+            let q = Query::<Entity, Without<Small>>::from_world(&w);
+            assert_eq!(q.iter().count(), LIVE - SMALL);
+        });
+        assert_eq!(n, LIVE);
+    }
+
+    // ---- natural form ≤ best hand-rewrite (same driver steps) ----
+
+    #[test]
+    fn natural_form_matches_best_hand_rewrite() {
+        let w = world();
+        // `Query<Entity, With<Small>>` is the natural form; `Query<(Entity,
+        // &Small)>` is the hand-rewrite a user reaches for today. Equal cost.
+        let natural = steps(|| {
+            let _ = Query::<Entity, With<Small>>::from_world(&w).iter().count();
+        });
+        let rewrite = steps(|| {
+            let _ = Query::<(Entity, &Small)>::from_world(&w).iter().count();
+        });
+        assert_eq!(natural, rewrite);
+        assert_eq!(natural, SMALL);
+    }
+
+    // ---- correctness: reordering the driver doesn't change the result set ----
+
+    #[test]
+    fn driver_choice_preserves_result_set() {
+        let w = world();
+        let forward: usize = Query::<(&Big, &Small)>::from_world(&w).iter().count();
+        let reversed: usize = Query::<(&Small, &Big)>::from_world(&w).iter().count();
+        assert_eq!(forward, reversed);
+        assert_eq!(forward, SMALL);
+    }
+
+    // ---- value correctness through a filter-/reorder-chosen driver ----
+
+    // Six `Val` entities; indices 0 and 3 also carry `Tag`. So `Tag` (2)
+    // drives over `Val` (6) — exercising the `&mut` filter-driven path
+    // (`DenseMut` reached via an *external* filter driver, not a non-first
+    // data element) and asserting the *written values*, not just the count.
+    fn world_six_vals() -> (World, Vec<Entity>) {
+        let mut w = World::new();
+        let mut ids = Vec::new();
+        for i in 0..6 {
+            let e = w.spawn().insert(Val(i)).id();
+            if i % 3 == 0 {
+                w.insert(e, Tag);
+            }
+            ids.push(e);
+        }
+        (w, ids)
+    }
+
+    #[test]
+    fn filter_driven_mut_writes_only_matching_values() {
+        let (w, ids) = world_six_vals();
+        let n = steps(|| {
+            let mut q = Query::<&mut Val, With<Tag>>::from_world(&w);
+            for mut v in q.iter_mut() {
+                v.0 += 100;
+            }
+        });
+        assert_eq!(n, 2); // filter (Tag) drives, not all six Vals
+        let vals: Vec<i32> = ids.iter().map(|&e| w.get::<Val>(e).unwrap().0).collect();
+        assert_eq!(vals, vec![100, 1, 2, 103, 4, 5]); // only the Tag-holders bumped
+    }
+
+    #[test]
+    fn entity_prefixed_mut_drives_smallest_and_writes_through() {
+        let (w, ids) = world_six_vals();
+        let n = steps(|| {
+            let mut q = Query::<(Entity, &mut Val, &Tag)>::from_world(&w);
+            let mut seen = Vec::new();
+            for (e, mut v, _tag) in q.iter_mut() {
+                v.0 += 100;
+                seen.push(e);
+            }
+            assert_eq!(seen.len(), 2);
+        });
+        assert_eq!(n, 2); // `Tag` (global index 2) drives the exclusive path
+        let vals: Vec<i32> = ids.iter().map(|&e| w.get::<Val>(e).unwrap().0).collect();
+        assert_eq!(vals, vec![100, 1, 2, 103, 4, 5]);
+    }
+
+    // ---- edge cases in the candidate machinery ----
+
+    #[test]
+    fn or_with_absent_arm_drives_only_the_present_arm() {
+        let w = world();
+        // `Phantom`'s storage is absent ⇒ its `candidate_slice` is `Some(&[])`,
+        // so the union is `Small (50) ∪ ∅` = 50 — never the live set.
+        let n = steps(|| {
+            let q = Query::<Entity, Or<(With<Small>, With<Phantom>)>>::from_world(&w);
+            assert_eq!(q.iter().count(), SMALL);
+        });
+        assert_eq!(n, SMALL);
+    }
+
+    #[test]
+    fn and_with_negative_arm_drives_the_positive_arm() {
+        let w = world();
+        // `Without<Big>` offers no candidate (it `flatten`s out of
+        // `And::candidate_slice`), so the positive `With<Small>` arm (50)
+        // drives. Every Small-holder also has Big, so `matches` rejects all
+        // 50 — 0 results, but the driver cost is the smallest positive arm.
+        let n = steps(|| {
+            let q = Query::<Entity, And<(With<Small>, Without<Big>)>>::from_world(&w);
+            assert_eq!(q.iter().count(), 0);
+        });
+        assert_eq!(n, SMALL); // drove Small's 50, not the live set
+    }
+
+    #[test]
+    fn equal_population_tie_breaks_to_earliest_element() {
+        // `L` and `R` cover the same 3 entities but in opposite dense order
+        // (`R` inserted in reverse). Equal populations ⇒ the tie breaks to the
+        // *first* element, so the yielded order is the first element's order.
+        #[derive(Component)]
+        struct L(i32);
+        #[derive(Component)]
+        struct R;
+
+        let mut w = World::new();
+        let e0 = w.spawn().insert(L(0)).id();
+        let e1 = w.spawn().insert(L(1)).id();
+        let e2 = w.spawn().insert(L(2)).id();
+        w.insert(e2, R);
+        w.insert(e1, R);
+        w.insert(e0, R); // R's dense order is [e2, e1, e0]
+
+        // `(&L, &R)`: tie → L (first) drives → L's dense order [0, 1, 2].
+        let forward: Vec<i32> = Query::<(&L, &R)>::from_world(&w)
+            .iter()
+            .map(|(l, _)| l.0)
+            .collect();
+        assert_eq!(forward, vec![0, 1, 2]);
+
+        // `(&R, &L)`: tie → R (first) drives → R's dense order [2, 1, 0].
+        let reversed: Vec<i32> = Query::<(&R, &L)>::from_world(&w)
+            .iter()
+            .map(|(_, l)| l.0)
+            .collect();
+        assert_eq!(reversed, vec![2, 1, 0]);
+    }
+
+    // ---- the frozen plan replays correctly across multiple iterations ----
+
+    #[test]
+    fn or_filter_plan_replays_identically_on_second_iter() {
+        let w = world();
+        // The `Or` union is materialized once at construction; a second
+        // `iter()` must borrow the same cached `Vec` and yield the same set
+        // at the same cost — not rebuild it (cycle-1 perf fix) nor drift.
+        let q = Query::<Entity, Or<(With<Small>, With<One>)>>::from_world(&w);
+        let first: Vec<Entity> = q.iter().collect();
+        let _ = take_driver_steps();
+        let second: Vec<Entity> = q.iter().collect();
+        let n2 = take_driver_steps();
+        assert_eq!(first, second);
+        assert_eq!(n2, SMALL + 1);
+    }
+
+    #[test]
+    fn non_first_data_driver_replays_on_second_iter_mut() {
+        let w = world();
+        // `Small` (2nd, smaller) drives; `Big` is reached via `DenseMut` from
+        // the still-live `RefMut`. A second `iter_mut()` re-borrows through
+        // the same guard and costs the same.
+        let mut q = Query::<(&mut Big, &Small)>::from_world(&w);
+        let first = q.iter_mut().count();
+        let _ = take_driver_steps();
+        let second = q.iter_mut().count();
+        let n2 = take_driver_steps();
+        assert_eq!(first, SMALL);
+        assert_eq!(second, SMALL);
+        assert_eq!(n2, SMALL);
+    }
+
+    #[test]
+    fn or_three_arms_drives_union_of_all_three() {
+        // Exercises the arity-3 `candidate_len` sum and `candidate_materialize`
+        // union (three disjoint arms: Small 50, One 1, Trio 3).
+        #[derive(Component)]
+        struct Trio;
+        let mut w = world();
+        for _ in 0..3 {
+            w.spawn().insert(Trio);
+        }
+        let n = steps(|| {
+            let q = Query::<Entity, Or<(With<Small>, With<One>, With<Trio>)>>::from_world(&w);
+            assert_eq!(q.iter().count(), SMALL + 1 + 3);
+        });
+        assert_eq!(n, SMALL + 1 + 3);
+    }
+
+    #[test]
+    fn multi_mut_tuple_drives_smaller_and_writes_both() {
+        // `(&mut Val, &mut Val2)` where `Val2` is smaller: it drives off its
+        // own slice and *both* elements are written through `DenseMut`.
+        #[derive(Component)]
+        struct Val2(i32);
+        let mut w = World::new();
+        let mut ids = Vec::new();
+        for i in 0..6 {
+            let e = w.spawn().insert(Val(i)).id();
+            if i % 3 == 0 {
+                w.insert(e, Val2(i * 10)); // idx 0, 3 carry Val2
+            }
+            ids.push(e);
+        }
+        let n = steps(|| {
+            let mut q = Query::<(&mut Val, &mut Val2)>::from_world(&w);
+            for (mut v, mut v2) in q.iter_mut() {
+                v.0 += 1;
+                v2.0 += 100;
+            }
+        });
+        assert_eq!(n, 2); // Val2 (2) drives, not Val (6)
+        // The two joined entities had both written; the rest are untouched.
+        assert_eq!(w.get::<Val>(ids[0]).unwrap().0, 1);
+        assert_eq!(w.get::<Val2>(ids[0]).unwrap().0, 100);
+        assert_eq!(w.get::<Val>(ids[3]).unwrap().0, 4);
+        assert_eq!(w.get::<Val2>(ids[3]).unwrap().0, 130);
+        assert_eq!(w.get::<Val>(ids[1]).unwrap().0, 1); // Val(1), no Val2 → unchanged
+        assert_eq!(w.get::<Val>(ids[2]).unwrap().0, 2); // unchanged
+    }
+
+    #[test]
+    fn or_mut_with_overlapping_arms_visits_each_entity_once() {
+        // Soundness pin: an entity in BOTH `Or` arms must be visited once,
+        // never twice — `Or::candidate_materialize`'s dedup is what keeps
+        // `DenseMut::get` from handing out two aliasing `&mut OD` to the same
+        // dense slot. If the dedup regressed, this would over-count steps and
+        // double-increment (or be UB under Miri).
+        #[derive(Component)]
+        struct OA;
+        #[derive(Component)]
+        struct OB;
+        #[derive(Component)]
+        struct OD(i32);
+
+        let mut w = World::new();
+        let e0 = w.spawn().insert(OA).insert(OB).insert(OD(1)).id(); // in BOTH arms
+        let e1 = w.spawn().insert(OA).insert(OD(2)).id();
+        let e2 = w.spawn().insert(OB).insert(OD(3)).id();
+        // Extra OD-only entities so OD's population (8) exceeds the `Or`
+        // candidate sum (|OA| + |OB| = 4) — forcing the `Or` union to be the
+        // driver, which is the path under test. Each is paired with its
+        // expected (untouched) value so the assertion needs no `usize as i32`.
+        let others: Vec<(Entity, i32)> = (0..5)
+            .map(|v| (w.spawn().insert(OD(10 + v)).id(), 10 + v))
+            .collect();
+
+        let n = steps(|| {
+            let mut q = Query::<&mut OD, Or<(With<OA>, With<OB>)>>::from_world(&w);
+            for mut d in q.iter_mut() {
+                d.0 += 100;
+            }
+        });
+        // Union {e0,e1} ∪ {e0,e2} dedups to {e0,e1,e2} = 3 driver steps — e0
+        // appears once, so its `&mut OD` is handed out exactly once.
+        assert_eq!(n, 3);
+        assert_eq!(w.get::<OD>(e0).unwrap().0, 101); // visited exactly once
+        assert_eq!(w.get::<OD>(e1).unwrap().0, 102);
+        assert_eq!(w.get::<OD>(e2).unwrap().0, 103);
+        for (e, expected) in others {
+            assert_eq!(w.get::<OD>(e).unwrap().0, expected); // excluded, untouched
+        }
+    }
+
+    #[test]
+    fn changed_driver_steps_equal_candidate_while_matches_trims() {
+        // `Changed<Small>` drives `Small`'s full population (the candidate),
+        // and the per-entity tick check trims the result *below* that — the
+        // step count tracks the candidate, the result tracks the matches.
+        use crate::Access;
+        use crate::storage::AnyStorage;
+        use std::any::TypeId;
+
+        let mut w = World::new();
+        let mut small_ids = Vec::new();
+        for _ in 0..5 {
+            small_ids.push(w.spawn().insert(Big).insert(Small).id());
+        }
+        for _ in 0..10 {
+            w.spawn().insert(Big); // Big 15, Small 5 → Changed<Small> drives
+        }
+
+        // Baseline = Small's clock now: every current holder looks "seen".
+        let baseline = w.storage::<Small>().unwrap().current_tick();
+        let small_tid = TypeId::of::<Small>();
+
+        // Re-insert Small on 2 → their `changed_tick` advances past baseline.
+        w.insert(small_ids[0], Small);
+        w.insert(small_ids[1], Small);
+
+        let mut results = 0;
+        let mut driver_steps = 0;
+        let access = Access::new();
+        let mut last_seen = vec![(small_tid, baseline)];
+        w.run_system(&access, &mut last_seen, &mut |world| {
+            let _ = take_driver_steps();
+            let q = Query::<&Big, Changed<Small>>::from_world(world);
+            results = q.iter().count();
+            driver_steps = take_driver_steps();
+        });
+        assert_eq!(results, 2); // only the 2 re-inserted Smalls
+        assert_eq!(driver_steps, 5); // but the driver walked all 5 Small, never Big's 15
     }
 }

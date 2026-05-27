@@ -16,15 +16,20 @@
 //!
 //! # The matching mechanism
 //!
-//! [`Query::iter`](crate::Query::iter) calls [`QueryFilter::init_state`]
-//! once at the start of iteration — taking the storage borrow(s) and tick
-//! baseline(s) the filter needs — then wraps the data driver in a
-//! `.filter(…)` that calls [`QueryFilter::matches`] per candidate entity
-//! against that pre-fetched `&Self::State`. So `World::storage::<T>()` is
-//! borrowed exactly once per iteration, not per entity, and the filter
-//! rides on top of the safe iteration path — no new `unsafe`, no change to
-//! the join machinery. That single `init_state` borrow is the chokepoint
-//! the M4 `RefCell → UnsafeCell` swap will target.
+//! [`Query::from_world`](crate::Query::from_world) calls
+//! [`QueryFilter::init_state`] **once at query construction** — taking the
+//! storage borrow(s) and tick baseline(s) the filter needs — and stores the
+//! result in the [`Query`]. Each [`Query::iter`](crate::Query::iter) /
+//! `iter_mut` then wraps the driver in a `.filter(…)` that calls
+//! [`QueryFilter::matches`] per candidate entity against that pre-fetched
+//! `&Self::State`. So `World::storage::<T>()` is borrowed once at
+//! construction — not per `iter` call and not per entity — and the borrow
+//! lives for the query's lifetime (issue #65 moved it here from a per-`iter`
+//! fetch so a filter that *drives* can borrow its candidate slice at query
+//! lifetime; see [`QueryFilter::candidate_slice`]). The filter rides on top
+//! of the safe iteration path — no new `unsafe`, no change to the join
+//! machinery. That single borrow is the chokepoint the M4
+//! `RefCell → UnsafeCell` swap will target.
 //!
 //! # Access reporting (and the `With` / `Without` asymmetry)
 //!
@@ -39,13 +44,13 @@
 //!   [`Query::from_world`].
 //! - [`Without<T>`] reports **nothing**. It is a pure archetype-style
 //!   exclusion. The cost: a nonsensical `Query<&mut T, Without<T>>`
-//!   (mutate `T` on entities that lack `T` — always empty) is *not*
-//!   caught at construction; if `T`'s storage is non-empty it surfaces
-//!   when iteration begins — `Without<T>::init_state` takes a shared
+//!   (mutate `T` on entities that lack `T` — always empty) is *not* caught
+//!   by the self-conflict check; if `T`'s storage is non-empty it surfaces
+//!   at construction instead — `Without<T>::init_state` (now run from
+//!   `Query::from_world`, see *The matching mechanism*) takes a shared
 //!   borrow of `T` while the `&mut T` data shape already holds it
 //!   exclusively, so the `RefCell`'s "already mutably borrowed" fires at
-//!   the `iter`/`iter_mut` call, before any entity is visited. That query
-//!   is meaningless anyway.
+//!   `from_world`, before any iteration. That query is meaningless anyway.
 //!
 //! [`And`] / [`Or`] report the **union** of their children's access —
 //! conservative on purpose, since the scheduler needs the worst case
@@ -132,8 +137,9 @@ pub trait QueryFilter {
     where
         Self: 'w;
 
-    /// Fetches the filter's [`State`](Self::State) from the world, once,
-    /// at the start of iteration.
+    /// Fetches the filter's [`State`](Self::State) from the world, once, at
+    /// query construction ([`Query::from_world`](crate::Query::from_world)) —
+    /// not per `iter` call. The borrow guards live for the query's lifetime.
     fn init_state(world: &World) -> Self::State<'_>;
 
     /// Returns `true` if `entity` passes this filter, reading only the
@@ -149,6 +155,60 @@ pub trait QueryFilter {
     /// module-level docs for why [`With`] reports a read but [`Without`]
     /// reports nothing.
     fn collect_access(access: &mut QueryAccess);
+
+    /// The dense entity list this filter can *drive* iteration off of, or
+    /// `None` if it offers no single-storage candidate.
+    ///
+    /// This is the heart of issue #65's driver selection: a filter that
+    /// names a concrete component already holds that component's storage,
+    /// so it can *lead* the loop over just that component's entities
+    /// instead of only rejecting members of a larger driver. [`With<T>`],
+    /// [`Changed<T>`] and [`Added<T>`] return `T`'s entities (an **empty**
+    /// slice when `T`'s storage is absent — the candidate is empty, not
+    /// missing, so the query yields nothing rather than scanning the live
+    /// set). [`And`] returns its smallest arm's slice. [`Without`], `()`
+    /// and [`Or`] have no single-storage candidate and return `None`
+    /// (`Or` surfaces a composite one via
+    /// [`candidate_materialize`](Self::candidate_materialize)).
+    ///
+    /// The default returns `None`.
+    fn candidate_slice<'s>(_state: &'s Self::State<'_>) -> Option<&'s [Entity]> {
+        None
+    }
+
+    /// Population of this filter's candidate set, or `None` if it offers
+    /// none. Read once at [`Query::from_world`](crate::Query::from_world)
+    /// to pick the smallest driver across the whole query; O(1) (a `len()`
+    /// on a packed array).
+    ///
+    /// The default derives from [`candidate_slice`](Self::candidate_slice).
+    /// [`Or`] overrides it: its candidate is the *union* of its arms, sized
+    /// as the sum of arm populations (an upper bound — exact enough to
+    /// choose a driver, and `None` unless **every** arm offers a
+    /// [`candidate_slice`](Self::candidate_slice) so the union can be built —
+    /// `Without` / `()` / nested `Or` arms do not, an `And` arm does).
+    ///
+    /// **Contract:** if you override this to return `Some`, then
+    /// [`candidate_slice`](Self::candidate_slice) **or**
+    /// [`candidate_materialize`](Self::candidate_materialize) must also return
+    /// `Some` — the query relies on a `Some` length meaning "I can produce a
+    /// driver". The default upholds this trivially.
+    fn candidate_len(state: &Self::State<'_>) -> Option<usize> {
+        Self::candidate_slice(state).map(<[Entity]>::len)
+    }
+
+    /// Materialized composite candidate for a filter whose driver is *not*
+    /// a single storage — today only [`Or`], whose driver is the
+    /// deduplicated union of its arms. Returns `None` for every
+    /// single-storage filter (they drive via
+    /// [`candidate_slice`](Self::candidate_slice)).
+    ///
+    /// The union is sorted by `(index, generation)` and deduplicated, so an
+    /// entity in two arms yields once and the order is a deterministic
+    /// function of the inputs. The default returns `None`.
+    fn candidate_materialize(_state: &Self::State<'_>) -> Option<Vec<Entity>> {
+        None
+    }
 }
 
 /// The always-true filter — the default `F` for `Query<'w, D>`.
@@ -213,6 +273,13 @@ impl<T: Component> QueryFilter for With<T> {
 
     fn collect_access(access: &mut QueryAccess) {
         access.add_read::<T>();
+    }
+
+    fn candidate_slice<'s>(state: &'s Self::State<'_>) -> Option<&'s [Entity]> {
+        // Some(empty) when `T`'s storage is absent: the candidate exists and
+        // is empty (nobody has `T`), so the query drives nothing rather than
+        // falling back to the live set and rejecting everyone.
+        Some(state.as_ref().map_or(&[], |storage| storage.entities()))
     }
 }
 
@@ -320,6 +387,13 @@ impl<T: Component> QueryFilter for Changed<T> {
     fn collect_access(access: &mut QueryAccess) {
         access.add_read::<T>();
     }
+
+    fn candidate_slice<'s>(state: &'s Self::State<'_>) -> Option<&'s [Entity]> {
+        // Only entities holding `T` can carry a change tick, so `T`'s
+        // population is the ceiling — the per-entity tick check (`matches`)
+        // then rejects the unchanged ones. Never the live set.
+        Some(state.0.as_ref().map_or(&[], |s| s.entities()))
+    }
 }
 
 /// Keeps only entities to which `T` was **newly attached** since the
@@ -371,6 +445,13 @@ impl<T: Component> QueryFilter for Added<T> {
 
     fn collect_access(access: &mut QueryAccess) {
         access.add_read::<T>();
+    }
+
+    fn candidate_slice<'s>(state: &'s Self::State<'_>) -> Option<&'s [Entity]> {
+        // Same ceiling as `Changed<T>`: only `T`-holders carry an
+        // `added_tick`, so `T`'s population bounds iteration; `matches`
+        // then keeps only the freshly-attached ones.
+        Some(state.0.as_ref().map_or(&[], |s| s.entities()))
     }
 }
 
@@ -464,6 +545,20 @@ macro_rules! impl_logical_filter {
             fn collect_access(access: &mut QueryAccess) {
                 $($F::collect_access(access);)+
             }
+
+            // `And` matches the intersection, so its result is bounded by
+            // every arm — the tightest arm bounds it. Drive the smallest
+            // arm's candidate (ties → earliest arm, via `min_by_key`'s
+            // first-minimum rule) and let `matches` reject the rest. Arms
+            // offering no candidate (e.g. `Without`) drop out via `flatten`.
+            #[allow(non_snake_case)]
+            fn candidate_slice<'s>(state: &'s Self::State<'_>) -> Option<&'s [Entity]> {
+                let ($($F,)+) = state;
+                [$($F::candidate_slice($F),)+]
+                    .into_iter()
+                    .flatten()
+                    .min_by_key(|s| s.len())
+            }
         }
 
         impl<$($F: QueryFilter),+> QueryFilter for Or<($($F,)+)> {
@@ -484,6 +579,35 @@ macro_rules! impl_logical_filter {
 
             fn collect_access(access: &mut QueryAccess) {
                 $($F::collect_access(access);)+
+            }
+
+            // `Or` drives the deduplicated *union* of its arms — so it can
+            // surface a candidate only when **every** arm is itself a single
+            // storage (the `?` on `candidate_slice` bails to `None` if any
+            // arm is a `Without`, `()`, or nested `Or`). The length is the
+            // sum of arm populations: an upper bound on `|⋃ arms|`, exact
+            // enough to choose a driver.
+            #[allow(non_snake_case)]
+            fn candidate_len(state: &Self::State<'_>) -> Option<usize> {
+                let ($($F,)+) = state;
+                let mut total = 0usize;
+                $(total += $F::candidate_slice($F)?.len();)+
+                Some(total)
+            }
+
+            // Materializes the union: concatenate every arm's candidate, then
+            // sort by `(index, generation)` and dedup so an entity in two
+            // arms yields once and the order is deterministic. `matches`
+            // re-checks each entity, so driving a superset (e.g. an `And`
+            // arm's smallest-arm candidate) stays correct.
+            #[allow(non_snake_case)]
+            fn candidate_materialize(state: &Self::State<'_>) -> Option<Vec<Entity>> {
+                let ($($F,)+) = state;
+                let mut union: Vec<Entity> = Vec::new();
+                $(union.extend_from_slice($F::candidate_slice($F)?);)+
+                union.sort_unstable_by_key(|e| (e.index, e.generation));
+                union.dedup();
+                Some(union)
             }
         }
     };

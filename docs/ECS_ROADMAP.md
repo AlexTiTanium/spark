@@ -387,9 +387,49 @@ end-to-end change detection on a *per-component* clock.**
   the existing macro) is the minimal-duplication shape.
 - *Deferred (on demand):* `Entity` only as the **first** element; arity
   capped at `(Entity, &A, &B, &C)` (4–5 are one `impl_all_tuple_entity!`
-  line each). `Query<Entity, With<T>>` is correct but iterates the whole
-  live set and tests the filter per entity rather than driving from `T`'s
-  (smaller) storage — a future optimisation, flagged on the impl.
+  line each). ~~`Query<Entity, With<T>>` iterates the whole live set rather
+  than driving from `T`'s (smaller) storage~~ **✅ shipped with #65** — see
+  item 11; it now drives from `T`'s candidate set.
+
+**11. ~~Query driver selection — iteration cost ∝ result, not query shape~~ — ✅ shipped (#65).**
+This is the generalized **leading-storage `min`** optimisation deferred since
+#11 (and noted again in #26 and item 10): it widens that tuple-only `min` to
+*every* driver-bearing shape and unifies them under one rule.
+- *Shipped:* every query part naming a concrete component surfaces a
+  *candidate set* (its dense entity list — `ComponentStorage::entities()`,
+  population O(1) via `len()`). Driver selection, frozen once at
+  `Query::from_world`, drives the **smallest** candidate across the whole
+  query — a data element, `With`/`Changed`/`Added`, an `And`'s smallest arm,
+  or a shallow `Or`'s deduplicated union — and turns every other part into a
+  per-entity lookup (data) or reject (filter). Public API unchanged; every
+  query that compiled before still compiles and yields the same set.
+- *As built:* a `DriverPlan` (`Data(idx)` / `Filter` / `LiveSet`) computed at
+  construction from the data shape's per-element populations
+  (`QueryData::min_data_candidate`) and the filter's candidate population
+  (`QueryFilter::candidate_len`). The smallest data element drives **in
+  place** via the existing direct path (zero added cost on shapes already
+  optimal — single-component, or first-element-smallest); otherwise a
+  `DriverIter` (a `slice::Iter` wrapper) leads, borrowing a dense entity
+  slice — a single storage's own list (data element or filter), or a slice
+  into the `Or` union which is materialized **once** at `from_world` and
+  owned by the `Query` (`materialized_driver`), so `iter` borrows it rather
+  than re-sorting per call. The live-set fallback (`DriverPlan::LiveSet`)
+  does **not** go through `DriverIter` — it drives via the data shape's own
+  `iter`. So the only allocation is the one-time `Or` union (and the
+  pre-existing `Query<Entity>` live snapshot); single-storage drivers borrow
+  directly, with **no per-call allocation**. `filter_state` moved into the
+  `Query` (from a per-`iter` fetch) so a filter-driven loop can borrow its
+  candidate slice at query lifetime. Proven by deterministic
+  driver-step-count tests across the contract matrix; iteration order is now
+  the chosen driver's dense order (documented in the README).
+- *Deferred:* `Without`-driver selection (no candidate set without a reverse
+  index — structurally out of scope, not a deferred optimisation); nested
+  `Or` and non-positive `Or` arms (live-set fallback); the **per-position
+  direct-drive** variant (option B — zero redundant lookup even on non-first
+  *data* drivers) — considered and deferred pending the #63 bench harness,
+  since the only residual gap is ~1 ns per yield (one sparse lookup on the
+  driver element of a non-first data driver), invisible to driver-step
+  counting and unmeasurable until #63 exists.
 
 **Then: Render milestone** — does not need parallelism.
 
@@ -568,8 +608,9 @@ RefCells, no conflict. &mut Position items are distinct (slice::iter_mut).
   one and reading the other must not re-borrow the same field.
 - **Drive the mutable side.** For `(&mut A, &B)` the mut side must be the
   driver (it needs `iter_mut`); the read side is looked up per-entity. The
-  leading-storage `min` optimisation from #11 is a follow-up — correctness via
-  "drive first sub-query, look up the rest" is acceptable here.
+  leading-storage `min` optimisation from #11 is a follow-up (✅ generalized
+  & shipped in #65, roadmap item 11) — correctness via "drive first
+  sub-query, look up the rest" was acceptable here.
 - **`(&mut A, &mut B)` is simply not implemented in this issue** — the tuple
   impl for two mutable sides lands in issue 1b. Until then it fails to compile
   for lack of an impl; that is an absence, *not* a designed rejection. Do not
@@ -622,7 +663,7 @@ lib/ecs/src/
 
 `(&mut A, &mut B)` and query self-conflict detection (both → issue 1b);
 change detection; `par_iter`; tuple arity 3–4; leading-storage `min`
-optimisation (follow-up).
+optimisation (follow-up — ✅ generalized & shipped in #65, roadmap item 11).
 
 ---
 
@@ -866,7 +907,8 @@ primitive that the scheduler issue (roadmap item 3) extends.
 - Hoisting the conflict check to registration time — that is the scheduler's
   job (item 3). Here it runs per query construction (a few `TypeId`
   comparisons, negligible).
-- `par_iter`, change detection, leading-storage `min` optimisation.
+- `par_iter`, change detection, leading-storage `min` optimisation
+  (the `min` follow-up ✅ generalized & shipped in #65, roadmap item 11).
 
 ### Proposed shape
 
@@ -1072,5 +1114,5 @@ lib/ecs/src/
 ### Out of scope
 
 `par_iter`; registration-time conflict hoisting (item 3); arities beyond 5
-(one-line extension when needed); leading-storage `min` optimisation;
-change detection.
+(one-line extension when needed); leading-storage `min` optimisation
+(✅ generalized & shipped in #65, roadmap item 11); change detection.
