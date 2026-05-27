@@ -70,11 +70,14 @@
 //! [`State`](QueryFilter::State); per-entity [`matches`](QueryFilter::matches)
 //! then compares against that, never touching the world directly.
 //!
-//! [`Changed<T>`] passes when `changed_tick > baseline`; [`Added<T>`]
-//! when `added_tick > baseline` (a one-shot, since `added_tick` never
-//! moves after the attach). Both report a **read** of `T`, like
-//! [`With<T>`], so `Query<&mut T, Changed<T>>` is a self-conflict (use
-//! `&T`, or detect a *different* component).
+//! [`Changed<T>`] passes when `changed_tick` is newer than the baseline;
+//! [`Added<T>`] when `added_tick` is (a one-shot, since `added_tick` never
+//! moves after the attach). "Newer than" is a **wrapping-aware relative-age**
+//! comparison, not a plain `tick > baseline`: the clock is `wrapping_add`, so
+//! comparing distances from the storage's current tick (`is_changed_since`)
+//! stays correct across a wrap that a strict `>` would miss. Both report a
+//! **read** of `T`, like [`With<T>`], so `Query<&mut T, Changed<T>>` is a
+//! self-conflict (use `&T`, or detect a *different* component).
 //!
 //! Marking is **precise**: a `Query<&mut T>` yields [`Mut<T>`](crate::Mut),
 //! which stamps `changed_tick` only on an actual write (`DerefMut`). An
@@ -338,9 +341,11 @@ impl<T: Component> QueryFilter for Without<T> {
 /// Zero-sized, like [`With<T>`]. Each component type carries its own
 /// change-detection clock; this compares the entity's `changed_tick`
 /// against [`World::baseline_for::<T>`](crate::World::baseline_for) — the
-/// tick `T`'s clock read when this system last ran — with a strict `>`.
-/// Reports a **read** of `T`, so pairing it with a `&mut T` data shape is
-/// a self-conflict (read with `&T`, or filter on a different component).
+/// tick `T`'s clock read when this system last ran — with the wrapping-aware
+/// relative-age test (`is_changed_since`), correct even when the clock has
+/// wrapped past the baseline. Reports a **read** of `T`, so pairing it with
+/// a `&mut T` data shape is a self-conflict (read with `&T`, or filter on a
+/// different component).
 ///
 /// Iterating a `Query<&mut T>` marks an entity changed only when the body
 /// actually writes it (via [`Mut`]'s `DerefMut`), so `Changed<T>` is
@@ -368,6 +373,36 @@ impl<T: Component> QueryFilter for Without<T> {
 /// ```
 pub struct Changed<T>(PhantomData<T>);
 
+/// True iff a write stamped at `tick` is newer than the `baseline`
+/// observation, measured relative to `current` — this component's clock
+/// when the filter was built. Shared by [`Changed`] and [`Added`].
+///
+/// # Why relative-age, not `tick > baseline`
+///
+/// The tick clock is `wrapping_add` ([`ComponentStorage::insert`]), so a
+/// plain `tick > baseline` breaks the instant the clock wraps past a parked
+/// baseline — a fresh write stamped post-wrap reads as *older*. Comparing
+/// **distances from now** is wrapping-correct: `current - tick` is how long
+/// ago the write happened, `current - baseline` how long ago the last
+/// observation was, and the write is newer exactly when its distance is the
+/// smaller. The strict `<` preserves the `tick == baseline` edge as *not
+/// changed* (a write exactly at the baseline observation is not "since" it).
+///
+/// # Window
+///
+/// `current` is a true upper bound on both `tick` and `baseline` (the clock
+/// only ever advances), so the wrapping subtractions are exact for any
+/// baseline staleness below a full `u32` lap — 2³² ticks — which the
+/// single-threaded frame model never reaches. A known upper bound buys the
+/// **full** range, wider than the conventional half-range (2³¹)
+/// serial-arithmetic window. The sole residual false-negative is a complete
+/// 2³²-tick lap with no intervening run of the system: `current` then wraps
+/// back onto `baseline` and a same-tick change is indistinguishable from
+/// none (it collapses into the `tick == baseline` edge above).
+fn is_changed_since(current: u32, tick: u32, baseline: u32) -> bool {
+    current.wrapping_sub(tick) < current.wrapping_sub(baseline)
+}
+
 impl<T: Component> QueryFilter for Changed<T> {
     /// The `T` storage borrow + the baseline tick, both fetched once.
     type State<'w> = (Option<Ref<'w, ComponentStorage<T>>>, u32);
@@ -380,7 +415,7 @@ impl<T: Component> QueryFilter for Changed<T> {
         let (storage, baseline) = state;
         storage.as_ref().is_some_and(|s| {
             s.changed_tick_for(entity)
-                .is_some_and(|tick| tick > *baseline)
+                .is_some_and(|tick| is_changed_since(s.current_tick(), tick, *baseline))
         })
     }
 
@@ -402,8 +437,9 @@ impl<T: Component> QueryFilter for Changed<T> {
 ///
 /// Zero-sized, like [`With<T>`]. Compares the entity's `added_tick` (set
 /// only on a fresh attach, never re-stamped by overwrite or `&mut`)
-/// against [`World::baseline_for::<T>`](crate::World::baseline_for) with a
-/// strict `>`. Reports a **read** of `T`, same as [`With<T>`].
+/// against [`World::baseline_for::<T>`](crate::World::baseline_for) with the
+/// same wrapping-aware relative-age test as [`Changed<T>`]
+/// (`is_changed_since`). Reports a **read** of `T`, same as [`With<T>`].
 ///
 /// Because `added_tick` does not move on later writes, an entity matches
 /// `Added<T>` for exactly the run after its `T` was attached and never
@@ -439,7 +475,7 @@ impl<T: Component> QueryFilter for Added<T> {
         let (storage, baseline) = state;
         storage.as_ref().is_some_and(|s| {
             s.added_tick_for(entity)
-                .is_some_and(|tick| tick > *baseline)
+                .is_some_and(|tick| is_changed_since(s.current_tick(), tick, *baseline))
         })
     }
 
@@ -624,6 +660,73 @@ impl_logical_filter!(F1, F2, F3, F4);
 mod tests {
     use super::*;
     use crate::World;
+
+    // ── wrapping-aware change detection (issue #80 Phase 4) ──────────────
+    //
+    // `is_changed_since(current, tick, baseline)` decides "is the write at
+    // `tick` newer than the `baseline` observation, as seen from `current`".
+    // Testing it directly pins the contract without driving a clock 2³² times.
+
+    #[test]
+    fn changed_since_basic_ordering() {
+        assert!(is_changed_since(10, 10, 5), "fresh write, older baseline");
+        assert!(
+            !is_changed_since(10, 3, 5),
+            "write strictly before baseline"
+        );
+    }
+
+    #[test]
+    fn changed_since_strict_edge_tick_equals_baseline_is_not_changed() {
+        // A write stamped exactly at the baseline observation is NOT "since"
+        // it — the strict `<` preserves this edge for every `current`.
+        for current in [0u32, 1, 100, u32::MAX - 1, u32::MAX] {
+            assert!(!is_changed_since(current, 42, 42), "current = {current}");
+        }
+    }
+
+    #[test]
+    fn changed_since_detects_across_a_wrap() {
+        // The fix: clock wrapped to 0, write stamped at 0, baseline parked
+        // just before the wrap. The old strict `tick > baseline`
+        // (`0 > u32::MAX - 1`) missed it; the relative-age test
+        // (`0 - 0 = 0 < 0 - (u32::MAX - 1) = 2`) detects it.
+        assert!(is_changed_since(0, 0, u32::MAX - 1));
+    }
+
+    #[test]
+    fn changed_since_window_is_the_full_u32_range_not_half() {
+        // NOTE — deliberate deviation from issue #80's text, which pinned a
+        // 2³¹ window ("detected at T + 2³¹ − 1, fail-mode at T + 2³¹"). That
+        // is the conventional *half-range* serial-arithmetic bound, which
+        // applies when ordering two ticks with no known reference. Here
+        // `current` is a true upper bound on both `tick` and `baseline` (the
+        // clock only advances), which buys the **full** range: a fresh write
+        // is detected at every baseline staleness short of a complete lap —
+        // including 2³¹, 2³¹ + 1, and 2³² − 1, where a half-range comparison
+        // would already have flipped to a false-negative.
+        let t = 100u32;
+        let fresh = |staleness: u32| {
+            let current = t.wrapping_add(staleness); // a fresh write at `current`
+            is_changed_since(current, current, t)
+        };
+        assert!(fresh(1), "just after baseline");
+        assert!(fresh(1 << 31), "2³¹ stale — the issue's claimed fail point");
+        assert!(fresh((1 << 31) + 1), "2³¹ + 1 stale");
+        assert!(fresh(u32::MAX), "2³² − 1 stale — the last detectable point");
+    }
+
+    #[test]
+    fn changed_since_residual_false_negative_only_at_a_full_lap() {
+        // The sole residual: a complete 2³²-tick lap with no intervening run
+        // of the system wraps `current` back onto `baseline` (staleness 0),
+        // and a same-tick write collapses into the `tick == baseline` edge.
+        // This needs 2³² ticks between two runs of one system — unreachable
+        // in the single-threaded frame model.
+        let t = 100u32;
+        let current = t; // a full lap has wrapped `current` back onto the baseline
+        assert!(!is_changed_since(current, current, t));
+    }
 
     #[derive(Component)]
     struct A;

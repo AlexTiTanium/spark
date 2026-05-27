@@ -542,7 +542,6 @@ fn changed_driver_steps_equal_candidate_while_matches_trims() {
     // and the per-entity tick check trims the result *below* that — the
     // step count tracks the candidate, the result tracks the matches.
     use crate::Access;
-    use crate::storage::AnyStorage;
     use std::any::TypeId;
 
     let mut w = World::new();
