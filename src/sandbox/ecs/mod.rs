@@ -38,13 +38,17 @@
 //!   &Acceleration)>` (symplectic Euler physics step).
 //! - **Arity-2 mut-not-first** — `Query<(&Player, &mut Health)>`
 //!   (player-only regen).
+//! - **Entity-as-data** — `Query<(Entity, &Position)>` (id surfaced
+//!   alongside the component shape).
 //! - **`Res<T>` + multiple `Query`s in one signature** — the
 //!   per-tick summary system.
 //!
 //! Filters (in [`filters`]) — `With` / `Without` / `And<(…)>` /
 //! `Or<(…)>`, nested combinators, a filter over a multi-component
-//! shape, and a filtered mutation. Each logs its expected vs actual
-//! matches; see the module docs for the roster and outcome tables.
+//! shape, a filtered mutation, and **entity-as-data under a filter**
+//! (`Query<Entity, With<Building>>`, `Query<(Entity, &Building),
+//! With<Powered>>`). Each logs its expected vs actual matches; see the
+//! module docs for the roster and outcome tables.
 
 mod change_detection;
 mod components;

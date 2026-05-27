@@ -9,8 +9,11 @@
 //! [`Query::iter`] yields the data shape itself, not an `(Entity, …)`
 //! pair. So `Query<&T>::iter()` yields `&T`, `Query<(&mut A, &B)>`
 //! yields `(&mut A, &B)`. If a system needs the entity id, it asks
-//! for it explicitly via the forthcoming `Query<(Entity, &T)>` shape
-//! (entity-as-data follow-up).
+//! for it explicitly by naming [`Entity`] as a query-data element:
+//! `Query<(Entity, &T)>` yields `(Entity, &T)`, and `Query<Entity>`
+//! yields the id alone (every live entity). See the [`Entity`] impl and
+//! [`impl_all_tuple_entity!`] for how the id rides the existing internal
+//! `(Entity, Item)` thread.
 //!
 //! **This is a deliberate choice — do not "fix" it by re-introducing
 //! the always-present `(Entity, Item)` pair.** Two candidates were
@@ -29,11 +32,14 @@
 //!
 //! Path B was chosen because it lines up cleanly with the `Access`
 //! model the scheduler is being built around: `Entity` becomes a
-//! regular [`QueryData`] element with an empty access set, and every
-//! piece of machinery (`collect_access`, self-conflict, driver
-//! selection) handles it uniformly without a special-case for the
-//! always-pair. The internal `(Entity, Item)` thread is an
-//! implementation detail of the join path.
+//! regular [`QueryData`] element with an empty access set, so the
+//! *access* machinery (`collect_access`, self-conflict) handles it with
+//! no special-case for an always-pair. Driver selection is the one
+//! exception — `Entity` has no storage to drive, so standalone
+//! `Query<Entity>` drives off a live-entity snapshot and entity-prefixed
+//! tuples off their first *component* (see *Joins*). The internal
+//! `(Entity, Item)` thread the join path carries is an implementation
+//! detail of that layer.
 //!
 //! # The fetch / iterate split
 //!
@@ -75,6 +81,13 @@
 //! — and gives 64 impls for every flag combination at that arity.
 //! Note that monomorphisation cost doubles with each step: weigh it
 //! against actual need before extending past 5.
+//!
+//! Entity-prefixed shapes — `Query<(Entity, &A)>` through
+//! `Query<(Entity, &A, &B, &C)>` — come from a parallel
+//! [`impl_all_tuple_entity!`] family (1–3 trailing components, the same
+//! 2^N Cartesian expansion). `Entity` can't drive, so the first
+//! *component* drives and `Entity` rides the id that driver already
+//! threads; it adds nothing to `State` or `collect_access`.
 //!
 //! Read-only lookups use the storage's safe
 //! [`ComponentStorage::get`]. Mutable non-driver lookups use a
@@ -323,10 +336,131 @@ impl<T: Component> QueryData for &mut T {
 
 // No ReadOnlyQueryData for &mut T — that's the entire point of the split.
 
+// -------- Entity (the id itself, as data) --------
+
+/// Yields the [`Entity`] id of every live entity — `Query<Entity>`.
+///
+/// # Logic
+///
+/// `Entity` names no component, so it has no storage to walk and cannot
+/// *drive* a join. Standing alone it must enumerate the whole live set,
+/// which [`init_state`](QueryData::init_state) captures as a
+/// `World::live_entities` snapshot. [`iter`](QueryData::iter) maps each
+/// snapshotted id `e` to the pair `(e, e)`: the first is the entity the
+/// trait threads internally (the filter consumes it, [`Query::iter`]
+/// strips it); the second is the id the caller asked for. `Entity` is
+/// `Copy` (two `u32`s), so duplicating it is free.
+///
+/// # Why a snapshot, not a held borrow
+///
+/// The state is an owned `Vec<Entity>`, not a `Ref<EntityAllocator>`.
+/// Holding a live allocator borrow across iteration would panic the
+/// instant a co-resident [`Commands::spawn`](crate::Commands::spawn) took
+/// `borrow_mut` — so a system could not take `Query<Entity>` and
+/// `Commands` together. `World::live_entities` releases the borrow
+/// before returning; see its docs.
+///
+/// # Snapshot semantics (the contract)
+///
+/// The live set is frozen **once, at query construction**
+/// ([`Query::from_world`] / `SystemParam` fetch), and every `iter` call
+/// re-walks that same `Vec`. For a system mutating the entity set *while
+/// iterating* via `Commands`:
+///
+/// - An entity **spawned** during iteration is **not** yielded.
+///   `Commands::spawn` allocates the id synchronously, so it *is* alive —
+///   but it postdates the snapshot. A query constructed *after* the spawn
+///   would include it.
+/// - An entity **despawned** during iteration **is still yielded**.
+///   `Commands::despawn` is deferred to the next flush, so the entity
+///   stays alive and in the snapshot for the rest of this frame.
+///
+/// Both reduce to one rule — the yielded set is whatever was live when the
+/// query was built — which is what keeps iteration stable against
+/// concurrent structural edits.
+///
+/// # Examples
+///
+/// ```
+/// use spark_ecs::{Component, Query, World};
+///
+/// #[derive(Component)]
+/// struct Tile;
+///
+/// let mut world = World::new();
+/// let a = world.spawn().id();              // no components at all
+/// let b = world.spawn().insert(Tile).id();
+///
+/// let ids: Vec<_> = Query::<spark_ecs::Entity>::from_world(&world).iter().collect();
+/// assert_eq!(ids.len(), 2);                // every live entity, components or not
+/// assert!(ids.contains(&a) && ids.contains(&b));
+/// ```
+impl QueryData for Entity {
+    type Item<'w>
+        = Entity
+    where
+        Self: 'w;
+    // Owned snapshot — not a borrow guard. `'w` is unused (legal for a GAT:
+    // the `where Self: 'w` bound is vacuous since `Entity: 'static`).
+    type State<'w>
+        = Vec<Entity>
+    where
+        Self: 'w;
+
+    fn init_state<'w>(world: &'w World) -> Self::State<'w>
+    where
+        Self: 'w,
+    {
+        world.live_entities()
+    }
+
+    fn iter<'s, 'w>(
+        state: &'s mut Self::State<'w>,
+    ) -> Box<dyn Iterator<Item = (Entity, Entity)> + 's>
+    where
+        Self: 's,
+        Self: 'w,
+        'w: 's,
+    {
+        Box::new(state.iter().map(|&e| (e, e)))
+    }
+
+    fn collect_access(_access: &mut QueryAccess) {
+        // Entity reads no component — invisible to the self-conflict
+        // check, so `Query<(Entity, &mut A, &A)>` still panics on `A`.
+    }
+}
+
+impl ReadOnlyQueryData for Entity {
+    fn iter_ref<'s, 'w>(
+        state: &'s Self::State<'w>,
+    ) -> Box<dyn Iterator<Item = (Entity, Entity)> + 's>
+    where
+        Self: 's,
+        Self: 'w,
+        'w: 's,
+    {
+        Box::new(state.iter().map(|&e| (e, e)))
+    }
+
+    fn lookup<'s, 'w>(_state: &'s Self::State<'w>, entity: Entity) -> Option<Entity>
+    where
+        Self: 's,
+        Self: 'w,
+        'w: 's,
+    {
+        // Every entity trivially "matches" the `Entity` shape and its item
+        // is its own id. (`lookup` has no caller today — it exists for the
+        // read side of a tuple join, where `Entity` is never a non-driver.)
+        Some(entity)
+    }
+}
+
 // -------- DenseMut: the single `unsafe fn` powering (D1, &mut T) --------
 
-/// Mutable random-access view into one storage's `dense`, used by the
-/// `(D1, &mut T)` arity-2 impl to hand out `&mut T` by entity.
+/// Mutable random-access view into one storage's `dense`, used by
+/// non-driver `&mut T` positions in every tuple join (arities 2–5, and
+/// the `(Entity, …)` family) to hand out `&mut T` by entity.
 ///
 /// The driver walks D1 with its normal `iter`; this view is the
 /// random-access lookup for the second element, which needs a raw
@@ -403,7 +537,7 @@ impl<'s, T> DenseMut<'s, T> {
     /// Across the whole lifetime `'s`, `get` must never be called twice
     /// with the same `entity`. Two `&mut T` to one dense slot would
     /// alias. See the module-level *Joins* docs for how the
-    /// `(D1, &mut T)` arity-2 impl upholds this — structural driver
+    /// `(D1, &mut T)` tuple impls uphold this — structural driver
     /// shape plus [`QueryAccess::assert_no_self_conflict`] at query
     /// construction. The same once-per-entity contract makes the two raw
     /// borrows below sound: each slot (value + `changed_tick`) is handed
@@ -744,6 +878,182 @@ impl_all_tuple!(A, B, C);
 impl_all_tuple!(A, B, C, D);
 impl_all_tuple!(A, B, C, D, E);
 
+// ---- Entity-prefixed tuples: Query<(Entity, &A, …)> ------------------
+//
+// A parallel family beside impl_one_combo! / impl_all_tuple!, for shapes
+// whose FIRST element is `Entity` followed by 1..=3 components. It reuses
+// every per-flag helper (decl_type!, item_type!, state_type!,
+// init_storage!, access_call!, build_non_driver_fetch!, fetch_non_driver!,
+// drive_iter!) unchanged — only the impl target, the `Item` type, and the
+// yielded tuple gain a leading `Entity`.
+//
+// `Entity` has no storage and cannot drive a join: the FIRST COMPONENT
+// drives (its storage is walked) and `Entity` rides the entity id the
+// driver already threads in every `(entity, item)` pair. The closure emits
+// `(entity, (entity, item_first, rest..))` — the outer entity is the
+// trait-threaded key (the filter consumes it, `Query::iter` strips it),
+// the inner is the id the caller named. `Entity` adds nothing to `State`
+// and nothing to `collect_access` — the generated `collect_access` still
+// reports every *component* access, so the self-conflict check fires as
+// usual; only `Entity` itself is invisible to it.
+//
+// The "rest" is `*` (zero-or-more), so a single component — `(Entity, &A)`
+// — is expressible; its `State` is then a 1-tuple `(Option<Ref<…>>,)`. The
+// all-R arm is listed first so all-read shapes also get `ReadOnlyQueryData`
+// (first-match-wins: any `&mut` falls through to the mixed arm, which emits
+// only `QueryData`).
+
+// NOTE the `*` (zero-or-more) on the "rest", where `impl_one_combo!` uses
+// `+`: the entity family must cover arity 1 — `(Entity, &A)`, which has a
+// first component and *no* rest — whereas the plain family delegates its
+// arity-1 case to the `&T` / `&mut T` impls and so never needs zero-rest.
+macro_rules! impl_one_combo_entity {
+    // All-R: also emit ReadOnly.
+    (R $First:ident, $(R $Rest:ident,)*) => {
+        impl_one_combo_entity!(@gen R $First, $(R $Rest,)*);
+        impl_one_combo_entity!(@readonly $First $(, $Rest)*);
+    };
+    // Mixed (at least one W): only QueryData.
+    ($first_flag:ident $First:ident, $($rest_flag:ident $Rest:ident,)*) => {
+        impl_one_combo_entity!(@gen $first_flag $First, $($rest_flag $Rest,)*);
+    };
+
+    (@gen $first_flag:ident $First:ident, $($rest_flag:ident $Rest:ident,)*) => {
+        #[allow(unsafe_code)]
+        impl<$First: Component, $($Rest: Component),*>
+            QueryData
+            for (Entity, decl_type!($first_flag $First, '_), $(decl_type!($rest_flag $Rest, '_),)*)
+        {
+            type Item<'w>
+                = (Entity, item_type!($first_flag $First, 'w), $(item_type!($rest_flag $Rest, 'w),)*)
+            where
+                Self: 'w;
+            // No `Entity` in State — it rides the driver's threaded id.
+            type State<'w>
+                = (state_type!($first_flag $First, 'w), $(state_type!($rest_flag $Rest, 'w),)*)
+            where
+                Self: 'w;
+
+            fn init_state<'w>(world: &'w World) -> Self::State<'w>
+            where
+                Self: 'w,
+            {
+                (init_storage!($first_flag $First, world), $(init_storage!($rest_flag $Rest, world),)*)
+            }
+
+            #[allow(non_snake_case)]
+            fn iter<'s, 'w>(
+                state: &'s mut Self::State<'w>,
+            ) -> Box<dyn Iterator<Item = (Entity, Self::Item<'s>)> + 's>
+            where
+                Self: 's,
+                Self: 'w,
+                'w: 's,
+            {
+                let ($First, $($Rest,)*) = state;
+                $(let $Rest = build_non_driver_fetch!($rest_flag, $Rest);)*
+                let driver: Box<dyn Iterator<Item = (Entity, item_type!($first_flag $First, 's))> + 's> =
+                    drive_iter!($first_flag, $First);
+                Box::new(driver.filter_map(move |(entity, item_first)| {
+                    Some((
+                        entity,
+                        (
+                            entity,
+                            item_first,
+                            $(fetch_non_driver!($rest_flag, $Rest, entity),)*
+                        ),
+                    ))
+                }))
+            }
+
+            fn collect_access(access: &mut QueryAccess) {
+                access_call!($first_flag $First, access);
+                $(access_call!($rest_flag $Rest, access);)*
+            }
+        }
+    };
+
+    (@readonly $First:ident $(, $Rest:ident)*) => {
+        impl<$First: Component, $($Rest: Component),*>
+            ReadOnlyQueryData for (Entity, &$First, $(&$Rest,)*)
+        {
+            #[allow(non_snake_case)]
+            fn iter_ref<'s, 'w>(
+                state: &'s Self::State<'w>,
+            ) -> Box<dyn Iterator<Item = (Entity, Self::Item<'s>)> + 's>
+            where
+                Self: 's,
+                Self: 'w,
+                'w: 's,
+            {
+                let ($First, $($Rest,)*) = state;
+                let driver: Box<dyn Iterator<Item = (Entity, &'s $First)> + 's> = match $First {
+                    Some(s) => Box::new(s.iter()),
+                    None => Box::new(std::iter::empty()),
+                };
+                Box::new(driver.filter_map(move |(entity, item_first)| {
+                    Some((
+                        entity,
+                        (
+                            entity,
+                            item_first,
+                            $($Rest.as_ref()?.get(entity)?,)*
+                        ),
+                    ))
+                }))
+            }
+
+            #[allow(non_snake_case)]
+            fn lookup<'s, 'w>(
+                state: &'s Self::State<'w>,
+                entity: Entity,
+            ) -> Option<Self::Item<'s>>
+            where
+                Self: 's,
+                Self: 'w,
+                'w: 's,
+            {
+                let ($First, $($Rest,)*) = state;
+                Some((
+                    entity,
+                    $First.as_ref()?.get(entity)?,
+                    $($Rest.as_ref()?.get(entity)?,)*
+                ))
+            }
+        }
+    };
+}
+
+macro_rules! impl_all_tuple_entity_cartesian {
+    (@start [$($acc:tt)*]) => {
+        impl_one_combo_entity!($($acc)*);
+    };
+    (@start [$($acc:tt)*] $Head:ident, $($Tail:ident,)*) => {
+        impl_all_tuple_entity_cartesian!(@start [$($acc)* R $Head,] $($Tail,)*);
+        impl_all_tuple_entity_cartesian!(@start [$($acc)* W $Head,] $($Tail,)*);
+    };
+}
+
+/// Emits every `QueryData` impl (and the `ReadOnlyQueryData` impl for the
+/// all-read combination) for `(Entity, …)` at *every* `&` / `&mut`
+/// combination of the trailing components.
+///
+/// One line per trailing arity. `impl_all_tuple_entity!(A, B)` generates
+/// 2^2 = 4 impls: `(Entity, &A, &B)`, `(Entity, &mut A, &B)`,
+/// `(Entity, &A, &mut B)`, `(Entity, &mut A, &mut B)`. A single ident —
+/// `impl_all_tuple_entity!(A)` — is allowed and yields the `(Entity, &A)` /
+/// `(Entity, &mut A)` pair. Extending past `(Entity, &A, &B, &C)` is one
+/// more line, at the usual doubling monomorphisation cost.
+macro_rules! impl_all_tuple_entity {
+    ($A:ident $(, $B:ident)*) => {
+        impl_all_tuple_entity_cartesian!(@start [] $A, $($B,)*);
+    };
+}
+
+impl_all_tuple_entity!(A); // (Entity, &A) / (Entity, &mut A)
+impl_all_tuple_entity!(A, B); // (Entity, &A, &B) + all &/&mut combos
+impl_all_tuple_entity!(A, B, C); // (Entity, &A, &B, &C) + all combos
+
 // -------- Query<'w, D> --------
 
 /// System parameter that walks entities matching a data shape `D`.
@@ -760,7 +1070,8 @@ impl_all_tuple!(A, B, C, D, E);
 ///
 /// `iter()` / `iter_mut()` yield `D::Item<'_>` directly — no
 /// `(Entity, …)` prefix. A system that needs the entity asks for it
-/// explicitly via the (forthcoming) `Query<(Entity, &T)>` shape. See
+/// explicitly by naming `Entity` in the shape — `Query<(Entity, &T)>`,
+/// or `Query<Entity>` for the id alone (see the [`Entity`] impl). See
 /// the module-level docs for the *path A* vs *path B* design note.
 ///
 /// # Filters
@@ -1034,6 +1345,23 @@ impl<'w, D: ReadOnlyQueryData + 'w, F: QueryFilter> Query<'w, D, F> {
     /// // satisfied: `&mut Position: ReadOnlyQueryData`.
     /// for _ in q.iter() {}
     /// ```
+    ///
+    /// The gate applies to entity-prefixed shapes too: only all-read
+    /// `(Entity, &A, …)` tuples are [`ReadOnlyQueryData`], so a tuple with
+    /// a `&mut` element cannot use `.iter()` (use `.iter_mut()`):
+    ///
+    /// ```compile_fail
+    /// use spark_ecs::{Component, Entity, Query, World};
+    ///
+    /// #[derive(Component)]
+    /// struct Position(f32, f32);
+    ///
+    /// let mut world = World::new();
+    /// world.spawn().insert(Position(0.0, 0.0));
+    /// let q = Query::<(Entity, &mut Position)>::from_world(&world);
+    /// // error: `(Entity, &mut Position): ReadOnlyQueryData` is not satisfied.
+    /// for _ in q.iter() {}
+    /// ```
     pub fn iter(&self) -> impl Iterator<Item = D::Item<'_>> + '_ {
         // Path B — see `Query::iter_mut` for the rationale. Filter state is
         // fetched once, not per entity.
@@ -1183,7 +1511,11 @@ impl<'q, 'w, D: QueryData + 'w, F: QueryFilter> IntoIterator for &'q mut Query<'
               `Query` by value to match how plugins write systems."
 )]
 mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
     use super::*;
+    use crate::Commands;
     use crate::Component;
     use crate::filter::{And, Or, With, Without};
     use crate::system::IntoSystem;
@@ -2234,5 +2566,407 @@ mod tests {
             world.storage::<Velocity>().unwrap().changed_tick_for(e),
             Some(2) // read-only → stays at its insert tick
         );
+    }
+
+    // -------- entity-as-data: Query<Entity> / Query<(Entity, …)> --------
+
+    #[test]
+    fn query_entity_yields_every_live_entity_including_componentless() {
+        let mut world = World::new();
+        let a = world.spawn().insert(Position(0, 0)).id();
+        let b = world.spawn().id(); // no components at all
+        let c = world.spawn().insert(Velocity(1, 1)).id();
+
+        let ids: Vec<Entity> = Query::<Entity>::from_world(&world).iter().collect();
+        assert_eq!(ids.len(), 3);
+        assert!(ids.contains(&a));
+        assert!(ids.contains(&b)); // yielded despite holding no components
+        assert!(ids.contains(&c));
+    }
+
+    #[test]
+    fn query_entity_excludes_already_despawned_entity() {
+        let (mut world, [a, b, c]) = world_with_three_movers();
+        world.despawn(b);
+        let ids: Vec<Entity> = Query::<Entity>::from_world(&world).iter().collect();
+        assert_eq!(ids, vec![a, c]); // slot-index order; b's slot is free
+    }
+
+    #[test]
+    fn query_entity_with_filter_keeps_only_matching() {
+        let mut world = World::new();
+        let m1 = world.spawn().insert(Position(1, 1)).insert(Marker).id();
+        let _plain = world.spawn().insert(Position(2, 2)).id(); // no Marker
+        let m2 = world.spawn().insert(Marker).id(); // Marker, no Position
+
+        // Entity drives off the live snapshot, then `With<Marker>` filters
+        // per entity — correct even though the marker isn't in the item.
+        let ids: Vec<Entity> = Query::<Entity, With<Marker>>::from_world(&world)
+            .iter()
+            .collect();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&m1));
+        assert!(ids.contains(&m2));
+    }
+
+    #[test]
+    fn query_entity_position_tuple_yields_id_and_component() {
+        let (world, [a, b, c]) = world_with_three_movers();
+        let mut pairs: Vec<(Entity, i32)> = Query::<(Entity, &Position)>::from_world(&world)
+            .iter()
+            .map(|(e, p)| (e, p.0))
+            .collect();
+        pairs.sort_by_key(|(_, x)| *x);
+        assert_eq!(pairs, vec![(a, 0), (b, 10), (c, 20)]);
+    }
+
+    #[test]
+    fn query_entity_mut_tuple_writes_through_and_reports_id() {
+        let (world, [a, _, _]) = world_with_three_movers();
+        {
+            let mut q = Query::<(Entity, &mut Position)>::from_world(&world);
+            for (e, mut p) in q.iter_mut() {
+                if e == a {
+                    p.0 = 999;
+                }
+            }
+        }
+        assert_eq!(world.get::<Position>(a).unwrap().0, 999);
+    }
+
+    #[test]
+    fn query_entity_arity_two_tuple_yields_id_and_both_components() {
+        let (world, _) = world_with_three_movers();
+        let rows: Vec<(Entity, i32, i32)> =
+            Query::<(Entity, &Position, &Velocity)>::from_world(&world)
+                .iter()
+                .map(|(e, p, v)| (e, p.0, v.0))
+                .collect();
+        assert_eq!(rows.len(), 3);
+        // The id in each row owns the components it's paired with.
+        for (e, px, _) in rows {
+            assert_eq!(world.get::<Position>(e).unwrap().0, px);
+        }
+    }
+
+    #[test]
+    fn query_entity_tuple_skips_entity_missing_a_component() {
+        let mut world = World::new();
+        let full = world
+            .spawn()
+            .insert(Position(1, 1))
+            .insert(Velocity(2, 2))
+            .id();
+        let _pos_only = world.spawn().insert(Position(3, 3)).id();
+        // Position drives; the Velocity-less entity is dropped by the join.
+        let ids: Vec<Entity> = Query::<(Entity, &Position, &Velocity)>::from_world(&world)
+            .iter()
+            .map(|(e, _, _)| e)
+            .collect();
+        assert_eq!(ids, vec![full]);
+    }
+
+    #[test]
+    fn query_entity_mixed_mut_tuple_writes_only_through_mut() {
+        let (world, _) = world_with_three_movers();
+        {
+            // Position drives (mut), Velocity is a read non-driver.
+            let mut q = Query::<(Entity, &mut Position, &Velocity)>::from_world(&world);
+            for (_e, mut p, v) in q.iter_mut() {
+                p.0 += v.0;
+            }
+        }
+        let xs: Vec<i32> = Query::<&Position>::from_world(&world)
+            .iter()
+            .map(|p| p.0)
+            .collect();
+        // a: 0+1, b: 10+0, c: 20+1
+        assert_eq!(xs, vec![1, 10, 21]);
+    }
+
+    #[test]
+    fn query_entity_tuple_as_system_param_via_into_system() {
+        let (world, [a, _, _]) = world_with_three_movers();
+        fn step(mut q: Query<(Entity, &mut Position)>) {
+            for (_e, mut p) in q.iter_mut() {
+                p.0 += 1;
+            }
+        }
+        let mut sys = IntoSystem::into_system(step);
+        sys(&world);
+        assert_eq!(world.get::<Position>(a).unwrap().0, 1);
+    }
+
+    #[test]
+    fn query_entity_tuple_for_in_ref_sugar_yields_id_and_component() {
+        let (world, _) = world_with_three_movers();
+        let q = Query::<(Entity, &Position)>::from_world(&world);
+        let mut count = 0;
+        for (e, p) in &q {
+            // The yielded id owns the yielded component.
+            assert_eq!(world.get::<Position>(e).unwrap().0, p.0);
+            count += 1;
+        }
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "conflicting access to component")]
+    fn query_entity_tuple_self_conflict_panics_naming_component() {
+        // Entity is invisible to the conflict check; the write+read of
+        // Position still collides and the panic names Position.
+        let mut world = World::new();
+        world.spawn().insert(Position(0, 0));
+        let _q = Query::<(Entity, &mut Position, &Position)>::from_world(&world);
+    }
+
+    #[test]
+    #[should_panic(expected = "conflicting access to component")]
+    fn query_entity_mut_with_same_component_filter_panics() {
+        // `With<Position>` reports a read; the `&mut Position` element
+        // writes it. Entity contributes nothing, so the conflict stands.
+        let mut world = World::new();
+        world.spawn().insert(Position(0, 0));
+        let _q = Query::<(Entity, &mut Position), With<Position>>::from_world(&world);
+    }
+
+    #[test]
+    fn query_entity_coexists_with_commands_and_snapshot_excludes_new_spawn() {
+        // The snapshot (taken when the query is fetched, before the body
+        // runs) is what lets `Query<Entity>` and `Commands` share a
+        // signature: the Vec releases the allocator borrow, so the later
+        // `cmd.spawn()`'s `borrow_mut` doesn't panic. The spawned id
+        // postdates the snapshot, so it is not yielded this frame.
+        //
+        // `IntoSystem` requires a `'static` body, so the observed state is
+        // shared into the closure via owned `Rc` clones rather than borrows.
+        let mut world = World::new();
+        let pre = world.spawn().id();
+
+        let seen = Rc::new(RefCell::new(Vec::<Entity>::new()));
+        let spawned = Rc::new(RefCell::new(None));
+        {
+            let seen = Rc::clone(&seen);
+            let spawned = Rc::clone(&spawned);
+            let observe = move |q: Query<Entity>, mut cmd: Commands| {
+                let fresh = cmd.spawn().id(); // allocated synchronously…
+                *spawned.borrow_mut() = Some(fresh);
+                for id in q.iter() {
+                    // …but the query walks the construction-time snapshot.
+                    seen.borrow_mut().push(id);
+                }
+            };
+            let mut sys = IntoSystem::into_system(observe);
+            sys(&world); // no "already borrowed" panic
+        }
+        world.flush_commands();
+
+        let seen = seen.borrow();
+        let spawned = spawned.borrow().unwrap();
+        assert_eq!(*seen, vec![pre]);
+        assert!(!seen.contains(&spawned));
+        assert!(world.is_alive(spawned)); // it really was created
+    }
+
+    #[test]
+    fn query_entity_snapshot_still_yields_commands_despawned_entity() {
+        // `Commands::despawn` is deferred to the next flush, so the doomed
+        // entity stays alive — and in the snapshot — for the rest of the
+        // frame, and is still yielded.
+        let mut world = World::new();
+        let doomed = world.spawn().id();
+        let other = world.spawn().id();
+
+        let seen = Rc::new(RefCell::new(Vec::<Entity>::new()));
+        {
+            let seen = Rc::clone(&seen);
+            let observe = move |q: Query<Entity>, mut cmd: Commands| {
+                cmd.despawn(doomed);
+                for id in q.iter() {
+                    seen.borrow_mut().push(id);
+                }
+            };
+            let mut sys = IntoSystem::into_system(observe);
+            sys(&world);
+        }
+        {
+            let captured = seen.borrow();
+            assert!(captured.contains(&doomed)); // deferred → still yielded
+            assert!(captured.contains(&other));
+        }
+        assert!(world.is_alive(doomed)); // not gone until flush
+
+        world.flush_commands();
+        assert!(!world.is_alive(doomed));
+    }
+
+    #[test]
+    fn query_entity_on_empty_world_yields_nothing() {
+        // The snapshot path must cope with zero live entities — an empty
+        // `Vec`, not a panic.
+        let world = World::new();
+        assert_eq!(Query::<Entity>::from_world(&world).iter().count(), 0);
+    }
+
+    #[test]
+    fn query_entity_fully_mut_tuple_writes_through_both_components() {
+        // `(Entity, &mut A, &mut B)` — the all-mut entity tuple. The
+        // non-driver `&mut B` goes through `DenseMut` under an entity
+        // prefix, a path no other entity test exercises.
+        let mut world = World::new();
+        let e = world
+            .spawn()
+            .insert(Position(1, 2))
+            .insert(Velocity(10, 20))
+            .id();
+        {
+            let mut q = Query::<(Entity, &mut Position, &mut Velocity)>::from_world(&world);
+            for (id, mut p, mut v) in q.iter_mut() {
+                assert_eq!(id, e);
+                p.0 += v.0; // 1 + 10 = 11
+                v.0 = 0;
+            }
+        }
+        assert_eq!(world.get::<Position>(e).unwrap().0, 11);
+        assert_eq!(world.get::<Velocity>(e).unwrap().0, 0);
+    }
+
+    #[test]
+    fn query_entity_arity_three_component_read_tuple_joins_and_skips() {
+        // `(Entity, &A, &B, &C)` — the widest entity tuple, and the only
+        // shape that exercises `impl_all_tuple_entity!(A, B, C)`'s
+        // `ReadOnlyQueryData` arm. Also drives the `for … in &q` sugar on a
+        // 3-component entity tuple (its `iter_ref` body).
+        let mut world = World::new();
+        let full = world.spawn().insert(A(1)).insert(B(2)).insert(C(3)).id();
+        world.spawn().insert(A(9)).insert(B(9)); // no C — join must skip it
+
+        let rows: Vec<(Entity, i32, i32, i32)> = Query::<(Entity, &A, &B, &C)>::from_world(&world)
+            .iter()
+            .map(|(id, a, b, c)| (id, a.0, b.0, c.0))
+            .collect();
+        assert_eq!(rows, vec![(full, 1, 2, 3)]);
+
+        // `&q` sugar over the same shape — id owns the components it's with.
+        let q = Query::<(Entity, &A, &B, &C)>::from_world(&world);
+        let mut count = 0;
+        for (id, a, _b, _c) in &q {
+            assert_eq!(world.get::<A>(id).unwrap().0, a.0);
+            count += 1;
+        }
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn query_entity_tuple_for_in_mut_sugar_writes_through() {
+        // `for … in &mut q` over an entity tuple — the `IntoIterator for
+        // &mut Query` path (`iter`), distinct from the `&q` (`iter_ref`)
+        // path the read tests cover.
+        let (world, _) = world_with_three_movers();
+        {
+            let mut q = Query::<(Entity, &mut Position)>::from_world(&world);
+            for (id, mut p) in &mut q {
+                assert!(world.is_alive(id)); // the threaded id is a live handle
+                p.0 += 1;
+            }
+        }
+        let xs: Vec<i32> = Query::<&Position>::from_world(&world)
+            .iter()
+            .map(|p| p.0)
+            .collect();
+        assert_eq!(xs, vec![1, 11, 21]);
+    }
+
+    #[test]
+    #[should_panic(expected = "conflicting access to component")]
+    fn query_entity_double_mut_same_type_panics() {
+        // Write+write of the same component, behind an Entity prefix: the
+        // entity-prefixed `collect_access` must still report both writes so
+        // the self-conflict check fires (proves no `access_call!` was
+        // dropped in the entity macro expansion).
+        let mut world = World::new();
+        world.spawn().insert(Position(0, 0));
+        let _q = Query::<(Entity, &mut Position, &mut Position)>::from_world(&world);
+    }
+
+    #[test]
+    fn query_entity_tuple_without_filter_excludes_marked_entities() {
+        // Filter threading through an entity tuple: the outer (threaded) id
+        // the filter tests must be the driver's entity, so `Without<Marker>`
+        // drops the marked one and the surviving id/value pair is correct.
+        let mut world = World::new();
+        let plain = world.spawn().insert(Position(1, 1)).id();
+        let _marked = world.spawn().insert(Position(2, 2)).insert(Marker).id();
+
+        let rows: Vec<(Entity, i32)> =
+            Query::<(Entity, &Position), Without<Marker>>::from_world(&world)
+                .iter()
+                .map(|(e, p)| (e, p.0))
+                .collect();
+        assert_eq!(rows, vec![(plain, 1)]);
+    }
+
+    #[test]
+    fn query_entity_read_tuple_iter_and_iter_mut_agree() {
+        // `.iter()` on an all-read entity tuple takes the `@readonly`
+        // `iter_ref` path; `.iter_mut()` takes the `@gen` `iter` path. They
+        // are distinct macro expansions and must yield identical pairs — the
+        // only test that exercises `@gen` for an *all-read* entity tuple.
+        let (world, [a, b, c]) = world_with_three_movers();
+
+        let via_iter: Vec<(Entity, i32)> = Query::<(Entity, &Position)>::from_world(&world)
+            .iter()
+            .map(|(e, p)| (e, p.0))
+            .collect();
+        let mut q = Query::<(Entity, &Position)>::from_world(&world);
+        let via_iter_mut: Vec<(Entity, i32)> = q.iter_mut().map(|(e, p)| (e, p.0)).collect();
+
+        assert_eq!(via_iter, via_iter_mut);
+        assert_eq!(via_iter, vec![(a, 0), (b, 10), (c, 20)]);
+    }
+
+    #[test]
+    fn query_entity_tuple_excludes_immediately_despawned_entity() {
+        // `world.despawn` (immediate, unlike `Commands::despawn`) removes
+        // components before freeing the slot, so a tuple query built after it
+        // drives off a storage that no longer holds the despawned entity.
+        // Pins that despawn-ordering invariant for the entity-tuple path.
+        let (mut world, [a, b, c]) = world_with_three_movers();
+        world.despawn(b);
+        let pairs: Vec<(Entity, i32)> = Query::<(Entity, &Position)>::from_world(&world)
+            .iter()
+            .map(|(e, p)| (e, p.0))
+            .collect();
+        assert_eq!(pairs, vec![(a, 0), (c, 20)]); // b gone (swap-removed)
+    }
+
+    #[test]
+    fn query_entity_tuple_for_unknown_component_yields_empty() {
+        // `Marker` storage was never created — the entity-prefixed driver
+        // must reach the `None` arm of `drive_iter!` and yield empty, not
+        // panic (a distinct macro path from the join-skip case).
+        let mut world = World::new();
+        world.spawn().insert(Position(0, 0));
+        let q = Query::<(Entity, &Marker)>::from_world(&world);
+        assert_eq!(q.iter().count(), 0);
+        let mut q_mut = Query::<(Entity, &mut Marker)>::from_world(&world);
+        assert_eq!(q_mut.iter_mut().count(), 0);
+    }
+
+    #[test]
+    fn query_entity_after_respawn_yields_new_generation_not_stale() {
+        // The snapshot must carry each slot's *current* generation: after a
+        // despawn+respawn into the same slot, `Query<Entity>` yields the new
+        // handle and not the stale one.
+        let mut world = World::new();
+        let a = world.spawn().id(); // slot 0, gen 0
+        world.despawn(a);
+        let b = world.spawn().id(); // slot 0 reused, gen 1
+        assert_eq!(a.index, b.index);
+        assert_ne!(a, b);
+
+        let ids: Vec<Entity> = Query::<Entity>::from_world(&world).iter().collect();
+        assert_eq!(ids, vec![b]);
+        assert!(!ids.contains(&a)); // stale handle excluded
     }
 }

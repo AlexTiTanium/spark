@@ -276,6 +276,52 @@ impl EntityAllocator {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Iterates every currently-live [`Entity`] in **slot-index order**.
+    ///
+    /// Walks the `alive` bitmap once and yields a handle for each set
+    /// slot, pairing the slot index with its current `generation`. The
+    /// borrow of `self` lives as long as the returned iterator — to
+    /// snapshot the set free of that borrow (e.g. so a concurrent
+    /// [`allocate`](Self::allocate) can run), `.collect()` it, as
+    /// `World::live_entities` does.
+    ///
+    /// # Why slot-index order
+    ///
+    /// Iteration is `0, 1, 2, …` over the slot space, independent of
+    /// *when* each entity was allocated or how the free list churned.
+    /// That determinism is what the engine's "no `HashMap` iteration in
+    /// sim systems" rule needs: identical world states yield identical
+    /// `Query<Entity>` orderings, leaving save/replay/multiplayer on the
+    /// table. It is **not** allocation order — a slot reused after a
+    /// destroy keeps its low index, so its (new-generation) entity sorts
+    /// ahead of entities in higher slots allocated earlier.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use spark_ecs::EntityAllocator;
+    ///
+    /// let mut alloc = EntityAllocator::new();
+    /// let a = alloc.allocate();   // slot 0
+    /// let b = alloc.allocate();   // slot 1
+    /// alloc.destroy(a);
+    /// let c = alloc.allocate();   // reuses slot 0, fresh generation
+    ///
+    /// // Slot order: c (slot 0) precedes b (slot 1), though c is younger.
+    /// let live: Vec<_> = alloc.live().collect();
+    /// assert_eq!(live, vec![c, b]);
+    /// ```
+    pub fn live(&self) -> impl Iterator<Item = Entity> + '_ {
+        // Zip a `u32` slot counter against the parallel `alive` / `generation`
+        // arrays and walk all three in lockstep. Lockstep iteration (rather
+        // than indexing `generation[i]`) carries no per-slot bounds check, and
+        // the `u32` counter sidesteps a `usize -> u32` cast — `allocate` caps
+        // the slot space at `u32::MAX`, so the counter never overruns.
+        (0u32..).zip(&self.alive).zip(&self.generation).filter_map(
+            |((index, &alive), &generation)| alive.then_some(Entity { index, generation }),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -329,6 +375,32 @@ mod tests {
             generation: 0,
         };
         assert!(!alloc.is_alive(phantom));
+    }
+
+    #[test]
+    fn live_yields_every_alive_handle_in_slot_order() {
+        let mut alloc = EntityAllocator::new();
+        let a = alloc.allocate(); // slot 0
+        let b = alloc.allocate(); // slot 1
+        let c = alloc.allocate(); // slot 2
+        assert_eq!(alloc.live().collect::<Vec<_>>(), vec![a, b, c]);
+
+        // Destroying slot 1 drops b out; order of the survivors is stable.
+        alloc.destroy(b);
+        assert_eq!(alloc.live().collect::<Vec<_>>(), vec![a, c]);
+
+        // Reusing slot 1 puts the new tenant back at index 1 — slot order,
+        // not allocation order — with a bumped generation distinct from b.
+        let d = alloc.allocate();
+        assert_eq!(d.index, b.index);
+        assert_ne!(d, b);
+        assert_eq!(alloc.live().collect::<Vec<_>>(), vec![a, d, c]);
+    }
+
+    #[test]
+    fn live_on_empty_allocator_yields_nothing() {
+        let alloc = EntityAllocator::new();
+        assert_eq!(alloc.live().count(), 0);
     }
 
     #[test]

@@ -14,12 +14,12 @@ use spark_core::{Application, Plugin, Stage};
 
 use super::change_detection::ChangeDetectionPlugin;
 use super::filters::{
-    and_filter, bump_powered_capacity, filtered_join, nested_filter, or_filter, spawn_filter_demo,
-    with_filter, without_filter,
+    and_filter, building_ids, bump_powered_capacity, filtered_join, nested_filter, or_filter,
+    powered_building_ids, spawn_filter_demo, with_filter, without_filter,
 };
 use super::systems::{
-    decay_health, physics_step, player_regen, report_initial, report_player_position,
-    report_tick_summary, spawn_demo,
+    decay_health, physics_step, player_regen, report_entity_ids, report_initial,
+    report_player_position, report_tick_summary, spawn_demo,
 };
 
 /// Plugin that wires the ECS sub-sandbox into an [`Application`].
@@ -52,6 +52,7 @@ impl Plugin for EcsSandboxPlugin {
         // (-5 from decay, +2 from regen → net -3).
         app.add_system(Stage::Startup, spawn_demo)
             .add_system(Stage::PreUpdate, report_initial)
+            .add_system(Stage::PreUpdate, report_entity_ids)
             .add_system(Stage::Update, physics_step)
             .add_system(Stage::Update, decay_health)
             .add_system(Stage::Update, player_regen)
@@ -73,7 +74,11 @@ impl Plugin for EcsSandboxPlugin {
             .add_system(Stage::PreUpdate, or_filter)
             .add_system(Stage::PreUpdate, nested_filter)
             .add_system(Stage::PreUpdate, filtered_join)
-            .add_system(Stage::PreUpdate, bump_powered_capacity);
+            .add_system(Stage::PreUpdate, bump_powered_capacity)
+            // Entity-as-data under a filter: ids of the building roster, and
+            // id + name of just the powered buildings.
+            .add_system(Stage::PreUpdate, building_ids)
+            .add_system(Stage::PreUpdate, powered_building_ids);
 
         // ----- Change-detection demo (`Changed<T>` / `Added<T>`) -----
         //
