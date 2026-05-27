@@ -3059,6 +3059,13 @@ mod tests {
         // borrowed" panic now fires at *construction*, before iteration.
         // The query is nonsensical (it could never yield anything), but the
         // failure mode is exactly what `Without`'s no-access decision implies.
+        //
+        // REGRESSION GUARD — there is deliberately **no** `iter`/`iter_mut`
+        // call below: the panic must come from `from_world` itself. If a
+        // future refactor moves filter-state fetching back to a per-iter
+        // local, construction stops borrowing the cell, this body no longer
+        // panics, and `#[should_panic]` fails loudly — pinning the panic
+        // *point*, not just the message. Do not add an `iter` call here.
         let mut world = World::new();
         world.spawn().insert(Position(1, 1));
         let _q = Query::<&mut Position, Without<Position>>::from_world(&world);
