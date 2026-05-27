@@ -4112,6 +4112,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dense_join_aliasing_stress_writes_each_slot_once() {
+        // Many-entity `(&mut A, &mut B)` join: the non-driver `&mut B` is
+        // fetched per entity through `DenseMut::get`, the crate's only
+        // `unsafe fn`. Writing through *both* handles on every iteration
+        // exercises the "each dense slot is handed out at most once"
+        // contract at scale — the property the crate-scoped Miri job
+        // (`cargo +nightly miri test -p spark-ecs`) machine-checks against
+        // raw-pointer aliasing. A double-borrow of one slot, or an
+        // off-by-one in the dense-index lookup the `query/` split touches,
+        // surfaces here as a Miri error or a wrong post-condition rather
+        // than as silent UB.
+        let mut world = World::new();
+        let mut ids = Vec::new();
+        for i in 0..256 {
+            ids.push(world.spawn().insert(A(i)).insert(B(i * 10)).id());
+        }
+
+        let mut q = Query::<(&mut A, &mut B)>::from_world(&world);
+        let mut visited = 0usize;
+        for (mut a, mut b) in q.iter_mut() {
+            a.0 += 1;
+            b.0 += 1;
+            visited += 1;
+        }
+        // Release the query's exclusive storage borrows before reading back.
+        drop(q);
+        assert_eq!(visited, ids.len(), "every A∩B entity visited exactly once");
+
+        // Each slot written exactly once: A(i) → i + 1, B(i * 10) → i * 10 + 1.
+        // A second write to any slot (the aliasing bug this guards) would
+        // show up as `+ 2` here.
+        for (i, &e) in ids.iter().enumerate() {
+            let i = i32::try_from(i).unwrap();
+            assert_eq!(world.get::<A>(e).unwrap().0, i + 1);
+            assert_eq!(world.get::<B>(e).unwrap().0, i * 10 + 1);
+        }
+    }
+
     // -------- Query filters: Query<D, F> --------
 
     #[test]

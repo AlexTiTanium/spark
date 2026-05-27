@@ -5,7 +5,7 @@
 //!
 //! These exercise only the public API, the way a plugin would.
 
-use spark_ecs::{ResMut, Resource, Schedule, WorkloadLabel, World};
+use spark_ecs::{Component, Query, ResMut, Resource, Schedule, WorkloadLabel, World};
 
 /// Records the order systems run in, so a test can assert it.
 #[derive(Resource, Default)]
@@ -493,4 +493,80 @@ fn registering_a_label_twice_is_rejected() {
     });
     assert!(message.contains("registered twice"), "{message}");
     assert!(message.contains("Grid::Supply"), "{message}");
+}
+
+// ── component-access batching (issue #80 Phase 0) ───────────────────────
+//
+// The conflict-policy and resource-conflict tests above prove the
+// *registration-error* side of access. These pin the other side: how
+// component query access (`QueryAccess`) drives the access-disjoint
+// batcher the M4 parallel executor leans on — the contract this refactor
+// must not perturb.
+
+/// A component two systems can read or write to provoke / avoid a conflict.
+#[derive(Component)]
+struct Pos(i32);
+
+#[test]
+fn conflicting_component_access_forces_separate_batches() {
+    // `&mut Pos` (writer) and `&Pos` (reader) conflict on `Pos`'s storage,
+    // so the batcher must place them in *different* batches — same-batch
+    // means parallel-safe, which a write/read pair is not.
+    //
+    // `.any_order_with` only silences the conflict-*policy* error; it adds
+    // no ordering edge. So the separation observed here is the
+    // access-conflict arm of `build_batches` (via `QueryAccess`
+    // compatibility) at work, not a hand-declared `.after`.
+    #[derive(WorkloadLabel)]
+    enum W {
+        Tick,
+    }
+
+    let mut schedule = Schedule::new();
+    schedule.add_workload(W::Tick, |w| {
+        let writer = w.add_system(|mut q: Query<&mut Pos>| {
+            for mut p in q.iter_mut() {
+                p.0 += 1;
+            }
+        });
+        // Read-only system params (here `Query<&Pos>`) are taken by value per
+        // the `SystemParam` contract, so a closure dodges the pedantic
+        // `needless_pass_by_value` a named fn would trip — the crate's idiom.
+        w.add_system(|q: Query<&Pos>| {
+            let _ = q.iter().count();
+        })
+        .any_order_with(writer);
+    });
+
+    let batches = schedule.batches(W::Tick);
+    assert_eq!(batches.len(), 2, "write/read conflict ⇒ two batches");
+    assert_eq!(batches[0].len(), 1);
+    assert_eq!(batches[1].len(), 1);
+}
+
+#[test]
+fn disjoint_component_readers_share_one_batch() {
+    // Control for the test above: two read-only `Query<&Pos>` systems do
+    // not conflict (read/read is compatible), so the batcher keeps them in
+    // a single shared batch — they could run in parallel.
+    #[derive(WorkloadLabel)]
+    enum W {
+        Tick,
+    }
+
+    let mut schedule = Schedule::new();
+    schedule.add_workload(W::Tick, |w| {
+        // Two independent read-only systems, no declared order. Compatible
+        // access ⇒ the batcher leaves them together.
+        w.add_system(|q: Query<&Pos>| {
+            let _ = q.iter().count();
+        });
+        w.add_system(|q: Query<&Pos>| {
+            let _ = q.iter().count();
+        });
+    });
+
+    let batches = schedule.batches(W::Tick);
+    assert_eq!(batches.len(), 1, "read/read ⇒ one shared batch");
+    assert_eq!(batches[0].len(), 2);
 }

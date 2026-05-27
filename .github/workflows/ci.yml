@@ -47,6 +47,28 @@ jobs:
       - run: cargo build --all-targets --all-features
       - run: cargo test --all-features --no-fail-fast
 
+  # Machine-checks the one `unsafe fn` in the crate — `DenseMut::get`,
+  # which hands out `&mut T` into a storage's dense array by raw pointer —
+  # under Miri's Stacked/Tree Borrows model. A double-borrow of one dense
+  # slot (the "fetched at most once" invariant) surfaces here as a hard
+  # error instead of silent UB. Scoped to `spark-ecs` to bound CI time
+  # (Miri interprets every operation); this is the only crate with `unsafe`.
+  # It also seeds the M4 baseline for the `UnsafeCell` switchover.
+  miri:
+    name: Miri (spark-ecs)
+    runs-on: ubuntu-latest
+    env:
+      # Decouple from nightly lint drift: this job is about UB detection,
+      # not warnings (clippy/test enforce those on the pinned stable).
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo +nightly miri test -p spark-ecs
+
   # Enforces the rule from CLAUDE.md: any PR that touches a crate's
   # `src/` must also update that crate's `README.md`, or include an
   # explicit `README-skip: <crate>: <reason>` line in the PR body.
