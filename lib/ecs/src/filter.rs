@@ -390,9 +390,12 @@ pub struct Changed<T>(PhantomData<T>);
 ///
 /// # Window
 ///
-/// `current` is a true upper bound on both `tick` and `baseline` (the clock
-/// only ever advances), so the wrapping subtractions are exact for any
-/// baseline staleness below a full `u32` lap — 2³² ticks — which the
+/// `current` is a true upper bound on both `tick` and `baseline` in the
+/// *wrapping* sense — the clock only ever advances, so every stamped tick
+/// and parked baseline is at most one lap behind `current` (it may be
+/// numerically larger after a wrap). The wrapping subtractions are therefore
+/// exact for any baseline staleness below a full `u32` lap — 2³² ticks —
+/// which the
 /// single-threaded frame model never reaches. A known upper bound buys the
 /// **full** range, wider than the conventional half-range (2³¹)
 /// serial-arithmetic window. The sole residual false-negative is a complete

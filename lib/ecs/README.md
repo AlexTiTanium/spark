@@ -1399,8 +1399,8 @@ Option<&T>         // fetch T if present, give None otherwise; never gates the r
 Option<&mut T>     // mutable variant; trailing element of a required-first tuple
 
 // — ARITY 6+ —                       follow-up (one line per arity)
-// Add `impl_all_tuple!(A, B, C, D, E, F);` in query.rs to unlock all
-// 64 `&` / `&mut` combinations at arity 6. Pure mechanical extension —
+// Add `impl_all_tuple!(A, B, C, D, E, F);` in query/tuple_codegen.rs to
+// unlock all 64 `&` / `&mut` combos at arity 6. Pure mechanical extension —
 // but monomorphisation cost doubles per step, weigh against need.
 ```
 
@@ -1449,7 +1449,7 @@ also fetched once at construction.
 > `Query<(&mut A, &A)>`, and the reversed `Query<(&A, &mut A)>` panic
 > at `from_world` with a precise message rather than tripping the
 > `RefCell` "already borrowed" later. To unlock arity 6+, add one
-> `impl_all_tuple!(A, B, C, D, E, F);` line in `query.rs` — the
+> `impl_all_tuple!(A, B, C, D, E, F);` line in `query/tuple_codegen.rs` — the
 > Cartesian-product macro generates every combination automatically,
 > though monomorphisation cost doubles per step.
 

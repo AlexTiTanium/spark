@@ -604,6 +604,10 @@ macro_rules! impl_one_combo {
 // own driver — its first-slot-required / `y`-`n` sentinel logic is not a
 // plain R/W product.
 macro_rules! cartesian_rw {
+    // `@start` is a tt-muncher sentinel: it keeps the base-case pattern from
+    // greedily matching the type-ident list on the *initial* call (the
+    // accumulator `[$($acc)*]` alone would be ambiguous against trailing
+    // idents). Both call sites and every recursive arm re-tag with `@start`.
     ($leaf:ident, @start [$($acc:tt)*]) => {
         $leaf!($($acc)*);
     };
