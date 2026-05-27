@@ -914,7 +914,7 @@ Three parameter types ship today:
 |-|-|
 | `Res<T>` | Immutable borrow of resource `T`. Derefs to `&T`. |
 | `ResMut<T>` | Mutable borrow of resource `T`. Derefs to `&mut T`. |
-| `Query<D, F>` | Walks every entity matching the data shape `D` (a single `&T`/`&mut T` or a tuple of those), optionally narrowed by a filter `F` (`With`/`Without`/`And`/`Or`; defaults to no filter). See *Walking entities with `Query<D>`* below. |
+| `Query<D, F>` | Walks every entity matching the data shape `D` (a single `&T`/`&mut T`, a standalone `Option<&T>`/`Option<&mut T>`, or a required-first tuple whose trailing elements may be `Option<&T>`/`Option<&mut T>`), optionally narrowed by a filter `F` (`With`/`Without`/`And`/`Or`; defaults to no filter). See *Walking entities with `Query<D>`* below. |
 
 The wrapper supports arities 0..=4. Adding a fifth would mean adding
 one more line to the `impl_into_system!` macro list.
@@ -1702,6 +1702,7 @@ drives whether `Plant` is written first or second.
 | `Query<&A, Without<B>>` | O(\|A\|) + one sparse lookup per item (`Without` offers no candidate) |
 | `Query<&A, And<(With<B>, With<C>)>>` | O(smallest of \|A\|, \|B\|, \|C\|) + one sparse lookup per filter term per item |
 | `Query<(&A, Option<&T>)>` | O(\|A\|) — the required element drives; `Option` adds one sparse lookup per item but never gates |
+| `Query<Option<&T>>` | O(live entities) — no required element, so it walks the live-set snapshot like `Query<Entity>` |
 
 Filters are essentially free: each filter borrows its storage **once at
 query construction** (in `init_state`, stored for the query's lifetime),
