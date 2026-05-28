@@ -70,6 +70,7 @@ impl<'a, T> Mut<'a, T> {
     /// Wraps a component slot and its `changed_tick` for change detection.
     /// Crate-internal: only the storage / query layers know the slot is
     /// kept in lockstep with `dense`.
+    #[inline]
     pub(crate) fn new(value: &'a mut T, changed_tick: &'a mut u32, current_tick: u32) -> Self {
         Self {
             value,
@@ -82,12 +83,14 @@ impl<'a, T> Mut<'a, T> {
 impl<T> Deref for Mut<'_, T> {
     type Target = T;
 
+    #[inline]
     fn deref(&self) -> &T {
         self.value
     }
 }
 
 impl<T> DerefMut for Mut<'_, T> {
+    #[inline]
     fn deref_mut(&mut self) -> &mut T {
         // Taking the mutable borrow is the change signal.
         *self.changed_tick = self.current_tick;
@@ -451,6 +454,26 @@ impl<T: Component> ComponentStorage<T> {
         Some(&mut self.dense[dense_idx])
     }
 
+    /// Returns a change-marking [`Mut`] handle to `entity`'s component, or
+    /// `None` if absent / stale — the single-entity counterpart of
+    /// [`iter_mut`](Self::iter_mut), and the path
+    /// [`Query::get_mut`](crate::Query::get_mut) takes for one-off fetches so
+    /// precise change detection survives outside iteration.
+    ///
+    /// The returned [`Mut`] stamps `changed_tick` only on a write through
+    /// [`DerefMut`](std::ops::DerefMut); dropping the handle without writing
+    /// marks nothing — same precision contract as `iter_mut`.
+    #[inline]
+    pub(crate) fn get_mut_handle(&mut self, entity: Entity) -> Option<Mut<'_, T>> {
+        let dense_idx = self.dense_idx_of(entity)?;
+        let tick = self.current_tick;
+        Some(Mut::new(
+            &mut self.dense[dense_idx],
+            &mut self.changed_tick[dense_idx],
+            tick,
+        ))
+    }
+
     /// Iterates `(Entity, &T)` pairs in dense (packed) order.
     ///
     /// Iteration walks `dense` directly, so it's O(n) over live
@@ -667,6 +690,7 @@ impl<T: Component> ComponentStorage<T> {
     /// Resolves the dense index for `entity` if it's live in this
     /// storage. Checks both the sparse pointer *and* the generation
     /// via `entity_index` to reject stale handles.
+    #[inline]
     fn dense_idx_of(&self, entity: Entity) -> Option<usize> {
         let dense_idx = (*self.sparse.get(entity.index as usize)?)? as usize;
         if self.entity_index[dense_idx] != entity {

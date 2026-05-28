@@ -383,6 +383,40 @@ macro_rules! slice_ro {
     };
 }
 
+/// Per-element lookup for the random-access [`QueryData::lookup_mut`] path —
+/// the single-entity counterpart of `non_driver_lookup!`'s join-time
+/// machinery, but reaching into the *state* directly (no `DenseMut` view) so a
+/// single fetch carries no driver-scan setup.
+///
+/// - `R`: safe `storage.get(entity)?`. Stale handles fail the per-storage
+///   generation check and short-circuit the tuple to `None`.
+/// - `W`: safe [`ComponentStorage::get_mut_handle`], the precise (deref-marked)
+///   single-fetch counterpart of `iter_mut`. The `&mut self` on
+///   [`Query::get_mut`](crate::Query::get_mut) is the aliasing proof: the
+///   returned `Mut` borrows from `state`, so a second `get_mut` cannot start
+///   while the first is live, and a single `lookup_mut` call touches each
+///   component's storage at most once. The self-conflict check ruled out a
+///   duplicate component already, so distinct elements hit distinct storages.
+///   (The iteration path takes the `DenseMut` route instead — it lacks the
+///   `&mut self` proof and must rely on the structural driver-scan argument.)
+/// - `O` / `OW`: drop the `?` so a missing optional yields a `None` *value*
+///   instead of skipping the row, exactly as in the iteration path. The `OW`
+///   arm inherits the `W` arm's safety argument unchanged.
+macro_rules! lookup_mut_one {
+    (R, $state:expr, $entity:expr) => {
+        $state.as_ref()?.get($entity)?
+    };
+    (W, $state:expr, $entity:expr) => {
+        $state.as_mut()?.get_mut_handle($entity)?
+    };
+    (O, $state:expr, $entity:expr) => {
+        $state.as_ref().and_then(|s| s.get($entity))
+    };
+    (OW, $state:expr, $entity:expr) => {
+        $state.as_mut().and_then(|s| s.get_mut_handle($entity))
+    };
+}
+
 // ---- impl_one_combo: one impl per flag sequence ----------------------
 //
 // Takes a sequence `$flag $T,` of `R`/`W` flags paired with type idents.
@@ -504,6 +538,23 @@ macro_rules! impl_one_combo {
                         ),
                     ))
                 }))
+            }
+
+            #[allow(non_snake_case)]
+            fn lookup_mut<'s, 'w>(
+                state: &'s mut Self::State<'w>,
+                entity: Entity,
+            ) -> Option<Self::Item<'s>>
+            where
+                Self: 's,
+                Self: 'w,
+                'w: 's,
+            {
+                let ($First, $($Rest,)+) = state;
+                Some((
+                    lookup_mut_one!($first_flag, $First, entity),
+                    $(lookup_mut_one!($rest_flag, $Rest, entity),)+
+                ))
             }
         }
     };
@@ -761,6 +812,27 @@ macro_rules! impl_one_combo_opt {
                         ),
                     ))
                 }))
+            }
+
+            #[allow(non_snake_case)]
+            fn lookup_mut<'s, 'w>(
+                state: &'s mut Self::State<'w>,
+                entity: Entity,
+            ) -> Option<Self::Item<'s>>
+            where
+                Self: 's,
+                Self: 'w,
+                'w: 's,
+            {
+                // First slot is required, so its `?` short-circuits a stale /
+                // missing-required `entity` to `None`. Optionals contribute a
+                // `None` value without dropping the row — same shape `iter`
+                // yields for the entity.
+                let ($First, $($Rest,)+) = state;
+                Some((
+                    lookup_mut_one!($first_flag, $First, entity),
+                    $(lookup_mut_one!($rest_flag, $Rest, entity),)+
+                ))
             }
         }
     };
@@ -1035,6 +1107,28 @@ macro_rules! impl_one_combo_entity {
                         ),
                     ))
                 }))
+            }
+
+            #[allow(non_snake_case)]
+            fn lookup_mut<'s, 'w>(
+                state: &'s mut Self::State<'w>,
+                entity: Entity,
+            ) -> Option<Self::Item<'s>>
+            where
+                Self: 's,
+                Self: 'w,
+                'w: 's,
+            {
+                // First *component* is required, so its `?` rejects stale or
+                // missing-required `entity`. The leading `Entity` rides the
+                // id the caller asked for; it adds no extra alive-check (the
+                // component's generation check did that work).
+                let ($First, $($Rest,)*) = state;
+                Some((
+                    entity,
+                    lookup_mut_one!($first_flag, $First, entity),
+                    $(lookup_mut_one!($rest_flag, $Rest, entity),)*
+                ))
             }
         }
     };

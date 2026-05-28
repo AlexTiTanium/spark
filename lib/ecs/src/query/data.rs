@@ -21,6 +21,31 @@ use crate::world::World;
 use super::DriveSource;
 use super::dense_mut::DenseMut;
 
+/// `O(log n)` membership test on a live-entity snapshot.
+///
+/// # Correctness invariants
+///
+/// Two structural properties from outside this function make the binary
+/// search sound:
+///
+/// 1. `World::live_entities` returns the snapshot sorted by `Entity::index`
+///    (it walks the [`EntityAllocator::live`](crate::EntityAllocator::live)
+///    bitmap in slot order). The `binary_search` relies on this ordering.
+/// 2. At any one moment, no two live entities share an `index` — slots are
+///    single-tenanted, so a hit uniquely identifies the slot. The final
+///    `snapshot[i] == entity` compare then catches a stale handle whose
+///    `generation` differs from the live tenant's.
+///
+/// Called from the three standalone-no-required-component impls (`Entity`,
+/// `Option<&T>`, `Option<&mut T>`), which have no component generation check
+/// to lean on for aliveness.
+#[inline]
+fn entity_in_snapshot(snapshot: &[Entity], entity: Entity) -> bool {
+    snapshot
+        .binary_search_by_key(&entity.index, |e| e.index)
+        .is_ok_and(|i| snapshot[i] == entity)
+}
+
 /// Type-level description of what a [`Query`] fetches.
 ///
 /// Implementors define [`Item`](Self::Item) — the value yielded per
@@ -121,6 +146,30 @@ pub trait QueryData {
     {
         Self::iter(state)
     }
+
+    /// Per-entity lookup — the random-access counterpart of
+    /// [`iter`](Self::iter), used by [`Query::get_mut`](crate::Query::get_mut)
+    /// to fetch a single entity instead of walking a driver.
+    ///
+    /// Returns the same shape `iter` would yield for `entity`. `None` means
+    /// any required component is missing, or `entity` is despawned / stale /
+    /// never-allocated; the per-storage generation check rejects stale
+    /// handles, and the standalone-no-required impls
+    /// ([`Entity`], [`Option<&T>`], [`Option<&mut T>`]) verify membership in
+    /// the live snapshot they hold in `State`.
+    ///
+    /// `&'s mut Self::State` is what makes `&mut T` items expressible — same
+    /// reason [`iter`](Self::iter) takes the same. For read-only shapes the
+    /// `&mut` is just structural; the impl returns the same item
+    /// [`ReadOnlyQueryData::lookup`] would. A uniform `&mut State` signature
+    /// across every impl is what lets the tuple codegen's `lookup_mut_one!`
+    /// macro expand one body for both `R` and `W` flag arms — without it,
+    /// the codegen would need a `&` vs `&mut` branch per shape.
+    fn lookup_mut<'s, 'w>(state: &'s mut Self::State<'w>, entity: Entity) -> Option<Self::Item<'s>>
+    where
+        Self: 's,
+        Self: 'w,
+        'w: 's;
 }
 
 /// [`QueryData`] that borrows nothing mutably — the marker that gates
@@ -246,6 +295,16 @@ impl<T: Component> QueryData for &T {
             },
         }
     }
+
+    #[inline]
+    fn lookup_mut<'s, 'w>(state: &'s mut Self::State<'w>, entity: Entity) -> Option<&'s T>
+    where
+        Self: 's,
+        Self: 'w,
+        'w: 's,
+    {
+        state.as_ref().and_then(|s| s.get(entity))
+    }
 }
 
 impl<T: Component> ReadOnlyQueryData for &T {
@@ -263,6 +322,7 @@ impl<T: Component> ReadOnlyQueryData for &T {
         }
     }
 
+    #[inline]
     fn lookup<'s, 'w>(state: &'s Self::State<'w>, entity: Entity) -> Option<&'s T>
     where
         Self: 's,
@@ -366,6 +426,16 @@ impl<T: Component> QueryData for &mut T {
             },
         }
     }
+
+    #[inline]
+    fn lookup_mut<'s, 'w>(state: &'s mut Self::State<'w>, entity: Entity) -> Option<Mut<'s, T>>
+    where
+        Self: 's,
+        Self: 'w,
+        'w: 's,
+    {
+        state.as_mut().and_then(|s| s.get_mut_handle(entity))
+    }
 }
 
 // No ReadOnlyQueryData for &mut T — that's the entire point of the split.
@@ -404,7 +474,10 @@ impl<T: Component> QueryData for &mut T {
 /// *Snapshot semantics* section): it is frozen at query construction, so an
 /// entity `Commands::despawn`'d mid-iteration is still yielded (despawn is
 /// deferred) and one `Commands::spawn`'d after construction is not. In a join
-/// the optional rides the driver and the snapshot is unused.
+/// the optional rides the driver and the snapshot is unused by the iteration
+/// path — for standalone `Query::get` / `Query::get_mut` the snapshot also
+/// gates aliveness (the only such gate available with no required component
+/// to fall back on).
 ///
 /// # Examples
 ///
@@ -548,6 +621,20 @@ impl<T: Component> QueryData for Option<&T> {
             DriveSource::Data(_) => <Self as QueryData>::iter(state),
         }
     }
+
+    #[inline]
+    fn lookup_mut<'s, 'w>(state: &'s mut Self::State<'w>, entity: Entity) -> Option<Option<&'s T>>
+    where
+        Self: 's,
+        Self: 'w,
+        'w: 's,
+    {
+        // Standalone — alive-check via the frozen snapshot, same contract as
+        // the read mirror below. The `&mut` on `state` is structural only
+        // (the inner `Ref` is shared), so reborrow and forward — keeps the
+        // mut and read paths byte-identical and lockstep with `Query::get`.
+        <Self as ReadOnlyQueryData>::lookup(&*state, entity)
+    }
 }
 
 impl<T: Component> ReadOnlyQueryData for Option<&T> {
@@ -571,9 +658,14 @@ impl<T: Component> ReadOnlyQueryData for Option<&T> {
         Self: 'w,
         'w: 's,
     {
-        // Always `Some(…)` — an optional never rejects the entity. The
-        // inner `Option` carries the presence/absence of `T`.
-        Some(state.1.as_ref().and_then(|s| s.get(entity)))
+        // Standalone — alive-check via the frozen snapshot. Tuple `lookup`s
+        // (the only callers from `drive_ref`'s External path) never recurse
+        // into element-level `lookup`, so this strictness is reachable only
+        // through `Query::get` — exactly where the issue's contract demands
+        // `None` for stale / despawned. The inner `Option` carries the
+        // presence/absence of `T` for entities that *are* live.
+        let (entities, storage) = state;
+        entity_in_snapshot(entities, entity).then(|| storage.as_ref().and_then(|s| s.get(entity)))
     }
 
     fn drive_ref<'s, 'w>(
@@ -727,6 +819,25 @@ impl<T: Component> QueryData for Option<&mut T> {
             DriveSource::Data(_) => <Self as QueryData>::iter(state),
         }
     }
+
+    fn lookup_mut<'s, 'w>(
+        state: &'s mut Self::State<'w>,
+        entity: Entity,
+    ) -> Option<Option<Mut<'s, T>>>
+    where
+        Self: 's,
+        Self: 'w,
+        'w: 's,
+    {
+        // Standalone — mirror of `Option<&T>::lookup_mut`'s alive-check via the
+        // frozen snapshot. `get_mut_handle` is the precise (`DerefMut`-marked)
+        // single-fetch counterpart of `iter_mut`, so a `Query::get_mut` that
+        // never touches the value leaves `changed_tick` untouched, exactly
+        // like the loop body would.
+        let (entities, storage) = state;
+        entity_in_snapshot(entities, entity)
+            .then(|| storage.as_mut().and_then(|s| s.get_mut_handle(entity)))
+    }
 }
 
 // -------- Entity (the id itself, as data) --------
@@ -844,6 +955,19 @@ impl QueryData for Entity {
             DriveSource::Data(_) => Self::iter(state),
         }
     }
+
+    #[inline]
+    fn lookup_mut<'s, 'w>(state: &'s mut Self::State<'w>, entity: Entity) -> Option<Entity>
+    where
+        Self: 's,
+        Self: 'w,
+        'w: 's,
+    {
+        // `&mut` on `state` is structural only — the snapshot check is a
+        // shared read. Forward to the read-only mirror below to keep the
+        // two paths byte-identical.
+        <Self as ReadOnlyQueryData>::lookup(&*state, entity)
+    }
 }
 
 impl ReadOnlyQueryData for Entity {
@@ -858,16 +982,20 @@ impl ReadOnlyQueryData for Entity {
         Box::new(counted!(state.iter()).map(|&e| (e, e)))
     }
 
-    fn lookup<'s, 'w>(_state: &'s Self::State<'w>, entity: Entity) -> Option<Entity>
+    fn lookup<'s, 'w>(state: &'s Self::State<'w>, entity: Entity) -> Option<Entity>
     where
         Self: 's,
         Self: 'w,
         'w: 's,
     {
-        // Every entity trivially "matches" the `Entity` shape and its item
-        // is its own id. (`lookup` has no caller today — it exists for the
-        // read side of a tuple join, where `Entity` is never a non-driver.)
-        Some(entity)
+        // Standalone — `Entity` names no component, so aliveness comes only
+        // from the frozen snapshot in `State`. The shape `Some(entity)` is
+        // its own item; we return it iff the snapshot lists it. (Tuple
+        // `lookup`s never recurse into this one — `(Entity, &T)`'s join
+        // builds its own row inline — so this strictness is reachable only
+        // through `Query::get` here, and `Query::get_mut` via the mirror
+        // `lookup_mut` above.)
+        entity_in_snapshot(state, entity).then_some(entity)
     }
 
     fn drive_ref<'s, 'w>(

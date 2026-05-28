@@ -55,7 +55,15 @@ for x in &q { … }                        // sugar for q.iter()
 for x in &mut q { … }                    // sugar for q.iter_mut()
 let count = q.iter().count();
 let first = q.iter().next();
+let one  = q.get(entity);                // fetch one entity (shared)
+let one  = q.get_mut(entity);            // fetch one entity (mut)
 ```
+
+`q.get(entity)` / `q.get_mut(entity)` return `None` if any required component
+is missing, if the entity is despawned / stale / never-allocated, or if the
+query's filter rejects it. They share every contract with iteration —
+optionals still yield a `None` value, `Mut<T>` still marks change only on
+write.
 
 
 ## The three vocabulary words

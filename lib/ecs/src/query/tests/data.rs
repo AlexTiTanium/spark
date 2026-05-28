@@ -906,3 +906,507 @@ fn query_entity_after_respawn_yields_new_generation_not_stale() {
     assert_eq!(ids, vec![b]);
     assert!(!ids.contains(&a)); // stale handle excluded
 }
+
+// ---- Query::get / Query::get_mut (issue #72) -------------------------------
+
+// `Query::get(&Position)` returns the live component for the asked-for entity
+// and `None` when the entity is missing it, despawned, or never allocated.
+#[test]
+fn query_get_single_read_returns_present_and_none_for_missing() {
+    let mut world = World::new();
+    let a = world.spawn().insert(Position(1, 0)).id();
+    let b = world.spawn().insert(Position(2, 0)).id();
+    let c = world.spawn().id(); // no Position
+
+    let q = Query::<&Position>::from_world(&world);
+    assert_eq!(q.get(a), Some(&Position(1, 0)));
+    assert_eq!(q.get(b), Some(&Position(2, 0)));
+    assert_eq!(q.get(c), None); // alive but no Position
+}
+
+// Stale and never-allocated handles both collapse to `None` via the storage's
+// generation check — same machinery `World::get` uses.
+#[test]
+fn query_get_returns_none_for_stale_and_unallocated() {
+    let mut world = World::new();
+    let alive = world.spawn().insert(Position(1, 0)).id();
+    let doomed = world.spawn().insert(Position(2, 0)).id();
+    world.despawn(doomed);
+
+    let q = Query::<&Position>::from_world(&world);
+    assert_eq!(q.get(alive), Some(&Position(1, 0)));
+    assert!(q.get(doomed).is_none()); // despawned
+    // A handcrafted handle for a slot that was never allocated also returns
+    // `None` — sparse[index] is out of bounds.
+    let never = Entity {
+        index: 999,
+        generation: 0,
+    };
+    assert!(q.get(never).is_none());
+}
+
+// `get_mut` on `&mut T` yields a `Mut` whose write persists past the query.
+#[test]
+fn query_get_mut_writes_through_present_only() {
+    let mut world = World::new();
+    let a = world.spawn().insert(Position(5, 0)).id();
+    let b = world.spawn().id(); // no Position
+
+    {
+        let mut q = Query::<&mut Position>::from_world(&world);
+        q.get_mut(a).unwrap().0 += 10;
+        assert!(q.get_mut(b).is_none());
+    }
+    assert_eq!(world.get::<Position>(a).unwrap().0, 15);
+}
+
+// `get_mut` on a stale id returns `None` via the same generation check that
+// `iter_mut`'s `DenseMut::get` uses — no panic, no silent write to the
+// recycled slot.
+#[test]
+fn query_get_mut_returns_none_for_stale_handle() {
+    let mut world = World::new();
+    let a = world.spawn().insert(Position(1, 0)).id();
+    world.despawn(a);
+    let _b = world.spawn().insert(Position(2, 0)).id(); // reuses slot 0
+
+    let mut q = Query::<&mut Position>::from_world(&world);
+    assert!(q.get_mut(a).is_none()); // a now points at a recycled slot
+}
+
+// Two-tuple join: returns the pair only when both required components are
+// present, `None` if either is missing.
+#[test]
+fn query_get_tuple_join_is_all_or_nothing() {
+    let mut world = World::new();
+    let mover = world
+        .spawn()
+        .insert(Position(1, 0))
+        .insert(Velocity(2, 0))
+        .id();
+    let still = world.spawn().insert(Position(3, 0)).id();
+    let drifting = world.spawn().insert(Velocity(4, 0)).id();
+
+    let q = Query::<(&Position, &Velocity)>::from_world(&world);
+    assert_eq!(q.get(mover), Some((&Position(1, 0), &Velocity(2, 0))));
+    assert!(q.get(still).is_none()); // missing Velocity
+    assert!(q.get(drifting).is_none()); // missing Position
+}
+
+// Multi-mut join: both components mutable, both `Mut` handles write through.
+#[test]
+fn query_get_mut_multi_mut_tuple_writes_each() {
+    let mut world = World::new();
+    let e = world
+        .spawn()
+        .insert(Position(0, 0))
+        .insert(Velocity(1, 0))
+        .id();
+
+    {
+        let mut q = Query::<(&mut Position, &mut Velocity)>::from_world(&world);
+        let (mut pos, mut vel) = q.get_mut(e).unwrap();
+        pos.0 += vel.0;
+        vel.0 *= 2;
+    }
+    assert_eq!(world.get::<Position>(e).unwrap().0, 1);
+    assert_eq!(world.get::<Velocity>(e).unwrap().0, 2);
+}
+
+// Entity-prefixed shape: yields the id alongside the component. A stale
+// entity fails the required component's generation check, so the row is
+// `None` — no separate alive-check needed.
+#[test]
+fn query_get_entity_prefixed_yields_id_with_components() {
+    let mut world = World::new();
+    let e = world.spawn().insert(Position(7, 0)).id();
+    world.despawn(e);
+    let f = world.spawn().insert(Position(9, 0)).id();
+
+    let q = Query::<(Entity, &Position)>::from_world(&world);
+    assert_eq!(q.get(f), Some((f, &Position(9, 0))));
+    assert!(q.get(e).is_none()); // stale: recycled slot fails generation check
+}
+
+// `Query<Entity>` standalone alive-checks against the snapshot — a stale id
+// must return `None` even though the shape names no component.
+#[test]
+fn query_get_entity_standalone_alive_checks_via_snapshot() {
+    let mut world = World::new();
+    let a = world.spawn().id();
+    let b = world.spawn().id();
+    world.despawn(a);
+
+    let q = Query::<Entity>::from_world(&world);
+    assert_eq!(q.get(b), Some(b));
+    assert!(q.get(a).is_none()); // not in the snapshot
+    // Never-allocated handle also rejected.
+    let never = Entity {
+        index: 9999,
+        generation: 0,
+    };
+    assert!(q.get(never).is_none());
+}
+
+// `Query<Option<&T>>` standalone alive-checks too — the issue's "None for
+// stale" criterion applies even for shapes with no required component.
+#[test]
+fn query_get_option_standalone_alive_checks_via_snapshot() {
+    let mut world = World::new();
+    let with_pos = world.spawn().insert(Position(5, 0)).id();
+    let without = world.spawn().id();
+    let stale = world.spawn().id();
+    world.despawn(stale);
+
+    let q = Query::<Option<&Position>>::from_world(&world);
+    assert_eq!(q.get(with_pos), Some(Some(&Position(5, 0))));
+    assert_eq!(q.get(without), Some(None)); // live, no Position
+    assert!(q.get(stale).is_none()); // despawned — not Some(None)
+}
+
+// `Query<Option<&mut T>>` standalone: precise change marking via the snapshot
+// alive-check, otherwise mirrors the read variant.
+#[test]
+fn query_get_mut_option_standalone_writes_through_and_rejects_stale() {
+    let mut world = World::new();
+    let with_pos = world.spawn().insert(Position(1, 0)).id();
+    let without = world.spawn().id();
+    let stale = world.spawn().id();
+    world.despawn(stale);
+
+    {
+        let mut q = Query::<Option<&mut Position>>::from_world(&world);
+        if let Some(Some(mut p)) = q.get_mut(with_pos) {
+            p.0 += 100;
+        }
+        assert!(matches!(q.get_mut(without), Some(None))); // live, no Position
+        assert!(q.get_mut(stale).is_none()); // despawned
+    }
+    assert_eq!(world.get::<Position>(with_pos).unwrap().0, 101);
+}
+
+// Optional in a join: trailing `Option<&_>` yields a `None` value when the
+// entity lacks it; the required first element still gates the row.
+#[test]
+fn query_get_optional_in_join_yields_none_value_for_missing_optional() {
+    let mut world = World::new();
+    let a = world
+        .spawn()
+        .insert(Position(1, 0))
+        .insert(Velocity(2, 0))
+        .id();
+    let b = world.spawn().insert(Position(3, 0)).id(); // no Velocity
+    let c = world.spawn().insert(Velocity(9, 0)).id(); // no Position
+
+    let q = Query::<(&Position, Option<&Velocity>)>::from_world(&world);
+    assert_eq!(q.get(a), Some((&Position(1, 0), Some(&Velocity(2, 0)))));
+    assert_eq!(q.get(b), Some((&Position(3, 0), None))); // optional absent → Some(None)
+    assert!(q.get(c).is_none()); // missing required Position
+}
+
+// `With<T>` filter participates in `get` — an entity that passes the data
+// shape but fails the filter collapses to `None`.
+#[test]
+fn query_get_with_filter_rejects_when_predicate_false() {
+    let mut world = World::new();
+    let marked = world.spawn().insert(Position(1, 0)).insert(Marker).id();
+    let bare = world.spawn().insert(Position(2, 0)).id(); // no Marker
+
+    let q = Query::<&Position, With<Marker>>::from_world(&world);
+    assert_eq!(q.get(marked), Some(&Position(1, 0)));
+    assert!(q.get(bare).is_none()); // has Position, lacks Marker — filter rejects
+}
+
+// `Without<T>` filter participates the same way — symmetric to `With`.
+#[test]
+fn query_get_without_filter_rejects_marked_entities() {
+    let mut world = World::new();
+    let marked = world.spawn().insert(Position(1, 0)).insert(Marker).id();
+    let bare = world.spawn().insert(Position(2, 0)).id();
+
+    let q = Query::<&Position, Without<Marker>>::from_world(&world);
+    assert_eq!(q.get(bare), Some(&Position(2, 0)));
+    assert!(q.get(marked).is_none()); // Without rejects the Marker-bearing one
+}
+
+// `Or` filter: a candidate passes if either arm matches. The filter participates
+// even though the data shape's required element gates aliveness on its own.
+#[test]
+fn query_get_or_filter_passes_if_any_arm_matches() {
+    let mut world = World::new();
+    let with_a = world.spawn().insert(Position(1, 0)).insert(A(0)).id();
+    let with_b = world.spawn().insert(Position(2, 0)).insert(B(0)).id();
+    let neither = world.spawn().insert(Position(3, 0)).id();
+
+    let q = Query::<&Position, Or<(With<A>, With<B>)>>::from_world(&world);
+    assert_eq!(q.get(with_a), Some(&Position(1, 0)));
+    assert_eq!(q.get(with_b), Some(&Position(2, 0)));
+    assert!(q.get(neither).is_none()); // neither With<A> nor With<B> matches
+}
+
+// Reading via `get_mut` then dropping the handle without a `DerefMut` write
+// must *not* stamp `changed_tick` — change marking stays precise across the
+// single-fetch path, exactly as it does across `iter_mut`. Inspects the
+// storage's `changed_tick_for` directly so the assertion does not depend on
+// the scheduler's baseline plumbing.
+//
+// The clock must move between the read-only fetch and the write so a stamp
+// is observable; we advance it by inserting `Position` on a second entity
+// (every `insert` bumps the storage's `current_tick`).
+#[test]
+fn query_get_mut_does_not_mark_changed_unless_written() {
+    let mut world = World::new();
+    let e = world.spawn().insert(Position(0, 0)).id();
+    let tick_after_insert = world
+        .storage::<Position>()
+        .unwrap()
+        .changed_tick_for(e)
+        .unwrap();
+
+    // Read-only get_mut: drop without DerefMut. Must leave `changed_tick`
+    // exactly where insert left it.
+    {
+        let mut q = Query::<&mut Position>::from_world(&world);
+        let pos = q.get_mut(e).unwrap();
+        assert_eq!(pos.0, 0); // Deref only.
+    }
+    assert_eq!(
+        world
+            .storage::<Position>()
+            .unwrap()
+            .changed_tick_for(e)
+            .unwrap(),
+        tick_after_insert,
+        "read-without-write must not stamp changed_tick"
+    );
+
+    // Advance Position's clock by inserting on a fresh entity — every
+    // `insert` calls `advance_tick` on that storage.
+    let _ = world.spawn().insert(Position(99, 99)).id();
+    let tick_after_bump = world.storage::<Position>().unwrap().current_tick();
+    assert_ne!(tick_after_bump, tick_after_insert);
+
+    // Write through the handle — DerefMut stamps at the new current_tick.
+    {
+        let mut q = Query::<&mut Position>::from_world(&world);
+        q.get_mut(e).unwrap().0 = 7;
+    }
+    assert_eq!(
+        world
+            .storage::<Position>()
+            .unwrap()
+            .changed_tick_for(e)
+            .unwrap(),
+        tick_after_bump,
+        "DerefMut write must stamp at current_tick"
+    );
+}
+
+// `get` and `iter` agree on the entities they return — for every entity the
+// query yields, `get(id)` returns the same item; for every entity outside it,
+// `get` returns `None`.
+#[test]
+fn query_get_agrees_with_iter_for_filtered_query() {
+    let mut world = World::new();
+    let _a = world.spawn().insert(Position(1, 0)).insert(Marker).id();
+    let bare = world.spawn().insert(Position(2, 0)).id(); // no Marker, filtered out
+    let _c = world.spawn().insert(Position(3, 0)).insert(Marker).id();
+
+    let q = Query::<(Entity, &Position), With<Marker>>::from_world(&world);
+    let iter_set: std::collections::HashMap<Entity, &Position> = q.iter().collect();
+    assert_eq!(iter_set.len(), 2);
+    for (entity, pos) in &iter_set {
+        assert_eq!(q.get(*entity), Some((*entity, *pos)));
+    }
+    assert!(q.get(bare).is_none()); // filtered out — must agree with iter
+}
+
+// Arity-3 join: every required element gates the row, the `?`-chain
+// short-circuits on the first missing component.
+#[test]
+fn query_get_three_component_join_is_all_or_nothing() {
+    let mut world = World::new();
+    let all = world.spawn().insert(A(1)).insert(B(2)).insert(C(3)).id();
+    let missing_c = world.spawn().insert(A(4)).insert(B(5)).id();
+    let missing_b = world.spawn().insert(A(6)).insert(C(7)).id();
+
+    let q = Query::<(&A, &B, &C)>::from_world(&world);
+    assert_eq!(q.get(all), Some((&A(1), &B(2), &C(3))));
+    assert!(q.get(missing_c).is_none()); // `?` short-circuits at C
+    assert!(q.get(missing_b).is_none()); // `?` short-circuits at B
+}
+
+// Entity-prefixed shape with a `&mut T` — exercises the `W` arm of
+// `lookup_mut_one!` inside `impl_one_combo_entity!`'s @gen, which the read
+// variant test (`query_get_entity_prefixed_yields_id_with_components`) does
+// not cover.
+#[test]
+fn query_get_mut_entity_prefixed_writes_through() {
+    let mut world = World::new();
+    let e = world.spawn().insert(Position(5, 0)).id();
+
+    {
+        let mut q = Query::<(Entity, &mut Position)>::from_world(&world);
+        let (id, mut pos) = q.get_mut(e).unwrap();
+        assert_eq!(id, e); // the prefix rides the asked-for id
+        pos.0 += 100;
+    }
+    assert_eq!(world.get::<Position>(e).unwrap().0, 105);
+}
+
+// Mut-required + optional-read in a join through `get_mut` — exercises
+// `lookup_mut_one!(W, …)` for the driver slot and `(O, …)` for the trailing
+// slot together.
+#[test]
+fn query_get_mut_required_with_optional_trailing_coexist() {
+    let mut world = World::new();
+    let with_vel = world
+        .spawn()
+        .insert(Position(1, 0))
+        .insert(Velocity(2, 0))
+        .id();
+    let no_vel = world.spawn().insert(Position(3, 0)).id();
+
+    {
+        let mut q = Query::<(&mut Position, Option<&Velocity>)>::from_world(&world);
+        // Optional present: write through the required slot, optional rides.
+        let (mut pos, vel) = q.get_mut(with_vel).unwrap();
+        pos.0 += vel.unwrap().0;
+        // Optional absent: still a row, optional is `None`, write proceeds.
+        let (mut pos2, vel2) = q.get_mut(no_vel).unwrap();
+        assert!(vel2.is_none());
+        pos2.0 += 10;
+    }
+    assert_eq!(world.get::<Position>(with_vel).unwrap().0, 3);
+    assert_eq!(world.get::<Position>(no_vel).unwrap().0, 13);
+}
+
+// `Changed<T>` filter through `get`: an entity whose `changed_tick` predates
+// the parked baseline must be rejected, and one whose tick post-dates it
+// must pass. We drive the baseline directly via an observer system's
+// `last_seen` vec, matching the staging in `change_detection.rs`.
+#[test]
+fn query_get_changed_filter_rejects_unmodified_entity() {
+    use crate::Changed;
+    use crate::access::Access;
+
+    let mut world = World::new();
+    // Spawn the bystander first so its insert stamps the earlier tick; the
+    // writer's later insert advances the clock and stamps a strictly newer
+    // tick. The baseline we park sits between them.
+    let bystander = world.spawn().insert(Position(99, 0)).id();
+    let bystander_tick = world.storage::<Position>().unwrap().current_tick();
+    let writer = world.spawn().insert(Position(0, 0)).id();
+
+    // Park `bystander_tick` as the baseline: the writer's later insert
+    // stamps a tick > baseline → passes Changed; bystander's insert tick
+    // equals baseline → fails Changed (the strict-`<` in `is_changed_since`).
+    let pos_tid = std::any::TypeId::of::<Position>();
+    let mut observer_baseline = vec![(pos_tid, bystander_tick)];
+    let observer_access = Access::new(); // empty: no clock advance on observe
+
+    world.run_system(&observer_access, &mut observer_baseline, &mut |w| {
+        let q = Query::<&Position, Changed<Position>>::from_world(w);
+        assert!(q.get(writer).is_some(), "writer must pass Changed filter");
+        assert!(
+            q.get(bystander).is_none(),
+            "bystander must fail Changed filter (its tick equals baseline)"
+        );
+    });
+}
+
+// Absent storage case: when no entity has ever held `T`, `init_state` returns
+// `None`. `get` must yield `None` for any input without panicking.
+#[test]
+fn query_get_returns_none_when_storage_absent() {
+    let mut world = World::new();
+    // World holds entities, but no Position has ever been inserted, so the
+    // storage `Option<Ref<…>>` is `None`.
+    let e = world.spawn().insert(Marker).id();
+
+    let q = Query::<&Position>::from_world(&world);
+    assert!(q.get(e).is_none()); // alive, but no Position storage
+    let never = Entity {
+        index: 9999,
+        generation: 0,
+    };
+    assert!(q.get(never).is_none()); // also a clean `None`, no panic
+}
+
+// `Added<T>` is a structurally distinct filter from `Changed<T>` — it reads
+// `added_tick` (set only on first attach), not `changed_tick`. The matches
+// branch in `lookup`/`drive_ref` is the same, so a `get` test exercises it
+// the same way the `Changed` test does.
+#[test]
+fn query_get_added_filter_rejects_attached_before_baseline() {
+    use crate::Added;
+    use crate::access::Access;
+
+    let mut world = World::new();
+    // Bystander attached before the baseline tick → fails `Added`.
+    let bystander = world.spawn().insert(Position(99, 0)).id();
+    let bystander_tick = world.storage::<Position>().unwrap().current_tick();
+    // Writer attached *after* — its `added_tick` is strictly newer.
+    let writer = world.spawn().insert(Position(0, 0)).id();
+
+    let pos_tid = std::any::TypeId::of::<Position>();
+    let mut observer_baseline = vec![(pos_tid, bystander_tick)];
+    let observer_access = Access::new();
+
+    world.run_system(&observer_access, &mut observer_baseline, &mut |w| {
+        let q = Query::<&Position, Added<Position>>::from_world(w);
+        assert!(q.get(writer).is_some(), "writer must pass Added filter");
+        assert!(
+            q.get(bystander).is_none(),
+            "bystander attached at baseline must fail Added"
+        );
+    });
+}
+
+// `And<(...)>` filter through `get` — both arms must match. Symmetric to the
+// `Or` test above; exercises the combinator's `matches` dispatch through the
+// `get` path (distinct from single-predicate `With`/`Without`).
+#[test]
+fn query_get_and_filter_requires_both_predicates() {
+    use crate::filter::And;
+
+    let mut world = World::new();
+    let both = world
+        .spawn()
+        .insert(Position(1, 0))
+        .insert(A(0))
+        .insert(B(0))
+        .id();
+    let only_a = world.spawn().insert(Position(2, 0)).insert(A(0)).id();
+    let only_b = world.spawn().insert(Position(3, 0)).insert(B(0)).id();
+    let neither = world.spawn().insert(Position(4, 0)).id();
+
+    let q = Query::<&Position, And<(With<A>, With<B>)>>::from_world(&world);
+    assert_eq!(q.get(both), Some(&Position(1, 0)));
+    assert!(q.get(only_a).is_none()); // missing the With<B> arm
+    assert!(q.get(only_b).is_none()); // missing the With<A> arm
+    assert!(q.get(neither).is_none()); // missing both arms
+}
+
+// Mixed-mut tuple `(&mut A, &B)::get_mut` — `lookup_mut_one!(W, …)` for the
+// first slot and `(R, …)` for the second, distinct from the all-mut and
+// all-read tuples already covered.
+#[test]
+fn query_get_mut_mixed_mut_read_tuple_writes_through_mut_slot() {
+    let mut world = World::new();
+    let with_both = world
+        .spawn()
+        .insert(Position(10, 0))
+        .insert(Velocity(3, 0))
+        .id();
+    let only_pos = world.spawn().insert(Position(20, 0)).id();
+
+    {
+        let mut q = Query::<(&mut Position, &Velocity)>::from_world(&world);
+        let (mut pos, vel) = q.get_mut(with_both).unwrap();
+        pos.0 += vel.0;
+        assert!(q.get_mut(only_pos).is_none()); // required &Velocity missing
+    }
+    assert_eq!(world.get::<Position>(with_both).unwrap().0, 13);
+    assert_eq!(world.get::<Position>(only_pos).unwrap().0, 20); // untouched
+}
