@@ -397,9 +397,10 @@ impl Commands<'_> {
     /// # Panics
     ///
     /// Panics **at flush** if no resource of type `R` exists when `f` would
-    /// run, matching [`World::resource_mut`]. `update_resource` mutates; it
-    /// never creates — use [`insert_resource`](Self::insert_resource) to bring
-    /// a resource into existence first.
+    /// run. Unlike the generic miss from [`World::resource_mut`], the message
+    /// names `R` and points at [`World::add_resource`] /
+    /// [`insert_resource`](Self::insert_resource): `update_resource` mutates,
+    /// it never creates — bring the resource into existence first.
     ///
     /// # Examples
     ///
@@ -421,7 +422,17 @@ impl Commands<'_> {
     /// ```
     pub fn update_resource<R: Resource>(&mut self, f: impl FnOnce(&mut R) + 'static) {
         self.queue.borrow_mut().push(Box::new(move |world| {
-            f(&mut world.resource_mut::<R>());
+            // Resolve the actionable message here, where `R` is known —
+            // `World::resource_mut`'s generic miss is shared and stays generic.
+            let mut guard = world.get_resource_mut::<R>().unwrap_or_else(|| {
+                let name = std::any::type_name::<R>();
+                panic!(
+                    "Commands::update_resource::<{name}> was queued, but resource \
+                     {name} is not registered. Add it via World::add_resource or \
+                     Commands::insert_resource before queuing an update."
+                )
+            });
+            f(&mut guard);
         }));
     }
 }
@@ -1052,10 +1063,14 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "has not been inserted")]
+    #[should_panic(
+        expected = "is not registered. Add it via World::add_resource or Commands::insert_resource"
+    )]
     fn update_resource_on_absent_resource_panics_at_flush() {
         // Missing-resource contract: `update_resource` mutates, never creates.
-        // At flush, `World::resource_mut` panics on the absent `Score`.
+        // At flush it panics on the absent `Score` with an actionable message
+        // (not the bare `World::resource_mut` miss) — pinned here, not just
+        // documented.
         let mut world = World::new();
         let mut sys = IntoSystem::into_system(|mut commands: Commands| {
             commands.update_resource::<Score>(|s| s.0 += 1);
