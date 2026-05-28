@@ -8,6 +8,16 @@ name: Miri (spark-ecs)
 # (Miri interprets every operation); this is the only crate with `unsafe`.
 # It also seeds the M4 baseline for the `UnsafeCell` switchover.
 #
+# Cost control: the run is scoped to `--lib query`, not the whole crate.
+# `DenseMut::get` (query/dense_mut.rs) is the crate's only `unsafe fn`, and
+# it is reached *only* through multi-mut query joins, so the `query::tests`
+# modules are the entire UB-detection surface. Interpreting the other ~270
+# safe unit tests, every integration test, and all doctests under Miri buys
+# zero aliasing coverage at full interpreter cost — so they are excluded
+# (`--lib` drops doctests + integration; `query` drops unrelated unit tests).
+# `-Zmiri-disable-isolation` trims syscall-emulation overhead; the borrow
+# model that does the actual checking stays on.
+#
 # Conditional cadence (deviation from #80, recorded in the PR body): most
 # PRs never touch unsafe, so this only fires when the relevant surface
 # moves (path filter below), plus a weekly cron for toolchain / nightly
@@ -52,4 +62,12 @@ jobs:
         with:
           components: miri
       - uses: Swatinem/rust-cache@v2
-      - run: cargo +nightly miri test -p spark-ecs
+      # Build the Miri sysroot as its own step so the cold-sysroot spike is
+      # visible (and cached by rust-cache, keyed on the nightly version)
+      # separately from interpretation time.
+      - run: cargo +nightly miri setup
+      - run: cargo +nightly miri test -p spark-ecs --lib query
+        env:
+          # Skip syscall isolation emulation — pure interpreter speedup, no
+          # effect on the Stacked/Tree Borrows aliasing check this job exists for.
+          MIRIFLAGS: "-Zmiri-disable-isolation"
