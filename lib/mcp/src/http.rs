@@ -42,7 +42,11 @@ const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
 // `lib.rs` and matches `Sender`'s usual builder shape.
 #[allow(clippy::needless_pass_by_value)]
 pub fn serve(addr: SocketAddr, inbox_tx: Sender<Request>) -> std::io::Result<()> {
-    let server = Server::http(addr).map_err(std::io::Error::other)?;
+    let server = Server::http(addr).map_err(|e| {
+        tracing::warn!(%addr, error = %e, "spark-mcp failed to bind");
+        std::io::Error::other(e)
+    })?;
+    tracing::info!(%addr, "spark-mcp HTTP thread listening");
     for req in server.incoming_requests() {
         match (req.method(), req.url()) {
             (Method::Post, "/mcp") => handle_rpc(req, &inbox_tx),
@@ -72,6 +76,7 @@ fn handle_rpc(mut req: tiny_http::Request, inbox: &Sender<Request>) {
     let parsed: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
+            tracing::error!(error = %e, "spark-mcp JSON-RPC parse failed");
             // Parse error: id is unknown, so use Null per JSON-RPC spec.
             let _ = req.respond(json_response(rpc_err(Value::Null, -32700, &e.to_string())));
             return;
@@ -81,6 +86,7 @@ fn handle_rpc(mut req: tiny_http::Request, inbox: &Sender<Request>) {
     let id = parsed.get("id").cloned().unwrap_or(Value::Null);
     let method = parsed.get("method").and_then(Value::as_str).unwrap_or("");
     let params = parsed.get("params").cloned().unwrap_or_else(|| json!({}));
+    tracing::debug!(method, id = %id, "spark-mcp POST /mcp");
 
     match method {
         "initialize" => {
@@ -123,23 +129,37 @@ fn handle_rpc(mut req: tiny_http::Request, inbox: &Sender<Request>) {
             // behaviour for the client.
             if inbox
                 .send(Request::ToolCall {
-                    name,
+                    name: name.clone(),
                     args,
                     reply: reply_tx,
                 })
                 .is_err()
             {
+                tracing::error!(tool = %name, "spark-mcp inbox closed; main thread is gone");
                 let _ = req.respond(json_response(rpc_err(id, -32001, "game loop shut down")));
                 return;
             }
 
-            let envelope = match reply_rx.recv_timeout(TOOL_CALL_TIMEOUT) {
-                Ok(result) => rpc_ok(id, result),
-                Err(_) => rpc_err(id, -32001, "timeout waiting for game loop"),
+            let envelope = if let Ok(result) = reply_rx.recv_timeout(TOOL_CALL_TIMEOUT) {
+                rpc_ok(id, result)
+            } else {
+                // Almost always means the winit event loop is on
+                // `ControlFlow::Wait` and no OS event has woken the
+                // main thread within the timeout window — see #50
+                // (`Wait → Poll`) and the README's known-limitation
+                // section. Surface it explicitly so a future debugger
+                // doesn't have to guess.
+                tracing::warn!(
+                    tool = %name,
+                    timeout_ms = TOOL_CALL_TIMEOUT.as_millis(),
+                    "spark-mcp tools/call timed out — main thread did not service the inbox (event loop on Wait? see #50)",
+                );
+                rpc_err(id, -32001, "timeout waiting for game loop")
             };
             let _ = req.respond(json_response(envelope));
         }
         other => {
+            tracing::debug!(method = other, "spark-mcp unknown JSON-RPC method");
             let _ = req.respond(json_response(rpc_err(
                 id,
                 -32601,

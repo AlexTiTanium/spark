@@ -1,7 +1,6 @@
 #![cfg(debug_assertions)]
 #![doc = include_str!("../README.md")]
 
-mod bus;
 mod control;
 mod http;
 mod methods;
@@ -15,7 +14,6 @@ use spark_core::Stage;
 use spark_core::{Application, EngineError, Plugin};
 use spark_ecs::WorkloadLabel;
 
-pub use bus::Bus;
 pub use control::McpControl;
 pub use http::TOOL_CALL_TIMEOUT;
 pub use methods::{INBOX_BUDGET, Inbox, tool_descriptions};
@@ -99,6 +97,11 @@ impl Plugin for SparkMcpPlugin {
         app.add_workload(McpWorkload::Inbox, Stage::First, |w| {
             w.add_system(methods::drain_inbox);
         });
+        // `Control` and `Outbox` register no-op systems in P1 — the
+        // empty workload slots are deliberate so P3 (control/logs) and
+        // P5 (event publishing) only fill in handler bodies, never
+        // touch plugin wiring. Cost is one empty function call per
+        // frame per workload.
         app.add_workload(McpWorkload::Control, Stage::PreUpdate, |w| {
             w.add_system(control::apply_control);
         });
@@ -115,7 +118,10 @@ impl Plugin for SparkMcpPlugin {
                         tracing::warn!(error = %e, "spark-mcp server stopped");
                     }
                 })?;
-            tracing::info!(addr = %addr, "spark-mcp ready");
+            // The matching "bound + listening" log fires from inside
+            // the thread once `tiny_http::Server::http` returns — this
+            // line only confirms the OS thread is alive.
+            tracing::info!(%addr, "spark-mcp HTTP thread spawned");
             Ok(())
         });
     }

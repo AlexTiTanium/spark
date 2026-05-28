@@ -71,6 +71,20 @@ pub enum Request {
 /// `&mut World` system params), the signature here changes to accept
 /// the world and the dispatcher threads it through. For P1 the dispatch
 /// only needs `Time` to stamp `Reply`s.
+///
+/// # Known limitation — event-loop wait state (issue #50)
+///
+/// This system only runs when the engine ticks a frame. Today the winit
+/// runner uses `ControlFlow::Wait`, which suspends the main thread until
+/// the OS sends a window event (mouse move, resize, redraw). While the
+/// thread is suspended, `Stage::First` is not entered and this drain
+/// never sees the pending request — so an agent's `tools/call` will sit
+/// in the channel until the HTTP thread's 10 s `recv_timeout` fires.
+///
+/// Workaround during development: keep the cursor moving over the Spark
+/// window, or drag the window. Each event wakes the loop and runs one
+/// frame, which drains one pending request. The proper fix is #50
+/// (`Wait → Poll`), which is independent of this PR.
 #[allow(
     clippy::needless_pass_by_value,
     reason = "Res<T> / ResMut<T> are SystemParam values — IntoSystem hands them in by value."
@@ -81,6 +95,7 @@ pub fn drain_inbox(inbox: Res<Inbox>, time: Res<Time>) {
         let Ok(req) = inbox.rx.try_recv() else { return };
         budget -= 1;
         let Request::ToolCall { name, args, reply } = req;
+        tracing::debug!(tool = %name, "spark-mcp dispatch");
         let _ = reply.send(wrap(&time, dispatch(&name, args)));
     }
 }

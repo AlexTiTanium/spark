@@ -156,6 +156,36 @@ The `_rpc_code` field is a Spark extension — MCP's spec only carries
 (retry on `−32001` timeout, give up on `−32601` not-found, …). The
 leading underscore marks it as an extension field.
 
+## Known limitation: request servicing requires an active event loop
+
+`tools/call` requests are placed on an mpsc inbox by the HTTP thread and
+drained by the `drain_inbox` system on `Stage::First`. That system only
+runs when the engine ticks a frame. Today, [`spark-window`](../window/)'s
+winit runner uses **`ControlFlow::Wait`**: the main thread suspends until
+the OS sends a window event (mouse move, resize, redraw, focus change).
+While suspended, `Stage::First` never enters, the drain never reads the
+channel, and the HTTP thread's `recv_timeout` fires after 10 s with the
+JSON-RPC code `-32001`.
+
+You can see this for yourself: with the game window idle in the
+foreground, run
+
+```bash
+curl -s -X POST http://127.0.0.1:9123/mcp \
+  -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"x","arguments":{}}}'
+```
+
+The curl hangs for 10 s and returns `-32001`. Now wiggle the cursor over
+the Spark window while curl is in flight — the frame ticks, the inbox
+drains, and you get the expected method-not-found envelope back instantly.
+
+The fix is [issue #50](https://github.com/AlexTiTanium/spark/issues/50)
+(`ControlFlow::Wait → Poll`), tracked independently of this crate. The
+handshake methods (`initialize` / `ping` / `tools/list` / `notifications/initialized`)
+are unaffected — they're serviced entirely from the HTTP thread and don't
+touch the main loop.
+
 ## Errors / pitfalls
 
 - **Port already in use.** The HTTP thread logs `spark-mcp server
