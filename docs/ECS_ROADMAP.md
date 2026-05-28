@@ -46,6 +46,16 @@ expanded into full drafts in the project's `#10–#12` format below.
   detection (the safe window is the full `u32` range — wider than the 2³¹
   the issue assumed; see the commit). No public-API change
   (`cargo public-api` clean).
+- **#74 — `Commands::entity(e)` + `EntityCommands::remove::<T>()`.** A
+  builder bound to a *pre-existing* entity, with queued component removal
+  to match the existing queued `insert`. `remove::<T>()` on an entity
+  lacking `T` is an idempotent no-op. The despawn-then-mutate race resolves
+  to **silent drop** with no new flush-time machinery — `World::insert` /
+  `World::remove` already guard on `is_alive`, so a mutation queued against
+  an entity a prior FIFO despawn has freed dissolves on its own. Generation
+  bumping closes the slot-reuse hazard (a stale handle never hits a new
+  tenant). `insert_bundle((A, B, C))` stays out of scope — folded into the
+  #57 bundle rejection.
 
 ### To create — in order
 

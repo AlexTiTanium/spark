@@ -92,8 +92,8 @@ write.
 - **System** — a plain Rust function whose parameters describe what
   it reads and writes: `Res<T>`, `ResMut<T>`, `Query<D, F>` (for
   `D = &T`, `&mut T`, or a tuple of those), `Commands` for deferred
-  spawn / despawn / insert, and `EventReader<T>` / `EventWriter<T>` for
-  messaging. Each is covered in its own section below.
+  spawn / despawn / insert / remove, and `EventReader<T>` /
+  `EventWriter<T>` for messaging. Each is covered in its own section below.
 
 ```rust
 // Runs today. `Time` here is a tiny stand-in for the future
@@ -1239,10 +1239,11 @@ plants pop into existence mid-loop) and keeps determinism intact for
 parallel execution.
 
 > **Surface.** [`Commands`](struct.Commands.html) exposes `spawn`,
-> `despawn(entity)`, `EntityCommands::insert<T>`, and
-> `EntityCommands::id()` — see the table in *Commands available today*
-> below. Tuple-spawn (`spawn((A, B, C))`) was **rejected**, not deferred
-> — see #57.
+> `entity(e)`, `despawn(entity)`, `EntityCommands::insert<T>`,
+> `EntityCommands::remove<T>`, and `EntityCommands::id()` — see the table
+> in *Commands available today* below. Tuple-spawn (`spawn((A, B, C))`)
+> and `EntityCommands::insert_bundle((A, B, C))` were **rejected**, not
+> deferred — see #57.
 
 ```rust
 use spark_ecs::{Commands, Component, IntoSystem, Query, World};
@@ -1320,9 +1321,18 @@ commands.
 | Command | Effect |
 |-|-|
 | `commands.spawn()` | Allocates a fresh entity synchronously; returns `EntityCommands` for chained queued inserts. |
+| `commands.entity(e)` | Returns `EntityCommands` bound to an **existing** entity `e` (no allocation); queue inserts/removes on it. |
 | `commands.despawn(entity)` | Queues `World::despawn(entity)` for the next flush. |
-| `commands.spawn().insert::<T>(value)` | Queues an `insert::<T>(entity, value)` on the just-spawned entity. Chainable. |
-| `commands.spawn().id()` | Synchronously-allocated `Entity` — usable inside the same system. |
+| `commands.spawn().insert::<T>(value)` / `commands.entity(e).insert::<T>(value)` | Queues an `insert::<T>(entity, value)`. Chainable. |
+| `commands.entity(e).remove::<T>()` | Queues a `remove::<T>(entity)`. Idempotent no-op if `e` lacks `T`. Chainable. |
+| `commands.spawn().id()` / `commands.entity(e).id()` | Returns the `Entity` the builder is bound to. For `spawn()` it's freshly allocated and live immediately; for `entity(e)` it's just `e` back. |
+
+Ops queued through `commands.entity(e)` against an entity that is no
+longer live at flush — e.g. `commands.despawn(e)` then
+`commands.entity(e).insert(c)` in the same frame — are **dropped
+silently** (FIFO order: the despawn fires first, then `World::insert` /
+`World::remove` no-op on the now-stale handle). No panic, no slot
+resurrection.
 
 ### Why disjoint cells make this work
 

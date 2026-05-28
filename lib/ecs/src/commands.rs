@@ -14,13 +14,18 @@
 //!
 //! # Why `spawn` is the exception
 //!
-//! [`Commands::spawn`] returns an [`Entity`] *synchronously*. Allocating
-//! a fresh slot is a counter bump on the [`EntityAllocator`] — no
-//! component storage is touched, so there's nothing to defer. The
-//! component-insert operations the caller chains after `spawn` are the
-//! deferred parts; the [`Entity`] handle itself is real immediately
+//! [`Commands::spawn`] allocates a fresh [`Entity`] *synchronously* and
+//! returns an [`EntityCommands`] builder. Allocating a slot is a counter
+//! bump on the [`EntityAllocator`] — no component storage is touched, so
+//! there's nothing to defer. The component-insert operations the caller
+//! chains after `spawn` are the deferred parts; the [`Entity`] handle
+//! itself (reachable via [`id`](EntityCommands::id)) is real immediately
 //! and usable inside the same system (`commands.spawn().id()` works,
 //! and the id is valid for [`Commands::despawn`] in the same frame).
+//!
+//! [`Commands::entity`] is the complement: no allocation, no synchronous
+//! world touch — it is a pure builder wrapping an existing handle, so all
+//! of its `insert` / `remove` ops are deferred to the next flush.
 //!
 //! # Borrow choreography
 //!
@@ -122,10 +127,14 @@ impl CommandQueue {
 
     /// Drains every queued op into `world`, in push order.
     ///
-    /// Ops may themselves enqueue more ops (e.g. by constructing a
-    /// fresh [`Commands`] mid-flush); this method loops until the queue
-    /// settles, so callers don't need a second `flush` to catch
-    /// cascading work.
+    /// The loop is a safety net, not a hot path: a [`DeferredOp`] receives
+    /// only `&mut World`, never a handle to *this* queue, so nothing an op
+    /// does can repopulate `self.ops` — in practice the loop always exits
+    /// after one pass. (It would catch a direct [`push`](Self::push) from a
+    /// future op type that gained queue access.) Ops enqueued through a
+    /// system's [`Commands`] parameter mid-flush land in the world's own
+    /// pending queue instead, and are drained by [`World::flush_commands`]'s
+    /// outer loop (see the inline note below).
     ///
     /// # Examples
     ///
@@ -172,8 +181,8 @@ impl CommandQueue {
 ///
 /// 1. The runner calls [`SystemParam::fetch`] — `Commands` captures
 ///    references to the two cells, no data is moved.
-/// 2. The system queues spawns / inserts / despawns. Component writes
-///    are *not yet visible* to other systems.
+/// 2. The system queues spawns / inserts / removes / despawns. These
+///    structural changes are *not yet visible* to other systems.
 /// 3. At the next flush point — after the stage's sequential systems, or
 ///    at a workload boundary — [`World::flush_commands`] drains the queue
 ///    into the world; the queued writes land all at once. Systems that run
@@ -284,17 +293,63 @@ impl Commands<'_> {
             world.despawn(entity);
         }));
     }
+
+    /// Returns an [`EntityCommands`] builder bound to an *existing*
+    /// `entity`, so callers can queue `insert` / `remove` ops on an
+    /// entity spawned earlier — in a prior frame, a prior system, or
+    /// earlier in this same system via [`spawn`](Self::spawn).
+    ///
+    /// Unlike [`spawn`](Self::spawn), this allocates nothing and touches
+    /// no world state at call time — it just wraps the handle. `entity`
+    /// is not validated for liveness here; validation happens at flush,
+    /// inside each queued op.
+    ///
+    /// # Despawn-then-mutate
+    ///
+    /// Ops queued against an entity that is no longer live when the queue
+    /// flushes are **dropped silently** — no panic, no slot resurrection.
+    /// This falls out of the [`World`] mutators, not bespoke logic:
+    /// [`World::insert`] and [`World::remove`] both check liveness and
+    /// return early on a stale handle. Because the queue is FIFO, a
+    /// [`despawn`](Self::despawn) queued *before* a mutation on the same
+    /// entity always fires first, so the later op finds a dead handle and
+    /// dissolves.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use spark_ecs::{Commands, Component, IntoSystem, World};
+    ///
+    /// #[derive(Component)]
+    /// struct Frozen;
+    ///
+    /// let mut world = World::new();
+    /// let e = world.spawn().id();
+    ///
+    /// let mut sys = IntoSystem::into_system(move |mut commands: Commands| {
+    ///     commands.entity(e).insert(Frozen);
+    /// });
+    /// sys(&world);
+    /// world.flush_commands();
+    /// assert!(world.get::<Frozen>(e).is_some());
+    /// ```
+    pub fn entity(&mut self, entity: Entity) -> EntityCommands<'_> {
+        EntityCommands {
+            entity,
+            queue: self.queue,
+        }
+    }
 }
 
-/// Builder returned by [`Commands::spawn`]. Chains
-/// `.insert(component)` queues and exposes the synchronously-allocated
-/// [`Entity`] via [`id`](Self::id).
-///
-/// Holds a reference to the parent [`CommandQueue`] cell so its
-/// `insert` calls reach the same queue every other [`Commands`]
-/// operation uses.
+/// Builder returned by [`Commands::spawn`] (freshly-allocated entity) and
+/// [`Commands::entity`] (existing entity). Chains `.insert(component)` /
+/// `.remove::<T>()` queues and exposes the bound [`Entity`] via
+/// [`id`](Self::id).
 ///
 /// # Examples
+///
+/// Both builder sources at work — `spawn()` for a fresh entity, and
+/// `entity(e)` to mutate an existing one:
 ///
 /// ```
 /// use spark_ecs::{Commands, Component, IntoSystem, World};
@@ -304,16 +359,21 @@ impl Commands<'_> {
 /// #[derive(Component)]
 /// struct Velocity(f32, f32);
 ///
-/// fn spawn_one(mut commands: Commands) {
-///     commands.spawn()
-///         .insert(Position(0.0, 0.0))
-///         .insert(Velocity(1.0, 0.0));
-/// }
-///
 /// let mut world = World::new();
-/// let mut sys = IntoSystem::into_system(spawn_one);
+/// // An entity that already exists before the system runs.
+/// let existing = world.spawn().insert(Position(0.0, 0.0)).insert(Velocity(1.0, 0.0)).id();
+///
+/// let mut sys = IntoSystem::into_system(move |mut commands: Commands| {
+///     commands.spawn().insert(Position(5.0, 5.0)); // fresh entity
+///     commands.entity(existing).remove::<Velocity>(); // mutate existing
+/// });
 /// sys(&world);
 /// world.flush_commands();
+///
+/// // The freshly-spawned entity plus the original both carry Position.
+/// assert_eq!(spark_ecs::Query::<&Position>::from_world(&world).iter().count(), 2);
+/// // The queued remove landed: `existing` no longer has Velocity.
+/// assert!(world.get::<Velocity>(existing).is_none());
 /// ```
 pub struct EntityCommands<'a> {
     entity: Entity,
@@ -356,23 +416,74 @@ impl EntityCommands<'_> {
         self
     }
 
+    /// Queues a `remove::<T>(entity)` for the next flush.
+    ///
+    /// Idempotent: at flush time, removing a `T` the entity doesn't have
+    /// — never inserted, already removed, or the entity itself despawned
+    /// — is a silent no-op. [`World::remove`] returns `None` on a missing
+    /// component or a stale handle, and that `None` is discarded here:
+    /// deferred ops can't hand a value back to the queuing system. A
+    /// caller who needs the removed value must call [`World::remove`]
+    /// directly against `&mut World`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use spark_ecs::{Commands, Component, IntoSystem, World};
+    ///
+    /// #[derive(Component)]
+    /// struct Stunned;
+    ///
+    /// let mut world = World::new();
+    /// let e = world.spawn().insert(Stunned).id();
+    ///
+    /// let mut sys = IntoSystem::into_system(move |mut commands: Commands| {
+    ///     commands.entity(e).remove::<Stunned>();
+    /// });
+    /// sys(&world);
+    /// world.flush_commands();
+    /// assert!(world.get::<Stunned>(e).is_none());
+    /// ```
+    // Builder-chain ergonomics: discardable mid-chain, same rationale as
+    // `insert` — `#[must_use]` would just force a stray `let _ =`. `remove`
+    // also trips `must_use_candidate` (unlike `insert`) because it takes no
+    // by-value component arg, so clippy reads it as a query worth keeping;
+    // it's the same discardable builder, so we waive that too.
+    #[allow(
+        clippy::return_self_not_must_use,
+        clippy::must_use_candidate,
+        reason = "builder is deliberately discardable mid-chain"
+    )]
+    pub fn remove<T: Component>(self) -> Self {
+        let entity = self.entity;
+        self.queue.borrow_mut().push(Box::new(move |world| {
+            world.remove::<T>(entity);
+        }));
+        self
+    }
+
     /// Returns the [`Entity`] handle this builder names.
     ///
     /// # Examples
     ///
     /// ```
+    /// use std::cell::Cell;
+    /// use std::rc::Rc;
+    ///
     /// use spark_ecs::{Commands, IntoSystem, World};
     ///
-    /// fn spawn_and_capture(mut commands: Commands) {
-    ///     let id = commands.spawn().id();
-    ///     // `id` is a real Entity right now — usable inside this system.
-    ///     let _ = id;
-    /// }
+    /// let captured: Rc<Cell<Option<_>>> = Rc::new(Cell::new(None));
+    /// let sink = captured.clone();
+    /// let mut sys = IntoSystem::into_system(move |mut commands: Commands| {
+    ///     // `.id()` is synchronous — the handle is real inside this system.
+    ///     sink.set(Some(commands.spawn().id()));
+    /// });
     ///
-    /// let mut world = World::new();
-    /// let mut sys = IntoSystem::into_system(spawn_and_capture);
+    /// let world = World::new();
     /// sys(&world);
-    /// world.flush_commands();
+    /// let id = captured.get().expect("spawn allocates before flush");
+    /// // Live now, no `flush_commands()` needed for the entity itself.
+    /// assert!(world.is_alive(id));
     /// ```
     #[must_use]
     pub fn id(&self) -> Entity {
@@ -412,8 +523,8 @@ impl<'a> SystemParam for Commands<'a> {
 )]
 mod tests {
     use super::*;
-    use crate::Component;
     use crate::system::IntoSystem;
+    use crate::{Component, Query};
 
     #[derive(Debug, PartialEq, Component)]
     struct Position(i32, i32);
@@ -448,15 +559,12 @@ mod tests {
         // Pre-flush: the entity is alive (sync allocate), but its
         // component isn't reachable yet — still queued.
         assert_eq!(
-            crate::Query::<&Position>::from_world(&world).iter().count(),
+            Query::<&Position>::from_world(&world).iter().count(),
             0,
             "insert must not land before flush"
         );
         world.flush_commands();
-        assert_eq!(
-            crate::Query::<&Position>::from_world(&world).iter().count(),
-            1
-        );
+        assert_eq!(Query::<&Position>::from_world(&world).iter().count(), 1);
     }
 
     #[test]
@@ -484,23 +592,19 @@ mod tests {
         world.spawn().insert(Position(0, 0));
         world.spawn().insert(Position(10, 10));
 
-        let mut sys =
-            IntoSystem::into_system(|q: crate::Query<&Position>, mut commands: Commands| {
-                // Iterate and queue a sibling for every entity we see.
-                // The original storage isn't mutated; new entities
-                // appear after flush.
-                let count = q.iter().count();
-                for _ in 0..count {
-                    commands.spawn().insert(Position(99, 99));
-                }
-            });
+        let mut sys = IntoSystem::into_system(|q: Query<&Position>, mut commands: Commands| {
+            // Iterate and queue a sibling for every entity we see.
+            // The original storage isn't mutated; new entities
+            // appear after flush.
+            let count = q.iter().count();
+            for _ in 0..count {
+                commands.spawn().insert(Position(99, 99));
+            }
+        });
         sys(&world);
         world.flush_commands();
         // Original 2 + 2 sibling spawns = 4.
-        assert_eq!(
-            crate::Query::<&Position>::from_world(&world).iter().count(),
-            4
-        );
+        assert_eq!(Query::<&Position>::from_world(&world).iter().count(), 4);
     }
 
     #[test]
@@ -534,9 +638,279 @@ mod tests {
         sys(&world);
         world.flush_commands();
         // No entity survived the round trip.
-        assert_eq!(
-            crate::Query::<&Position>::from_world(&world).iter().count(),
-            0
+        assert_eq!(Query::<&Position>::from_world(&world).iter().count(), 0);
+    }
+
+    #[test]
+    fn entity_insert_and_remove_on_existing_entity() {
+        // `entity(e)` binds to a pre-existing entity; insert + remove both
+        // land at flush, uniformly with the spawn()-fresh case.
+        let mut world = World::new();
+        let e = world.spawn().insert(Position(1, 2)).id();
+        let mut sys = IntoSystem::into_system(move |mut commands: Commands| {
+            commands
+                .entity(e)
+                .insert(Velocity(3, 4))
+                .remove::<Position>();
+        });
+        sys(&world);
+        // Deferred: pre-flush the original component is untouched.
+        assert_eq!(*world.get::<Position>(e).unwrap(), Position(1, 2));
+        world.flush_commands();
+        assert!(world.get::<Position>(e).is_none());
+        assert_eq!(*world.get::<Velocity>(e).unwrap(), Velocity(3, 4));
+    }
+
+    #[test]
+    fn remove_on_entity_lacking_component_is_noop() {
+        // `remove::<T>()` on an entity that lacks `T` is idempotent — no
+        // panic, the entity and its other components survive. The `T`
+        // storage *exists* (another entity has it), so this exercises the
+        // storage-level "entity not present" path, not the missing-storage
+        // path (see `remove_with_no_storage_ever_created_is_noop`).
+        let mut world = World::new();
+        let e = world.spawn().insert(Position(0, 0)).id();
+        world.spawn().insert(Velocity(7, 7)); // forces Velocity storage to exist
+        let mut sys = IntoSystem::into_system(move |mut commands: Commands| {
+            commands.entity(e).remove::<Velocity>();
+        });
+        sys(&world);
+        world.flush_commands();
+        assert!(world.is_alive(e));
+        assert!(world.get::<Position>(e).is_some());
+    }
+
+    #[test]
+    fn despawn_then_mutate_drops_silently() {
+        // FIFO: despawn fires first, so the later insert finds a dead
+        // handle and dissolves — World::insert no-ops on a stale handle.
+        let mut world = World::new();
+        let e = world.spawn().insert(Position(5, 5)).id();
+        let mut sys = IntoSystem::into_system(move |mut commands: Commands| {
+            commands.despawn(e);
+            commands.entity(e).insert(Velocity(1, 1));
+        });
+        sys(&world);
+        world.flush_commands();
+        assert!(!world.is_alive(e));
+        assert!(world.get::<Velocity>(e).is_none());
+    }
+
+    #[test]
+    fn chained_insert_insert_remove() {
+        // Ops fire in push order: insert(Position) -> insert(Velocity) ->
+        // remove::<Position>() nets to "no Position"; Velocity survives.
+        let mut world = World::new();
+        let id_cell = std::rc::Rc::new(std::cell::Cell::new(None));
+        let id_cell_clone = id_cell.clone();
+        let mut sys = IntoSystem::into_system(move |mut commands: Commands| {
+            let id = commands
+                .spawn()
+                .insert(Position(1, 2))
+                .insert(Velocity(3, 4))
+                .remove::<Position>()
+                .id();
+            id_cell_clone.set(Some(id));
+        });
+        sys(&world);
+        world.flush_commands();
+        let id = id_cell.get().unwrap();
+        assert!(world.get::<Position>(id).is_none());
+        assert_eq!(*world.get::<Velocity>(id).unwrap(), Velocity(3, 4));
+    }
+
+    #[test]
+    fn insert_then_despawn_sweeps_the_component() {
+        // The reverse order from `despawn_then_mutate_drops_silently`:
+        // the insert *does* fire (entity still live), then despawn's
+        // storage sweep removes it. The component is never observable on
+        // a dead entity — there is no window where it persists.
+        let mut world = World::new();
+        let e = world.spawn().insert(Position(5, 5)).id();
+        let mut sys = IntoSystem::into_system(move |mut commands: Commands| {
+            commands.entity(e).insert(Velocity(9, 9));
+            commands.despawn(e);
+        });
+        sys(&world);
+        world.flush_commands();
+        assert!(!world.is_alive(e));
+        assert!(world.get::<Velocity>(e).is_none());
+    }
+
+    #[test]
+    fn queued_despawn_does_not_reuse_slot_for_same_frame_spawn() {
+        // `despawn` is deferred, so `old`'s slot is still live (not on the
+        // free-list) when a same-system `spawn` allocates — the new entity
+        // therefore gets a *distinct* handle, never `old`'s slot. This
+        // closes the same-frame half of the slot-reuse hazard: there is no
+        // window where a queued op against `old` could collide with a fresh
+        // tenant, because no fresh tenant can take `old`'s slot this frame.
+        // (The cross-reuse case — a despawned slot genuinely reallocated,
+        // then hit by a stale handle — is rejected by the generation check
+        // and is covered at the `World` layer by
+        // `stale_handle_after_slot_reuse_is_rejected`.)
+        let mut world = World::new();
+        let old = world.spawn().insert(Position(1, 1)).id();
+        let id_cell = std::rc::Rc::new(std::cell::Cell::new(None));
+        let id_cell_clone = id_cell.clone();
+        let mut sys = IntoSystem::into_system(move |mut commands: Commands| {
+            commands.despawn(old);
+            // Sync allocate — must not reuse `old`'s still-live slot.
+            let fresh = commands.spawn().id();
+            assert_ne!(fresh.index, old.index, "fresh must not take old's slot");
+            // A mutation queued against the dead-to-be `old` must drop, not
+            // resurrect it.
+            commands.entity(old).insert(Velocity(99, 99));
+            id_cell_clone.set(Some(fresh));
+        });
+        sys(&world);
+        world.flush_commands();
+        let fresh = id_cell.get().unwrap();
+        assert!(!world.is_alive(old), "old despawned");
+        assert!(world.is_alive(fresh), "fresh survives");
+        // The stale insert against `old` dropped silently.
+        assert!(world.get::<Velocity>(old).is_none());
+    }
+
+    #[test]
+    fn remove_with_no_storage_ever_created_is_noop() {
+        // `remove::<T>()` where no entity ever had a `T` (the
+        // ComponentStorage<T> doesn't exist) returns cleanly via the `?`
+        // on the storage lookup — no panic, no storage materialised.
+        let mut world = World::new();
+        let e = world.spawn().insert(Position(0, 0)).id();
+        let mut sys = IntoSystem::into_system(move |mut commands: Commands| {
+            commands.entity(e).remove::<Velocity>();
+        });
+        sys(&world);
+        world.flush_commands();
+        assert!(world.is_alive(e));
+        assert!(world.get::<Position>(e).is_some());
+    }
+
+    #[test]
+    fn remove_then_reinsert_same_type_nets_to_new_value() {
+        // The reverse FIFO of `entity_insert_and_remove_on_existing_entity`:
+        // remove fires first (clears the old `Position`), then insert fires
+        // and reattaches a new value. Last write wins.
+        let mut world = World::new();
+        let e = world.spawn().insert(Position(1, 2)).id();
+        let mut sys = IntoSystem::into_system(move |mut commands: Commands| {
+            commands.entity(e).remove::<Position>();
+            commands.entity(e).insert(Position(9, 9));
+        });
+        sys(&world);
+        world.flush_commands();
+        assert_eq!(*world.get::<Position>(e).unwrap(), Position(9, 9));
+    }
+
+    #[test]
+    fn despawn_then_remove_drops_silently() {
+        // Companion to `despawn_then_mutate_drops_silently`, which covers
+        // the *insert* path: this exercises the *remove* path's own
+        // `World::remove` is_alive guard against a stale handle.
+        let mut world = World::new();
+        let e = world.spawn().insert(Position(5, 5)).id();
+        let mut sys = IntoSystem::into_system(move |mut commands: Commands| {
+            commands.despawn(e);
+            commands.entity(e).remove::<Position>();
+        });
+        sys(&world);
+        world.flush_commands(); // must not panic
+        assert!(!world.is_alive(e));
+    }
+
+    #[test]
+    fn entity_on_never_allocated_handle_drops_silently() {
+        // `entity()` does not validate liveness — a fabricated handle the
+        // allocator never issued must still flush cleanly, with every
+        // queued op dropped by the World mutators' is_alive guards.
+        let mut world = World::new();
+        // Fields are `pub(crate)`, so a fabricated handle is constructible
+        // from inside the crate's test module.
+        let garbage = Entity {
+            index: 9999,
+            generation: 42,
+        };
+        let mut sys = IntoSystem::into_system(move |mut commands: Commands| {
+            commands.entity(garbage).insert(Position(1, 1));
+            commands.entity(garbage).remove::<Position>();
+        });
+        sys(&world);
+        world.flush_commands(); // must not panic
+        assert!(!world.is_alive(garbage));
+        assert!(world.get::<Position>(garbage).is_none());
+    }
+
+    #[test]
+    fn entity_stale_after_cross_frame_slot_reuse_drops_silently() {
+        // The cross-frame companion to
+        // `queued_despawn_does_not_reuse_slot_for_same_frame_spawn`: once a
+        // despawn has actually flushed, the freed slot CAN be reallocated to
+        // a new entity with a bumped generation. A later `commands.entity`
+        // call on the *stale* handle must drop via the generation check in
+        // `World::insert` / `World::remove` — never corrupting the new
+        // tenant. (The bare-`World` form of this is
+        // `stale_handle_after_slot_reuse_is_rejected` in world.rs; this pins
+        // the deferred `Commands` path.)
+        let mut world = World::new();
+        let old = world.spawn().insert(Position(1, 1)).id();
+        world.despawn(old);
+        // Slot is now free; reallocate it for a fresh entity.
+        let fresh = world.spawn().insert(Velocity(9, 9)).id();
+        assert_eq!(old.index, fresh.index, "fresh reuses old's slot");
+        assert_ne!(old, fresh, "but with a bumped generation");
+
+        let mut sys = IntoSystem::into_system(move |mut commands: Commands| {
+            commands.entity(old).insert(Position(99, 99)); // stale — must drop
+            commands.entity(old).remove::<Velocity>(); // stale — must drop
+        });
+        sys(&world);
+        world.flush_commands(); // must not panic, must not corrupt `fresh`
+
+        assert!(world.is_alive(fresh));
+        // `fresh`'s Velocity is untouched by the stale remove.
+        assert_eq!(*world.get::<Velocity>(fresh).unwrap(), Velocity(9, 9));
+        // The stale insert did not land on the reused slot.
+        assert!(world.get::<Position>(fresh).is_none());
+    }
+
+    #[test]
+    fn remove_is_deferred_until_flush() {
+        // Mirrors `insert_is_deferred_until_flush` / `despawn_is_deferred_
+        // until_flush`: a standalone `remove` is queued, not applied, until
+        // the flush point — the component stays readable in between.
+        let mut world = World::new();
+        let e = world.spawn().insert(Position(3, 4)).id();
+        let mut sys = IntoSystem::into_system(move |mut commands: Commands| {
+            commands.entity(e).remove::<Position>();
+        });
+        sys(&world);
+        // Pre-flush: still queued, component readable.
+        assert!(
+            world.get::<Position>(e).is_some(),
+            "remove must not land before flush"
         );
+        world.flush_commands();
+        assert!(world.get::<Position>(e).is_none());
+    }
+
+    #[test]
+    fn remove_then_despawn_entity_is_dead_post_flush() {
+        // Mirror of `insert_then_despawn_sweeps_the_component` and the
+        // reverse of `despawn_then_remove_drops_silently`: the remove fires
+        // first (strips the component), then despawn fires and must still
+        // kill the live entity, sweeping the already-absent storage entry
+        // without trouble.
+        let mut world = World::new();
+        let e = world.spawn().insert(Position(5, 5)).id();
+        let mut sys = IntoSystem::into_system(move |mut commands: Commands| {
+            commands.entity(e).remove::<Position>();
+            commands.despawn(e);
+        });
+        sys(&world);
+        world.flush_commands();
+        assert!(!world.is_alive(e));
+        assert!(world.get::<Position>(e).is_none());
     }
 }
