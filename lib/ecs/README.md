@@ -92,7 +92,7 @@ write.
 - **System** — a plain Rust function whose parameters describe what
   it reads and writes: `Res<T>`, `ResMut<T>`, `Query<D, F>` (for
   `D = &T`, `&mut T`, or a tuple of those), `Commands` for deferred
-  spawn / despawn / insert / remove, and `EventReader<T>` /
+  spawn / despawn / insert / remove / event sends, and `EventReader<T>` /
   `EventWriter<T>` for messaging. Each is covered in its own section below.
 
 ```rust
@@ -1339,6 +1339,7 @@ commands.
 | `commands.spawn().id()` / `commands.entity(e).id()` | Returns the `Entity` the builder is bound to. For `spawn()` it's freshly allocated and live immediately; for `entity(e)` it's just `e` back. |
 | `commands.insert_resource::<R>(r)` | Queues `World::add_resource(r)` for the next flush — the deferred way to **create** a resource from a system. Overwrites if `R` already exists. |
 | `commands.update_resource::<R>(f)` | Queues `f(&mut R)` to run at the next flush against the existing `R`. **Panics at flush** if `R` is absent — it mutates, never creates (use `insert_resource` first). |
+| `commands.send_event::<E>(event)` | Queues `Events::<E>::send(event)` for the next flush. Panics at flush if `Events<E>` was not registered via `Application::add_event::<E>()`. |
 
 Ops queued through `commands.entity(e)` against an entity that is no
 longer live at flush — e.g. `commands.despawn(e)` then
@@ -1436,6 +1437,13 @@ You rarely call `swap` by hand. In an app,
 `Events<T>` buffer and registers the swap on `Stage::Input`, pumped first
 each frame by the window runner — so sending is just `EventWriter::send`
 and reading next frame is `EventReader::read`.
+
+A system that already takes `Commands` for structural edits can skip the
+extra `EventWriter<E>` parameter and call `commands.send_event(MyEvent { .. })`
+instead. The send is queued like any other command and fires at the same
+flush point, landing in `current` — so readers see it next frame, exactly as
+if it came from an `EventWriter`. (It panics at flush if you forgot
+`Application::add_event::<MyEvent>()`.)
 
 `EventReader` is **stateless**: it holds no per-system cursor, so it always
 reads the previous-frame snapshot rather than "resuming where it left off."
