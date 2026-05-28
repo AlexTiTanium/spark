@@ -171,21 +171,26 @@ gives us a uniform Rust interface:
 ### Per-frame schedule, today
 
 The loop is built once inside [`run`], then handed to winit via
-`run_app(&mut runner)`. The runner owns the [`Application`] that was
-handed to it from the
+`run_app(&mut runner)`, paced with `ControlFlow::WaitUntil` at ~60 Hz.
+The runner owns the
+[`Application`] that was handed to it from the
 [`set_runner`](../spark_core/struct.Application.html#method.set_runner)
-closure. On every `WindowEvent::RedrawRequested`, the runner ticks the
-per-frame stages — swapping event buffers in `Input` first, advancing the
-[`Time`](../spark_common/struct.Time.html) clock in `PreUpdate`, then
-reading `Time::fixed_steps_this_frame()` to drive the simulation — then
-asks winit for the next redraw:
+closure, and splits the frame across **two winit hooks**:
+
+- `about_to_wait` runs once per loop wake and drives the *simulation*
+  block — swapping event buffers in `Input` first, advancing the
+  [`Time`](../spark_common/struct.Time.html) clock in `PreUpdate`, then reading
+  `Time::fixed_steps_this_frame()` to step the simulation — then rearms the
+  ~60 Hz `WaitUntil` timer and asks winit for a redraw.
+- `RedrawRequested` drives only `Stage::Render`. It's a no-op today (no render
+  systems are registered); a `wgpu` swapchain will pace it at vsync in M5.
 
 ```text
    ┌──────────────────────────────────────────────────────┐
-   │  one frame (on RedrawRequested) — TODAY              │
+   │  about_to_wait — each ~60 Hz wake (WaitUntil)        │
    │                                                      │
    │   1. app.run_stage(Stage::Input)                     │  ◀── event-buffer
-   │      → flush queued commands                         │       swap
+   │      → flush queued commands                         │       swap (FIRST)
    │                                                      │
    │   2. app.run_stage(Stage::PreUpdate)                 │  ◀── advance_time:
    │      → advance_time updates Time                     │       sample clock,
@@ -201,8 +206,15 @@ asks winit for the next redraw:
    │   5. app.run_stage(Stage::PostUpdate)                │  ◀── settled-state
    │      → flush queued commands                         │       bookkeeping
    │                                                      │
-   │   6. window.request_redraw()                         │  ◀── queue next
-   │                                                      │       frame
+   │   6. set_control_flow(WaitUntil(now + 1/60 s))       │  ◀── sleep, don't
+   │                                                      │       busy-spin
+   │   7. window.request_redraw()                         │  ◀── queue a frame
+   └──────────────────────────────────────────────────────┘
+   ┌──────────────────────────────────────────────────────┐
+   │  RedrawRequested — gated by the swapchain (M5)       │
+   │                                                      │
+   │   8. app.run_stage(Stage::Render)                    │  ◀── rendering
+   │                                                      │       (no-op today)
    └──────────────────────────────────────────────────────┘
 ```
 
@@ -236,78 +248,45 @@ catch-up steps at once — the "spiral of death". Keeping the math in a
 directly: carry-over across frames, the clamp, and the inclusive step boundary
 all have table-driven tests in `spark-common`.
 
-The control-flow mode is `ControlFlow::Wait`: the OS thread sleeps
-between frames and `window.request_redraw()` is what wakes it for
-the next tick. This is **temporary** — it's the minimum that makes
-the per-frame stages tick at all without a render path. It works
-because the OS compositor schedules the redraw at roughly its native
-cadence, so frames don't free-spin and CPU stays cool. The cost: no
-sub-frame precision and no way to drain queued input events between
-ticks. Both come back when the loop flips to `Poll` (see below).
+The control-flow mode is `ControlFlow::WaitUntil`, rearmed to `now +
+1/60 s` at the end of each `about_to_wait`: the thread sleeps between
+wakes, so idle CPU stays low, and the simulation steps independently of
+when the GPU is ready to draw.
+
+This is a **deliberate deviation** from
+[issue #50](https://github.com/AlexTiTanium/spark/issues/50), whose
+target is bare `ControlFlow::Poll`. `Poll` never sleeps — it only makes
+sense once a `wgpu` swapchain gates `RedrawRequested` at vsync (M5) to
+pace the loop; before then it **busy-spins a CPU core for no gain**. M5
+is milestones away, yet the loop already has a real interim consumer:
+the debug-only [`spark-mcp`](https://github.com/AlexTiTanium/spark/issues/78)
+plugin drains its request inbox on a per-frame stage, so the loop must
+wake steadily (an idle MCP server burning a core for the whole dev
+session is the cost `Poll` would impose). `WaitUntil` gives that steady
+wake without the spin; the swapchain replaces it with `Poll` + vsync at
+M5.
+
+The wake cadence doesn't affect sim timing: `advance_time` banks
+*wall-clock* time, so `FixedUpdate` still steps at a steady 60 Hz no
+matter how often the loop wakes — `WaitUntil` is a ceiling on idle
+wakeups, not a precise frame scheduler (that's the swapchain's job).
 
 ### Where we're headed
 
-The shipping shape is a stepping stone. The target loop — the one
-[`docs/PLAN.md`](../../docs/PLAN.md) calls for — separates input,
-fixed-timestep simulation, variable-rate game logic, and rendering
-into distinct slots driven by two different winit hooks:
-
-```text
-   ┌───────────────────────────────────────────────────┐
-   │  one frame — TARGET                               │
-   │                                                   │
-   │  about_to_wait  ┐    (ControlFlow::Poll)          │
-   │                 │                                 │
-   │   1. drain queued WindowEvents into the           │  ◀── Input
-   │      KeyboardState / MouseState resources         │       collection
-   │                                                   │
-   │   2. run the Stage::FixedUpdate stage N times     │  ◀── Simulation
-   │      (60 Hz fixed timestep — deterministic)       │       (60 Hz)
-   │                                                   │
-   │   3. run the Stage::Update stage once             │  ◀── Per-frame
-   │      (variable rate — animations, ECS commands)   │       game logic
-   │                                                   │
-   │  RedrawRequested  ┐                               │
-   │                   │                               │
-   │   4. run the Stage::Render stage                  │  ◀── Rendering
-   │      (push a frame to the GPU)                    │       (variable)
-   │                                                   │
-   └───────────────────────────────────────────────────┘
-```
-
-What's different from today:
-
-- **`ControlFlow::Poll`** instead of `Wait`. Poll asks winit to fire
-  `about_to_wait` as fast as the OS allows. That's where the
-  per-frame *simulation* lives — independent of when the GPU is ready
-  to draw. With `Wait`, sim and render are conflated into the single
-  `RedrawRequested` handler; with `Poll`, they separate cleanly.
-- **Two hooks, not one.** `about_to_wait` runs input + sim every
-  iteration; `RedrawRequested` only fires the render schedule. The
-  swapchain (via `wgpu`) is what gates `RedrawRequested` cadence, so
-  rendering paces against vsync without us doing anything special.
-- **`Stage::FixedUpdate` moves to `about_to_wait`.** The accumulator
-  driver itself already ships (see *the fixed-timestep loop* above); under
-  `Poll` it relocates from the `RedrawRequested` handler to
-  `about_to_wait`, so simulation steps independently of when the GPU is
-  ready to draw.
-- **Input collection already shipped, decoupled from the loop.** Keyboard,
-  mouse, cursor, wheel, and focus events are forwarded as [`spark-input`]
-  events (see *Forwarding input into the world* above) and turned into
-  `KeyboardState` / `MouseState` by [`spark-input`]'s systems on `Stage::Input`
-  — no longer just `tracing` lines. The remaining `Poll`-related change is only
-  about *when* OS events are drained relative to sim, not *whether* they reach
-  the world.
-
-Each piece grows into its own crate as the milestones land:
+The two-hook split is in place; what's still missing is the swapchain
+that makes it pay off. As the milestones land:
 
 | Capability | Where it'll live | Milestone |
 |-|-|-|
 | ✅ Input collection — forward OS input as events into `KeyboardState` / `MouseState` | `spark-input` | **shipped** |
 | ✅ `Stage::FixedUpdate` driver — reads `Time::fixed_steps_this_frame()` (accumulator owned by `Time`) | `spark-window` runner + `spark-common` | **shipped** |
-| `ControlFlow::Wait → Poll` flip + `about_to_wait` driver (relocates `FixedUpdate`) | `spark-window` | M3 follow-up |
-| `Stage::Render` driver that pushes a frame to the GPU | `spark-render` (`wgpu` + WGSL) | M5 |
+| ✅ `about_to_wait` sim driver (relocates `FixedUpdate`) + `WaitUntil` ~60 Hz pacer (interim for `Poll`) | `spark-window` | **shipped** |
+| `Stage::Render` driver that pushes a frame to the GPU — gates `RedrawRequested` at vsync, replacing the `WaitUntil` pacer with `ControlFlow::Poll` | `spark-render` (`wgpu` + WGSL) | M5 |
+| Sub-frame render interpolation between fixed ticks | `spark-render` | later |
 | Multi-threaded scheduler | `spark-ecs` parallel executor | M4 |
+
+Until the swapchain lands, `RedrawRequested` runs an empty `Stage::Render`
+and `WaitUntil` paces the loop at ~60 Hz — see the pacing note above.
 
 The per-stage pattern — *run every system, then flush pending
 `Commands`* — is settled and won't change. The `Stage` enum is closed:
@@ -343,8 +322,9 @@ When `Application::run()` fires, it hands itself to that closure
 instead of returning early. The closure's job is to drive the
 application until exit — for `WindowPlugin`, that means moving the
 `Application` into the `EventLoopRunner` and handing the main thread
-to `winit::EventLoop::run_app`. Each `RedrawRequested` ticks the
-per-frame stages on that owned `Application`. When the user closes
+to `winit::EventLoop::run_app`. The loop ticks the simulation stages in
+`about_to_wait` and `Stage::Render` in `RedrawRequested` on that owned
+`Application`. When the user closes
 the window, `run_app` returns, the closure returns `Ok(())`, and
 `Application::run` returns to the caller.
 
@@ -355,7 +335,9 @@ Things worth knowing:
   registering two runner-installing plugins means the last one wins.
 - **The runner owns the `Application`.** The closure takes
   `Application` by value; the `EventLoopRunner` stores it as a field
-  and ticks `PreUpdate → Update → PostUpdate` on every redraw.
+  and ticks the simulation stages (`Input → PreUpdate → FixedUpdate × N
+  → Update → PostUpdate`) in `about_to_wait`, leaving `Stage::Render`
+  for `RedrawRequested`.
 - **`set_runner` is what makes the plugin model windowed-game-
   friendly.** Without it, anyone wanting to use winit would have to
   bypass `Application` entirely. With it, windowed apps stay inside

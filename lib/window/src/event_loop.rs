@@ -4,18 +4,39 @@
 //! builds a [`winit::event_loop::EventLoop`], pairs it with an
 //! internal `EventLoopRunner` that implements
 //! [`ApplicationHandler`](winit::application::ApplicationHandler), and
-//! hands the loop to winit. On every `RedrawRequested`, the runner
-//! ticks the per-frame stages — `Input → PreUpdate → (FixedUpdate × N) →
-//! Update → PostUpdate` — then asks winit for the next redraw. `Input`
-//! runs first and swaps the double-buffered event queues; `PreUpdate`
-//! advances the [`Time`](spark_common::Time) clock, which owns the 60 Hz
-//! fixed-timestep accumulator. The runner then reads
-//! [`Time::fixed_steps_this_frame`](spark_common::Time::fixed_steps_this_frame)
-//! and dispatches `FixedUpdate` that many times, so the simulation advances
-//! in fixed 60 Hz steps regardless of display frame rate. The runner holds no
-//! clock state of its own.
+//! hands the loop to winit under [`ControlFlow::WaitUntil`]. The frame
+//! splits across two winit hooks:
+//!
+//! - [`about_to_wait`](ApplicationHandler::about_to_wait) runs once per loop
+//!   iteration and drives the *simulation* block — `Input → PreUpdate →
+//!   (FixedUpdate × N) → Update → PostUpdate`. `Input` runs first and swaps the
+//!   double-buffered event queues; `PreUpdate` advances the
+//!   [`Time`](spark_common::Time) clock, which owns the 60 Hz fixed-timestep
+//!   accumulator. The runner then reads
+//!   [`Time::fixed_steps_this_frame`](spark_common::Time::fixed_steps_this_frame)
+//!   and dispatches `FixedUpdate` that many times, so the simulation advances
+//!   in fixed 60 Hz steps regardless of display frame rate.
+//! - `RedrawRequested` drives only `Stage::Render`. Once a `wgpu` swapchain
+//!   lands (M5) its present-rate paces this hook at vsync; until then no render
+//!   systems are registered, so it is a no-op.
+//!
+//! The runner holds no clock state of its own.
+//!
+//! **Pacing.** `#50`'s target is bare `ControlFlow::Poll`, but `Poll` only
+//! makes sense once a swapchain gates `RedrawRequested` at vsync (M5) — until
+//! then it busy-spins a core for no gain. M5 is milestones away, yet the loop
+//! already has a real interim consumer: the debug-only `spark-mcp` plugin (#78)
+//! drains its request inbox on a per-frame stage, so the loop must wake
+//! steadily. So we pace with [`ControlFlow::WaitUntil`] at ~60 Hz instead: the
+//! thread sleeps between wakes (idle CPU stays low) and `about_to_wait` fires
+//! about once every [`FRAME_INTERVAL`]. This is the deliberate, documented
+//! deviation from #50's "use `Poll`" line; the swapchain replaces the pacer at
+//! M5. The wake cadence does not affect sim timing: `advance_time` banks
+//! *wall-clock* time, so `FixedUpdate` still steps at a steady 60 Hz however
+//! often the loop wakes.
 
 use std::num::NonZeroU32;
+use std::time::{Duration, Instant};
 
 use spark_common::Time;
 use spark_core::{Application, Stage};
@@ -29,11 +50,34 @@ use winit::window::{Window, WindowAttributes, WindowId};
 use crate::config::WindowConfig;
 use crate::error::WindowError;
 
+/// Interim wake cadence for the [`ControlFlow::WaitUntil`] pacer: one
+/// `1/60 s` tick (16.667 ms).
+///
+/// This is a *ceiling on idle wakeups*, not a precise frame scheduler —
+/// `about_to_wait` rearms the timer to `now + FRAME_INTERVAL` each wake, so
+/// sim work pushes the effective rate slightly below 60 Hz. That is fine:
+/// `Time`'s 60 Hz accumulator decides how many `FixedUpdate` steps to run from
+/// *wall-clock* elapsed time, independent of when the loop happens to wake.
+/// Precise frame pacing is the swapchain's job once `Stage::Render` lands (M5),
+/// at which point this pacer is replaced by vsync.
+const FRAME_INTERVAL: Duration = Duration::from_micros(16_667);
+
 /// Opens the window from `config` and drives the OS event loop until
-/// the user closes it, ticking [`Application`]'s per-frame stages on
-/// every `RedrawRequested`. Blocks the calling thread; must run on the
-/// main thread. Uses [`ControlFlow::Wait`] — `Window::request_redraw`
-/// wakes the loop for the next frame, naturally throttled by the OS.
+/// the user closes it. Blocks the calling thread; must run on the main
+/// thread. The simulation block ticks in
+/// [`about_to_wait`](ApplicationHandler::about_to_wait); `Stage::Render`
+/// ticks in `RedrawRequested`.
+///
+/// Paces the loop with [`ControlFlow::WaitUntil`] at ~60 Hz
+/// ([`FRAME_INTERVAL`]): the thread sleeps between wakes, so idle CPU
+/// stays low. #50's target is bare [`ControlFlow::Poll`], but `Poll`
+/// busy-spins a core until a swapchain gates `RedrawRequested` at vsync
+/// (M5, `spark-render`) — milestones away — while the loop already has a
+/// live interim consumer in the debug-only `spark-mcp` inbox drain (#78).
+/// `WaitUntil` is the deliberate interim
+/// ([see #50](https://github.com/AlexTiTanium/spark/issues/50), whose
+/// "use `Poll`" line this knowingly defers); the swapchain replaces the
+/// pacer at M5.
 ///
 /// Typically reached via
 /// [`WindowPlugin`](crate::WindowPlugin)'s runner closure rather than
@@ -57,7 +101,8 @@ use crate::error::WindowError;
 /// ```
 pub fn run(app: Application, config: WindowConfig) -> Result<(), WindowError> {
     let event_loop = EventLoop::new()?;
-    event_loop.set_control_flow(ControlFlow::Wait);
+    // Establish the initial wake; `about_to_wait` rearms it every wake.
+    event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + FRAME_INTERVAL));
 
     let mut runner = EventLoopRunner {
         app,
@@ -77,8 +122,9 @@ pub fn run(app: Application, config: WindowConfig) -> Result<(), WindowError> {
 
 /// State held across calls into the OS event loop.
 ///
-/// `app` is the owned [`Application`] — the runner ticks its stages on
-/// every `RedrawRequested`. `window` is `Option` because winit only
+/// `app` is the owned [`Application`] — the runner ticks its simulation
+/// stages in `about_to_wait` and `Stage::Render` in `RedrawRequested`.
+/// `window` is `Option` because winit only
 /// creates it after the loop is active
 /// ([`ApplicationHandler::resumed`]). M4 will move the window onto the
 /// ECS `World` as a resource. The runner holds no clock state of its own:
@@ -91,10 +137,11 @@ struct EventLoopRunner {
 }
 
 impl ApplicationHandler for EventLoopRunner {
-    /// Builds the OS window from `self.config`, then asks winit to
-    /// deliver the first `RedrawRequested` — that's what kicks the
-    /// per-frame loop into motion. winit calls this once on desktop
-    /// platforms and again on every foreground on mobile.
+    /// Builds the OS window from `self.config`. No redraw kick is needed:
+    /// the [`ControlFlow::WaitUntil`] timer set in [`run`] wakes the loop
+    /// on its own, and `about_to_wait` rearms the timer and requests each
+    /// frame's redraw. winit calls this once on desktop platforms and
+    /// again on every foreground on mobile.
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
@@ -116,9 +163,6 @@ impl ApplicationHandler for EventLoopRunner {
                     scale_factor = window.scale_factor(),
                     "window created"
                 );
-                // Kick the redraw chain — without this, the loop sits
-                // idle in `Wait` mode until an external event fires.
-                window.request_redraw();
                 self.window = Some(window);
             }
             Err(err) => {
@@ -131,12 +175,11 @@ impl ApplicationHandler for EventLoopRunner {
     /// Routes each OS event to the right handler.
     ///
     /// - `CloseRequested`: exits the loop so [`run`] returns.
-    /// - `RedrawRequested`: ticks `Input → PreUpdate → (FixedUpdate × N) →
-    ///   Update → PostUpdate`, swapping event buffers in `Input`. `PreUpdate`
-    ///   advances [`Time`] (which banks the fixed-timestep accumulator); the
-    ///   runner then reads `Time::fixed_steps_this_frame()` to dispatch
-    ///   `FixedUpdate` that many times, and requests the next redraw to keep
-    ///   the loop alive.
+    /// - `RedrawRequested`: ticks `Stage::Render` only. The simulation
+    ///   block lives in [`about_to_wait`](Self::about_to_wait); this hook
+    ///   is reserved for rendering, which a `wgpu` swapchain will pace at
+    ///   vsync (M5). No render systems are registered yet, so today it is a
+    ///   no-op.
     /// - Lifecycle / input events: logged at appropriate `tracing`
     ///   levels (cursor at `trace`, input at `debug`, focus/resize at
     ///   `info`). Device input (keyboard, mouse-button, cursor, wheel)
@@ -155,36 +198,11 @@ impl ApplicationHandler for EventLoopRunner {
                 event_loop.exit();
             }
             WindowEvent::RedrawRequested => {
-                // Per-frame tick. Each stage flushes its pending commands at
-                // the end of its run via `Application::run_stage`.
-                //
-                // `Input` runs first: it pumps the per-event swap systems
-                // registered by `Application::add_event`, rotating each
-                // `Events<T>` buffer so this frame's readers observe last
-                // frame's sends before any other stage touches them.
-                self.app.run_stage(Stage::Input);
-                // `PreUpdate` runs `advance_time` (registered first by
-                // `TimePlugin`): it samples the wall clock, advances `Time`, and
-                // banks the fixed-timestep accumulator for this frame.
-                self.app.run_stage(Stage::PreUpdate);
-
-                // Fixed-timestep simulation: `Time` already computed how many
-                // whole 1/60 s steps this frame's banked time covers — run
-                // `FixedUpdate` exactly that many times. Zero on a fast frame,
-                // several after a slow one, but never an unbounded burst (the
-                // 250 ms clamp inside `Time::tick` caps it at ~15).
-                let fixed_steps = self.app.world().resource::<Time>().fixed_steps_this_frame();
-                for _ in 0..fixed_steps {
-                    self.app.run_stage(Stage::FixedUpdate);
-                }
-
-                self.app.run_stage(Stage::Update);
-                self.app.run_stage(Stage::PostUpdate);
-                // Request the next frame. Under `ControlFlow::Wait`
-                // this is what wakes the loop for the next tick.
-                if let Some(window) = self.window.as_ref() {
-                    window.request_redraw();
-                }
+                // Render only. The simulation block runs in `about_to_wait`;
+                // this hook is reserved for `Stage::Render`, which a `wgpu`
+                // swapchain will pace at vsync (M5). No render systems are
+                // registered yet, so this is a no-op today.
+                self.app.run_stage(Stage::Render);
             }
             WindowEvent::Resized(size) => {
                 let nonzero = (NonZeroU32::new(size.width), NonZeroU32::new(size.height));
@@ -222,6 +240,57 @@ impl ApplicationHandler for EventLoopRunner {
                 crate::input::forward_wheel(&self.app, delta);
             }
             _ => {}
+        }
+    }
+
+    /// Drives the per-frame **simulation** block, once per loop wake.
+    ///
+    /// winit calls this after pending OS events drain — the natural home for
+    /// input + simulation, decoupled from rendering. It ticks the stages in
+    /// `Application`'s canonical order, minus the reserved render slot:
+    ///
+    /// `Input → PreUpdate → (FixedUpdate × N) → Update → PostUpdate`
+    ///
+    /// `Input` runs **first** (non-negotiable): it pumps the per-event swap
+    /// systems registered by `Application::add_event`, rotating each
+    /// `Events<T>` buffer so this frame's readers observe last frame's sends
+    /// before any other stage touches them. `PreUpdate` runs `advance_time`
+    /// (registered first by `TimePlugin`): it samples the wall clock, advances
+    /// [`Time`], and banks the fixed-timestep accumulator for this frame. Each
+    /// stage flushes its pending commands at the end of its run via
+    /// `Application::run_stage`.
+    ///
+    /// Then it rearms the [`ControlFlow::WaitUntil`] timer to the next
+    /// [`FRAME_INTERVAL`] boundary (so the thread sleeps instead of spinning)
+    /// and requests a redraw; the render lands in `RedrawRequested`. Redraw
+    /// requests coalesce, so requesting one per wake is harmless — once a
+    /// swapchain gates `RedrawRequested` at vsync (M5) this hook keeps stepping
+    /// the sim while rendering paces independently, and the `WaitUntil` pacer
+    /// is dropped in favour of `Poll`.
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.app.run_stage(Stage::Input);
+        self.app.run_stage(Stage::PreUpdate);
+
+        // Fixed-timestep simulation: `Time` already computed how many whole
+        // 1/60 s steps this frame's banked time covers — run `FixedUpdate`
+        // exactly that many times. Zero on a fast frame, several after a slow
+        // one, but never an unbounded burst (the 250 ms clamp inside
+        // `Time::tick` caps it at ~15).
+        let fixed_steps = self.app.world().resource::<Time>().fixed_steps_this_frame();
+        for _ in 0..fixed_steps {
+            self.app.run_stage(Stage::FixedUpdate);
+        }
+
+        self.app.run_stage(Stage::Update);
+        self.app.run_stage(Stage::PostUpdate);
+
+        // Sleep until the next ~60 Hz boundary instead of busy-spinning under
+        // `Poll`; the swapchain takes over pacing once `Stage::Render` lands.
+        event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + FRAME_INTERVAL));
+
+        // Ask the platform for a frame; `RedrawRequested` runs `Stage::Render`.
+        if let Some(window) = self.window.as_ref() {
+            window.request_redraw();
         }
     }
 }
