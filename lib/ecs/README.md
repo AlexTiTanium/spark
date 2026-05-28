@@ -282,7 +282,11 @@ assert_eq!(world.resource::<Score>().0, 7);
 ```
 
 Inside a *system*, prefer the `Res<T>` / `ResMut<T>` parameters —
-see *Systems and parameters* below.
+see *Systems and parameters* below. To *create* a resource from a
+system, use `Commands::insert_resource`; to *mutate* one when you
+can't take `ResMut<T>`, use `Commands::update_resource` (panics at
+flush if the resource is absent). Both are deferred to the next
+flush — see *Commands available today*.
 
 ## Entities
 
@@ -1238,8 +1242,15 @@ iteration stable (a system iterating `Query<&Plant>` can't have new
 plants pop into existence mid-loop) and keeps determinism intact for
 parallel execution.
 
+Resource ops (`insert_resource` / `update_resource`) ride the same
+queue for a different reason: they touch resource storage, not
+component storage, so there's no mutate-while-iterating hazard to
+dodge — they're deferred for *ordering and visibility*, landing at the
+flush boundary alongside the structural edits.
+
 > **Surface.** [`Commands`](struct.Commands.html) exposes `spawn`,
-> `entity(e)`, `despawn(entity)`, `EntityCommands::insert<T>`,
+> `entity(e)`, `despawn(entity)`, `insert_resource<R>`,
+> `update_resource<R>`, `EntityCommands::insert<T>`,
 > `EntityCommands::remove<T>`, and `EntityCommands::id()` — see the table
 > in *Commands available today* below. Tuple-spawn (`spawn((A, B, C))`)
 > and `EntityCommands::insert_bundle((A, B, C))` were **rejected**, not
@@ -1326,6 +1337,8 @@ commands.
 | `commands.spawn().insert::<T>(value)` / `commands.entity(e).insert::<T>(value)` | Queues an `insert::<T>(entity, value)`. Chainable. |
 | `commands.entity(e).remove::<T>()` | Queues a `remove::<T>(entity)`. Idempotent no-op if `e` lacks `T`. Chainable. |
 | `commands.spawn().id()` / `commands.entity(e).id()` | Returns the `Entity` the builder is bound to. For `spawn()` it's freshly allocated and live immediately; for `entity(e)` it's just `e` back. |
+| `commands.insert_resource::<R>(r)` | Queues `World::add_resource(r)` for the next flush — the deferred way to **create** a resource from a system. Overwrites if `R` already exists. |
+| `commands.update_resource::<R>(f)` | Queues `f(&mut R)` to run at the next flush against the existing `R`. **Panics at flush** if `R` is absent — it mutates, never creates (use `insert_resource` first). |
 
 Ops queued through `commands.entity(e)` against an entity that is no
 longer live at flush — e.g. `commands.despawn(e)` then

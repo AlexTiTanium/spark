@@ -1,4 +1,5 @@
-//! `Commands` — system-param for deferred entity / component mutations.
+//! `Commands` — system-param for deferred entity / component / resource
+//! mutations.
 //!
 //! Systems can't mutate the [`World`] structurally while iterating it.
 //! If a system iterating `Query<&mut Position>` decides to spawn a new
@@ -11,6 +12,12 @@
 //! system holds borrows — after a stage's sequential systems, and at every
 //! workload boundary. Writes become visible at those points, never
 //! mid-iteration.
+//!
+//! Resource ops ([`Commands::insert_resource`] /
+//! [`Commands::update_resource`]) ride the same queue, but for a different
+//! reason: they touch resource storage, not component storage, so there's no
+//! mutate-while-iterating hazard to dodge. They're deferred for *ordering and
+//! visibility* — landing at the flush boundary alongside the structural edits.
 //!
 //! # Why `spawn` is the exception
 //!
@@ -37,11 +44,11 @@
 
 use std::cell::RefCell;
 
-use crate::Component;
 use crate::access::Access;
 use crate::entity::{Entity, EntityAllocator};
 use crate::system::SystemParam;
 use crate::world::World;
+use crate::{Component, Resource};
 
 /// Boxed one-shot mutation applied to the [`World`] during
 /// [`CommandQueue::flush`].
@@ -169,7 +176,7 @@ impl CommandQueue {
     }
 }
 
-/// System parameter that queues structural mutations on the [`World`].
+/// System parameter that queues deferred mutations on the [`World`].
 ///
 /// `Commands` borrows two cells — the entity allocator (mutably, for
 /// `spawn`) and the pending [`CommandQueue`] (mutably, for every
@@ -181,8 +188,9 @@ impl CommandQueue {
 ///
 /// 1. The runner calls [`SystemParam::fetch`] — `Commands` captures
 ///    references to the two cells, no data is moved.
-/// 2. The system queues spawns / inserts / removes / despawns. These
-///    structural changes are *not yet visible* to other systems.
+/// 2. The system queues spawns / inserts / removes / despawns, plus
+///    resource inserts / updates. These deferred changes are *not yet
+///    visible* to other systems.
 /// 3. At the next flush point — after the stage's sequential systems, or
 ///    at a workload boundary — [`World::flush_commands`] drains the queue
 ///    into the world; the queued writes land all at once. Systems that run
@@ -338,6 +346,83 @@ impl Commands<'_> {
             entity,
             queue: self.queue,
         }
+    }
+
+    /// Queues an `add_resource::<R>(value)` for the next flush — the deferred
+    /// way to *create* (or replace) a resource from inside a system.
+    ///
+    /// A system can't reach `&mut World`, and [`ResMut<T>`](crate::ResMut)
+    /// only borrows a resource that already exists. `insert_resource` is the
+    /// one path to introduce a brand-new resource mid-frame; it lands at the
+    /// flush point alongside every other queued command.
+    ///
+    /// Overwrite semantics match [`World::add_resource`]: queuing a resource
+    /// of a type that already exists at flush **replaces** the old value.
+    /// Last write wins — if two ops insert the same `R`, the later push wins
+    /// (the queue is FIFO).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use spark_ecs::{Commands, IntoSystem, Resource, World};
+    ///
+    /// #[derive(Resource)]
+    /// struct Score(u32);
+    ///
+    /// let mut world = World::new();
+    /// let mut sys = IntoSystem::into_system(|mut commands: Commands| {
+    ///     commands.insert_resource(Score(7));
+    /// });
+    /// sys(&world);
+    /// assert!(world.get_resource::<Score>().is_none()); // deferred — not yet
+    /// world.flush_commands();
+    /// assert_eq!(world.resource::<Score>().0, 7);
+    /// ```
+    pub fn insert_resource<R: Resource>(&mut self, value: R) {
+        self.queue.borrow_mut().push(Box::new(move |world| {
+            world.add_resource(value);
+        }));
+    }
+
+    /// Queues a mutation `f` to run against the resource of type `R` at the
+    /// next flush, where `f` receives `&mut R`.
+    ///
+    /// Useful when a system can't take [`ResMut<R>`](crate::ResMut) directly —
+    /// today, because it already holds a borrow that would collide with a live
+    /// `ResMut<R>` (a second same-type `ResMut` panics with "already
+    /// borrowed"); under the M4 scheduler, because its access set would
+    /// conflict with another param. Either way the closure runs at the flush
+    /// boundary, after the offending borrows are gone.
+    ///
+    /// # Panics
+    ///
+    /// Panics **at flush** if no resource of type `R` exists when `f` would
+    /// run, matching [`World::resource_mut`]. `update_resource` mutates; it
+    /// never creates — use [`insert_resource`](Self::insert_resource) to bring
+    /// a resource into existence first.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use spark_ecs::{Commands, IntoSystem, Resource, World};
+    ///
+    /// #[derive(Resource)]
+    /// struct Score(u32);
+    ///
+    /// let mut world = World::new();
+    /// world.add_resource(Score(1));
+    /// let mut sys = IntoSystem::into_system(|mut commands: Commands| {
+    ///     commands.update_resource::<Score>(|s| s.0 += 10);
+    /// });
+    /// sys(&world);
+    /// assert_eq!(world.resource::<Score>().0, 1); // deferred — not yet
+    /// world.flush_commands();
+    /// assert_eq!(world.resource::<Score>().0, 11);
+    /// ```
+    pub fn update_resource<R: Resource>(&mut self, f: impl FnOnce(&mut R) + 'static) {
+        self.queue.borrow_mut().push(Box::new(move |world| {
+            f(&mut world.resource_mut::<R>());
+        }));
     }
 }
 
@@ -524,13 +609,16 @@ impl<'a> SystemParam for Commands<'a> {
 mod tests {
     use super::*;
     use crate::system::IntoSystem;
-    use crate::{Component, Query};
+    use crate::{Component, Query, ResMut, Resource};
 
     #[derive(Debug, PartialEq, Component)]
     struct Position(i32, i32);
 
     #[derive(Debug, PartialEq, Component)]
     struct Velocity(i32, i32);
+
+    #[derive(Debug, PartialEq, Resource)]
+    struct Score(u32);
 
     #[test]
     fn spawn_allocates_entity_synchronously() {
@@ -912,5 +1000,151 @@ mod tests {
         world.flush_commands();
         assert!(!world.is_alive(e));
         assert!(world.get::<Position>(e).is_none());
+    }
+
+    #[test]
+    fn insert_resource_is_deferred_until_flush() {
+        // Mirrors `insert_is_deferred_until_flush`: the resource is created
+        // by `World::add_resource` at the flush point, not when queued.
+        let mut world = World::new();
+        let mut sys = IntoSystem::into_system(|mut commands: Commands| {
+            commands.insert_resource(Score(7));
+        });
+        sys(&world);
+        assert!(
+            world.get_resource::<Score>().is_none(),
+            "insert_resource must not land before flush"
+        );
+        world.flush_commands();
+        assert_eq!(*world.resource::<Score>(), Score(7));
+    }
+
+    #[test]
+    fn insert_resource_overwrites_existing() {
+        // Overwrite semantics inherited from `World::add_resource`: a queued
+        // insert of a type that already exists replaces the old value.
+        let mut world = World::new();
+        world.add_resource(Score(1));
+        let mut sys = IntoSystem::into_system(|mut commands: Commands| {
+            commands.insert_resource(Score(99));
+        });
+        sys(&world);
+        world.flush_commands();
+        assert_eq!(*world.resource::<Score>(), Score(99));
+    }
+
+    #[test]
+    fn update_resource_runs_at_flush() {
+        // `f` receives `&mut R` and runs at the flush boundary.
+        let mut world = World::new();
+        world.add_resource(Score(1));
+        let mut sys = IntoSystem::into_system(|mut commands: Commands| {
+            commands.update_resource::<Score>(|s| s.0 += 10);
+        });
+        sys(&world);
+        assert_eq!(
+            *world.resource::<Score>(),
+            Score(1),
+            "update_resource must not land before flush"
+        );
+        world.flush_commands();
+        assert_eq!(*world.resource::<Score>(), Score(11));
+    }
+
+    #[test]
+    #[should_panic(expected = "has not been inserted")]
+    fn update_resource_on_absent_resource_panics_at_flush() {
+        // Missing-resource contract: `update_resource` mutates, never creates.
+        // At flush, `World::resource_mut` panics on the absent `Score`.
+        let mut world = World::new();
+        let mut sys = IntoSystem::into_system(|mut commands: Commands| {
+            commands.update_resource::<Score>(|s| s.0 += 1);
+        });
+        sys(&world);
+        world.flush_commands(); // panics here, not at queue time
+    }
+
+    #[test]
+    fn two_queued_inserts_of_same_resource_last_write_wins() {
+        // Doc contract (insert_resource): "if two ops insert the same `R`,
+        // the later push wins (the queue is FIFO)." Pin it directly — the
+        // overwrite test only queues one op, so it can't catch a future
+        // same-type coalesce/first-wins regression.
+        let mut world = World::new();
+        let mut sys = IntoSystem::into_system(|mut commands: Commands| {
+            commands.insert_resource(Score(1));
+            commands.insert_resource(Score(2));
+        });
+        sys(&world);
+        world.flush_commands();
+        assert_eq!(*world.resource::<Score>(), Score(2));
+    }
+
+    #[test]
+    fn update_resource_dodges_live_resmut_borrow() {
+        // The method's raison d'être: a system holding a live `ResMut<Score>`
+        // can still queue an update of the *same* type without tripping the
+        // RefCell "already borrowed" panic — because the closure calls
+        // `resource_mut` only inside the deferred op, which runs at flush
+        // after the `ResMut` guard has dropped. Guards against a regression
+        // that eagerly borrows at queue time.
+        let mut world = World::new();
+        world.add_resource(Score(1));
+        let mut sys = IntoSystem::into_system(|mut r: ResMut<Score>, mut commands: Commands| {
+            r.0 = 5; // eager write through the live borrow
+            commands.update_resource::<Score>(|s| s.0 += 100); // deferred, same type
+        });
+        sys(&world); // must NOT panic with "already borrowed"
+        assert_eq!(
+            *world.resource::<Score>(),
+            Score(5),
+            "eager ResMut write lands immediately"
+        );
+        world.flush_commands();
+        assert_eq!(
+            *world.resource::<Score>(),
+            Score(105),
+            "deferred update applies against the flushed value"
+        );
+    }
+
+    #[test]
+    fn resource_and_structural_ops_share_one_flush() {
+        // The module header's headline: resource ops "ride the same queue ...
+        // alongside the structural edits." Pin that a single drain applies
+        // both kinds, in push order.
+        let mut world = World::new();
+        world.add_resource(Score(1));
+        let doomed = world.spawn().insert(Position(0, 0)).id();
+        let mut sys = IntoSystem::into_system(move |mut commands: Commands| {
+            commands.spawn().insert(Position(1, 2));
+            commands.insert_resource(Score(5));
+            commands.update_resource::<Score>(|s| s.0 += 1);
+            commands.despawn(doomed);
+        });
+        sys(&world);
+        // Nothing landed before flush.
+        assert!(world.is_alive(doomed));
+        assert_eq!(*world.resource::<Score>(), Score(1));
+        world.flush_commands();
+        // Structural ops applied: doomed gone, fresh entity present.
+        assert!(!world.is_alive(doomed));
+        assert_eq!(Query::<&Position>::from_world(&world).iter().count(), 1);
+        // Resource ops applied in FIFO: insert(5) then +1 = 6.
+        assert_eq!(*world.resource::<Score>(), Score(6));
+    }
+
+    #[test]
+    fn insert_then_update_resource_in_one_system() {
+        // FIFO across resource ops: insert creates `Score(5)`, then the
+        // queued update sees it and bumps it — both apply at the same flush.
+        let mut world = World::new();
+        let mut sys = IntoSystem::into_system(|mut commands: Commands| {
+            commands.insert_resource(Score(5));
+            commands.update_resource::<Score>(|s| s.0 *= 2);
+        });
+        sys(&world);
+        world.flush_commands();
+        assert_eq!(*world.resource::<Score>(), Score(10));
     }
 }
