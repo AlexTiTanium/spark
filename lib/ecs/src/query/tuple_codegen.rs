@@ -23,6 +23,12 @@
 //! three leaves stay distinct: Entity offsets the driver by `+1`
 //! (`DriveSource::Data(1)`), Option uses `filter_map` + `cand_len!`.
 //!
+//! The three entry macros and their per-arity invocations are grouped in
+//! the *Family entry points* section at the foot of this file, so the whole
+//! generated surface reads in one place. **Arity-1 shapes** — `&T`,
+//! `&mut T`, `Option<&T>`, `Option<&mut T>`, and `Entity` alone — are *not*
+//! generated here; they are hand-written in [`query/data.rs`](super::data).
+//!
 //! ## Codegen elsewhere in the crate
 //!
 //! Other declarative codegen lives in sibling files (different traits, no
@@ -59,19 +65,21 @@ use super::{DriveSource, DriverIter, QueryData, ReadOnlyQueryData};
 
 // -------- Tuple impls (arity 2 – 5) --------
 //
-// One public macro covers every supported tuple shape:
-// [`impl_all_tuple!($T1, $T2, …)`] emits **every 2^N combination** of
-// `&` / `&mut` flags across the type parameters at that arity. The
-// shapes you get from `impl_all_tuple!(A, B)`:
+// The plain-tuple family. Its machinery is below — the per-flag helpers,
+// the `impl_one_combo!` leaf, and the `cartesian_rw!` driver; the
+// `impl_all_tuple!` entry macro and its invocations live in the
+// consolidated *Family entry points* section at the foot of the file.
+//
+// `impl_all_tuple!(A, B)` emits **every 2^N combination** of `&` / `&mut`
+// flags across the type parameters at that arity:
 //
 // ```text
 //   (&A, &B)         (&mut A, &B)
 //   (&A, &mut B)     (&mut A, &mut B)
 // ```
 //
-// Arity 3 / 4 / 5 expand to 8 / 16 / 32 impls respectively. Each impl
-// is monomorphised once per concrete instantiation, so users only pay
-// for shapes they actually construct.
+// Each impl is monomorphised once per concrete instantiation, so users
+// only pay for shapes they actually construct.
 //
 // **No nested tuples.** All bounds are on concrete `Component`
 // parameters (`A: Component`, `B: Component`, …), never on a generic
@@ -79,13 +87,6 @@ use super::{DriveSource, DriverIter, QueryData, ReadOnlyQueryData};
 // `(A, (B, C))`, and similar — they don't match any impl pattern.
 // Arity grows through additional `impl_all_tuple!` invocations, not
 // through tuple recursion.
-//
-// **Extending arity past 5.** Add one line below:
-// `impl_all_tuple!(A, B, C, D, E, F);` unlocks arity 6 (64 combos).
-// Monomorphisation cost doubles with each step — weigh it against
-// real need before extending. Optional-bearing shapes live in the
-// companion `impl_all_tuple_opt!` family further down (currently arities
-// 2–3); extending *those* past 3 means adding a line there too.
 
 // ---- Helper macros (file-private) -----------------------------------
 //
@@ -167,9 +168,9 @@ macro_rules! access_call {
 ///   the `unsafe fn` [`DenseMut::get`].
 ///
 /// `O` is identical to `R` and `OW` to `W` — the optional/required
-/// difference lives in [`fetch_non_driver!`], not in how the handle is
+/// difference lives in [`non_driver_lookup!`], not in how the handle is
 /// built.
-macro_rules! build_non_driver_fetch {
+macro_rules! non_driver_handle {
     (R, $state:ident) => {
         &*$state
     };
@@ -204,7 +205,7 @@ macro_rules! build_non_driver_fetch {
 /// trailing `?`, so an absent component yields a `None` *value* in the
 /// tuple instead of short-circuiting the whole row away. (`R`/`W` keep the
 /// `?` — a missing required component skips the entity.)
-macro_rules! fetch_non_driver {
+macro_rules! non_driver_lookup {
     (R, $fetch:expr, $entity:expr) => {
         $fetch.as_ref()?.get($entity)?
     };
@@ -242,7 +243,7 @@ macro_rules! fetch_non_driver {
 /// No `O`/`OW` arms: an optional element never sits in the first (driver)
 /// position — `impl_all_tuple_opt_cartesian!` only ever assigns `R`/`W` to
 /// the first slot — so this macro is never invoked with an optional flag.
-macro_rules! drive_iter {
+macro_rules! first_elem_driver {
     (R, $state:ident) => {
         match $state {
             Some(s) => Box::new(s.iter()),
@@ -259,7 +260,7 @@ macro_rules! drive_iter {
 
 /// Population of one element's storage (`0` if absent), flag-agnostic — used
 /// by `min_data_candidate` to size each element's candidate set in O(1).
-macro_rules! len_of {
+macro_rules! population {
     ($state:expr) => {
         $state.as_ref().map_or(0, |s| s.len())
     };
@@ -267,7 +268,7 @@ macro_rules! len_of {
 
 /// One read element's dense entity slice (empty if the storage is absent) —
 /// the driver slice for a `&T` element in the shared (`drive_ref`) path.
-macro_rules! slice_of_read {
+macro_rules! read_entity_slice {
     ($state:expr) => {
         $state.as_ref().map_or(&[][..], |s| s.entities())
     };
@@ -289,7 +290,7 @@ macro_rules! slice_of_read {
 macro_rules! build_elem {
     (R, $state:ident) => {{
         let fetch = &*$state;
-        let ents: &[Entity] = slice_of_read!(fetch);
+        let ents: &[Entity] = read_entity_slice!(fetch);
         (ents, fetch)
     }};
     (W, $state:ident) => {
@@ -342,11 +343,11 @@ macro_rules! build_elem {
 /// driver. Used by `impl_one_combo_opt!`'s `min_data_candidate`.
 macro_rules! cand_len {
     (R, $state:expr) => {
-        Some($state.as_ref().map_or(0, |s| s.len()))
+        Some(population!($state))
     };
     // Same as `R` — both required flags expose a candidate.
     (W, $state:expr) => {
-        Some($state.as_ref().map_or(0, |s| s.len()))
+        Some(population!($state))
     };
     (O, $state:expr) => {
         None::<usize>
@@ -375,7 +376,7 @@ macro_rules! fetch_ro {
 /// `min_data_candidate`, so its slot is never the chosen driver index).
 macro_rules! slice_ro {
     (R, $state:expr) => {
-        slice_of_read!($state)
+        read_entity_slice!($state)
     };
     (O, $state:expr) => {
         &[][..]
@@ -433,15 +434,15 @@ macro_rules! impl_one_combo {
                 'w: 's,
             {
                 let ($First, $($Rest,)+) = state;
-                $(let $Rest = build_non_driver_fetch!($rest_flag, $Rest);)+
+                $(let $Rest = non_driver_handle!($rest_flag, $Rest);)+
                 let driver: Box<dyn Iterator<Item = (Entity, item_type!($first_flag $First, 's))> + 's> =
-                    drive_iter!($first_flag, $First);
+                    first_elem_driver!($first_flag, $First);
                 Box::new(counted!(driver).filter_map(move |(entity, item_first)| {
                     Some((
                         entity,
                         (
                             item_first,
-                            $(fetch_non_driver!($rest_flag, $Rest, entity),)+
+                            $(non_driver_lookup!($rest_flag, $Rest, entity),)+
                         ),
                     ))
                 }))
@@ -458,17 +459,14 @@ macro_rules! impl_one_combo {
                 Self: 'w,
             {
                 let ($First, $($Rest,)+) = state;
-                // Positional array → array index *is* the element index; the
-                // first minimum wins ties (strict `<`), so the earliest
-                // element leads on a tie.
-                let pops = [len_of!($First), $(len_of!($Rest),)+];
-                let mut best = (0usize, pops[0]);
-                for (i, &p) in pops.iter().enumerate().skip(1) {
-                    if p < best.1 {
-                        best = (i, p);
-                    }
-                }
-                Some(best)
+                // Array index *is* the element index; `reduce` keeps the
+                // first minimum (strict `<`), so the earliest element leads
+                // on a tie. The tuple is non-empty (arity ≥ 2), so the
+                // `reduce` always yields `Some`.
+                [population!($First), $(population!($Rest),)+]
+                    .into_iter()
+                    .enumerate()
+                    .reduce(|best, cur| if cur.1 < best.1 { cur } else { best })
             }
 
             #[allow(non_snake_case)]
@@ -501,8 +499,8 @@ macro_rules! impl_one_combo {
                     Some((
                         entity,
                         (
-                            fetch_non_driver!($first_flag, $First.1, entity),
-                            $(fetch_non_driver!($rest_flag, $Rest.1, entity),)+
+                            non_driver_lookup!($first_flag, $First.1, entity),
+                            $(non_driver_lookup!($rest_flag, $Rest.1, entity),)+
                         ),
                     ))
                 }))
@@ -575,7 +573,7 @@ macro_rules! impl_one_combo {
                 let di: DriverIter<'s> = match driver {
                     DriveSource::Data(k) => {
                         let ($First, $($Rest,)+) = state;
-                        let slices = [slice_of_read!($First), $(slice_of_read!($Rest),)+];
+                        let slices = [read_entity_slice!($First), $(read_entity_slice!($Rest),)+];
                         DriverIter::new(slices[k])
                     }
                     DriveSource::External(di) => di,
@@ -617,33 +615,13 @@ macro_rules! cartesian_rw {
     };
 }
 
-/// Emits every `QueryData` impl (and the `ReadOnlyQueryData` impl for
-/// the all-read combination) for a tuple of the given type parameters
-/// at *every* `&` / `&mut` combination.
-///
-/// One line per arity. `impl_all_tuple!(A, B, C)` generates 2^3 = 8
-/// impls covering `(&A, &B, &C)`, `(&mut A, &B, &C)`,
-/// `(&A, &mut B, &C)`, …, `(&mut A, &mut B, &mut C)`. The macro
-/// requires arity ≥ 2 (single-component shapes are handled by the
-/// `&T` / `&mut T` impls earlier in the file).
-macro_rules! impl_all_tuple {
-    ($A:ident, $($B:ident),+) => {
-        cartesian_rw!(impl_one_combo, @start [] $A, $($B,)+);
-    };
-}
-
-impl_all_tuple!(A, B);
-impl_all_tuple!(A, B, C);
-impl_all_tuple!(A, B, C, D);
-impl_all_tuple!(A, B, C, D, E);
-
 // ---- Optional-bearing tuples: Query<(&A, Option<&B>)> ----------------
 //
 // A second family beside impl_one_combo! / impl_all_tuple!, covering
 // tuples whose trailing elements may be `Option<&T>` (`O`) or
 // `Option<&mut T>` (`OW`). It reuses every per-flag helper (decl_type!,
 // item_type!, state_type!, init_storage!, access_call!,
-// build_non_driver_fetch!, fetch_non_driver!, drive_iter!, build_elem!)
+// non_driver_handle!, non_driver_lookup!, first_elem_driver!, build_elem!)
 // — those gained `O`/`OW` arms — and adds two: `cand_len!` (optionals
 // offer no driver candidate) and `fetch_ro!` (read-only optional lookup).
 //
@@ -710,9 +688,9 @@ macro_rules! impl_one_combo_opt {
                 'w: 's,
             {
                 let ($First, $($Rest,)+) = state;
-                $(let $Rest = build_non_driver_fetch!($rest_flag, $Rest);)+
+                $(let $Rest = non_driver_handle!($rest_flag, $Rest);)+
                 let driver: Box<dyn Iterator<Item = (Entity, item_type!($first_flag $First, 's))> + 's> =
-                    drive_iter!($first_flag, $First);
+                    first_elem_driver!($first_flag, $First);
                 // `filter_map` (not `map`): a required (`R`/`W`) non-driver
                 // still short-circuits the row via its `?`; an optional
                 // (`O`/`OW`) yields a `None` value and keeps the row.
@@ -721,7 +699,7 @@ macro_rules! impl_one_combo_opt {
                         entity,
                         (
                             item_first,
-                            $(fetch_non_driver!($rest_flag, $Rest, entity),)+
+                            $(non_driver_lookup!($rest_flag, $Rest, entity),)+
                         ),
                     ))
                 }))
@@ -778,8 +756,8 @@ macro_rules! impl_one_combo_opt {
                     Some((
                         entity,
                         (
-                            fetch_non_driver!($first_flag, $First.1, entity),
-                            $(fetch_non_driver!($rest_flag, $Rest.1, entity),)+
+                            non_driver_lookup!($first_flag, $First.1, entity),
+                            $(non_driver_lookup!($rest_flag, $Rest.1, entity),)+
                         ),
                     ))
                 }))
@@ -909,27 +887,13 @@ macro_rules! impl_all_tuple_opt_cartesian {
     };
 }
 
-/// Emits every optional-bearing `QueryData` impl (and `ReadOnlyQueryData`
-/// for the all-read shapes) for a tuple of the given type parameters: the
-/// first element required (`&T`/`&mut T`), the rest any of
-/// `&T`/`&mut T`/`Option<&T>`/`Option<&mut T>`, restricted to combinations
-/// with at least one optional.
-macro_rules! impl_all_tuple_opt {
-    ($A:ident, $($B:ident),+) => {
-        impl_all_tuple_opt_cartesian!(@first $A, $($B,)+);
-    };
-}
-
-impl_all_tuple_opt!(A, B);
-impl_all_tuple_opt!(A, B, C);
-
 // ---- Entity-prefixed tuples: Query<(Entity, &A, …)> ------------------
 //
 // A parallel family beside impl_one_combo! / impl_all_tuple!, for shapes
 // whose FIRST element is `Entity` followed by 1..=3 components. It reuses
 // every per-flag helper (decl_type!, item_type!, state_type!,
-// init_storage!, access_call!, build_non_driver_fetch!, fetch_non_driver!,
-// drive_iter!) unchanged — only the impl target, the `Item` type, and the
+// init_storage!, access_call!, non_driver_handle!, non_driver_lookup!,
+// first_elem_driver!) unchanged — only the impl target, the `Item` type, and the
 // yielded tuple gain a leading `Entity`.
 //
 // `Entity` has no storage and cannot drive a join: the FIRST COMPONENT
@@ -996,16 +960,16 @@ macro_rules! impl_one_combo_entity {
                 'w: 's,
             {
                 let ($First, $($Rest,)*) = state;
-                $(let $Rest = build_non_driver_fetch!($rest_flag, $Rest);)*
+                $(let $Rest = non_driver_handle!($rest_flag, $Rest);)*
                 let driver: Box<dyn Iterator<Item = (Entity, item_type!($first_flag $First, 's))> + 's> =
-                    drive_iter!($first_flag, $First);
+                    first_elem_driver!($first_flag, $First);
                 Box::new(counted!(driver).filter_map(move |(entity, item_first)| {
                     Some((
                         entity,
                         (
                             entity,
                             item_first,
-                            $(fetch_non_driver!($rest_flag, $Rest, entity),)*
+                            $(non_driver_lookup!($rest_flag, $Rest, entity),)*
                         ),
                     ))
                 }))
@@ -1023,16 +987,15 @@ macro_rules! impl_one_combo_entity {
             {
                 let ($First, $($Rest,)*) = state;
                 // Components only — `Entity` (global index 0) offers no
-                // candidate. Local array index `i` maps to global index
-                // `i + 1`; first minimum wins ties.
-                let pops = [len_of!($First), $(len_of!($Rest),)*];
-                let mut best = (1usize, pops[0]);
-                for (i, &p) in pops.iter().enumerate().skip(1) {
-                    if p < best.1 {
-                        best = (i + 1, p);
-                    }
-                }
-                Some(best)
+                // candidate. Local index `i` maps to global `i + 1`; `reduce`
+                // keeps the first minimum (strict `<`), so the earliest
+                // component leads on a tie. At least one component is present,
+                // so the `reduce` always yields `Some`.
+                [population!($First), $(population!($Rest),)*]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, p)| (i + 1, p))
+                    .reduce(|best, cur| if cur.1 < best.1 { cur } else { best })
             }
 
             #[allow(non_snake_case)]
@@ -1067,8 +1030,8 @@ macro_rules! impl_one_combo_entity {
                         entity,
                         (
                             entity,
-                            fetch_non_driver!($first_flag, $First.1, entity),
-                            $(fetch_non_driver!($rest_flag, $Rest.1, entity),)*
+                            non_driver_lookup!($first_flag, $First.1, entity),
+                            $(non_driver_lookup!($rest_flag, $Rest.1, entity),)*
                         ),
                     ))
                 }))
@@ -1140,7 +1103,7 @@ macro_rules! impl_one_combo_entity {
                 let di: DriverIter<'s> = match driver {
                     DriveSource::Data(k) => {
                         let ($First, $($Rest,)*) = state;
-                        let slices = [&[][..], slice_of_read!($First), $(slice_of_read!($Rest),)*];
+                        let slices = [&[][..], read_entity_slice!($First), $(read_entity_slice!($Rest),)*];
                         DriverIter::new(slices[k])
                     }
                     DriveSource::External(di) => di,
@@ -1157,22 +1120,76 @@ macro_rules! impl_one_combo_entity {
 // parameterised on the `impl_one_combo_entity` leaf — see that macro's note
 // for why the two families' Cartesian drivers are one and the same.
 
-/// Emits every `QueryData` impl (and the `ReadOnlyQueryData` impl for the
-/// all-read combination) for `(Entity, …)` at *every* `&` / `&mut`
+// =====================================================================
+// Family entry points — the whole generation surface in one place
+// =====================================================================
+//
+// Each family's machinery (per-flag helpers, leaf macro, Cartesian driver)
+// is defined above; these three thin entry macros are what drive it, and
+// the invocations below are the complete list of shapes the crate
+// generates. Read alongside the *Variant manifest* table at the top:
+//
+//   impl_all_tuple!         plain R/W tuples              arity 2–5
+//   impl_all_tuple_opt!     required-first + optionals    arity 2–3
+//   impl_all_tuple_entity!  Entity-prefixed tuples        1–3 components
+//
+// Arity-1 shapes (`&T`, `&mut T`, `Option<&T>`, `Option<&mut T>`, and
+// `Entity` alone) are hand-written in `query/data.rs`, not generated here.
+
+/// Plain-tuple family: every `QueryData` impl (plus `ReadOnlyQueryData` for
+/// the all-read shape) at *every* `&` / `&mut` combination.
+///
+/// `impl_all_tuple!(A, B, C)` generates 2^3 = 8 impls — `(&A, &B, &C)`,
+/// `(&mut A, &B, &C)`, …, `(&mut A, &mut B, &mut C)`. Requires arity ≥ 2
+/// (single-component shapes are the `&T` / `&mut T` impls in `data.rs`).
+macro_rules! impl_all_tuple {
+    ($A:ident, $($B:ident),+) => {
+        cartesian_rw!(impl_one_combo, @start [] $A, $($B,)+);
+    };
+}
+
+/// Optional family: every optional-bearing `QueryData` impl (plus
+/// `ReadOnlyQueryData` for the all-read shapes). First element required
+/// (`&T`/`&mut T`), the rest any of `&T`/`&mut T`/`Option<&T>`/`Option<&mut
+/// T>`, restricted to combinations with ≥ 1 optional — the pure-R/W ones
+/// are already `impl_all_tuple!`'s.
+macro_rules! impl_all_tuple_opt {
+    ($A:ident, $($B:ident),+) => {
+        impl_all_tuple_opt_cartesian!(@first $A, $($B,)+);
+    };
+}
+
+/// Entity-prefixed family: every `QueryData` impl (plus `ReadOnlyQueryData`
+/// for the all-read shape) for `(Entity, …)` at *every* `&` / `&mut`
 /// combination of the trailing components.
 ///
-/// One line per trailing arity. `impl_all_tuple_entity!(A, B)` generates
-/// 2^2 = 4 impls: `(Entity, &A, &B)`, `(Entity, &mut A, &B)`,
-/// `(Entity, &A, &mut B)`, `(Entity, &mut A, &mut B)`. A single ident —
-/// `impl_all_tuple_entity!(A)` — is allowed and yields the `(Entity, &A)` /
-/// `(Entity, &mut A)` pair. Extending past `(Entity, &A, &B, &C)` is one
-/// more line, at the usual doubling monomorphisation cost.
+/// `impl_all_tuple_entity!(A, B)` generates 2^2 = 4 impls — `(Entity, &A,
+/// &B)` through `(Entity, &mut A, &mut B)`. A single ident yields the
+/// `(Entity, &A)` / `(Entity, &mut A)` pair.
 macro_rules! impl_all_tuple_entity {
     ($A:ident $(, $B:ident)*) => {
         cartesian_rw!(impl_one_combo_entity, @start [] $A, $($B,)*);
     };
 }
 
+// ---- Generated instantiations: every shape the crate ships ----------
+//
+// Extend an arity by adding a line in the matching block (and nowhere
+// else). The Cartesian macro fans each line out to every flag combination,
+// so monomorphisation cost doubles per arity step — weigh against real need
+// before extending past what's here.
+
+// Plain R/W tuples — arity 2–5 (4 + 8 + 16 + 32 = 60 QueryData impls).
+impl_all_tuple!(A, B);
+impl_all_tuple!(A, B, C);
+impl_all_tuple!(A, B, C, D);
+impl_all_tuple!(A, B, C, D, E);
+
+// Required-first + ≥ 1 optional — arity 2–3 (4 + 24 = 28 QueryData impls).
+impl_all_tuple_opt!(A, B);
+impl_all_tuple_opt!(A, B, C);
+
+// Entity-prefixed — 1–3 trailing components (2 + 4 + 8 = 14 QueryData impls).
 impl_all_tuple_entity!(A); // (Entity, &A) / (Entity, &mut A)
 impl_all_tuple_entity!(A, B); // (Entity, &A, &B) + all &/&mut combos
 impl_all_tuple_entity!(A, B, C); // (Entity, &A, &B, &C) + all combos

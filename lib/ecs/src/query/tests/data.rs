@@ -464,7 +464,7 @@ fn query_optional_mut_marks_changed_only_when_written() {
 }
 
 /// Arity-3 with TWO trailing *mutable* optionals — exercises the
-/// `build_elem!(OW, …)` + `fetch_non_driver!(OW, …)` `DenseMut` lookup for
+/// `build_elem!(OW, …)` + `non_driver_lookup!(OW, …)` `DenseMut` lookup for
 /// two optional positions at once, with write-through on the present one.
 #[test]
 fn query_optional_arity_three_two_trailing_mut_optionals() {
@@ -880,7 +880,7 @@ fn query_entity_tuple_excludes_immediately_despawned_entity() {
 #[test]
 fn query_entity_tuple_for_unknown_component_yields_empty() {
     // `Marker` storage was never created — the entity-prefixed driver
-    // must reach the `None` arm of `drive_iter!` and yield empty, not
+    // must reach the `None` arm of `first_elem_driver!` and yield empty, not
     // panic (a distinct macro path from the join-skip case).
     let mut world = World::new();
     world.spawn().insert(Position(0, 0));

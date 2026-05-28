@@ -665,6 +665,37 @@ fn dense_mut_get_rejects_stale_handle_via_generation_check() {
     );
 }
 
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "fetched dense slot")]
+#[allow(
+    unsafe_code,
+    reason = "exercises DenseMut::get's debug-only once-per-entity tripwire"
+)]
+fn dense_mut_get_double_fetch_trips_debug_tripwire() {
+    // The `# Safety` contract's *structural* leg — "each entity is fetched at
+    // most once across `'s`" — is turned into a *checked* leg by a debug-only
+    // `seen`-set tripwire (Phase 3, issue #80). The aliasing-stress test above
+    // proves the contract *holds*; this proves the tripwire *fires* when it is
+    // breached, so a regression that silently disabled the `debug_assert!`
+    // would no longer pass unnoticed. Fetching the same live slot twice panics
+    // instead of handing out two aliasing `&mut T`. Both the tripwire and this
+    // test vanish in release (`#[cfg(debug_assertions)]`).
+    use crate::entity::EntityAllocator;
+    let mut alloc = EntityAllocator::new();
+    let live = alloc.allocate();
+    let mut dense = vec![Position(7, 7)];
+    let mut changed = vec![0_u32];
+    let sparse = vec![Some(0_u32)];
+    let entity_index = vec![live];
+    let view = DenseMut::<Position>::new(&mut dense, &mut changed, &sparse, &entity_index, 1);
+    // SAFETY: deliberately breaching the once-per-entity contract to prove the
+    // debug tripwire catches it — the first fetch is sound, the second is the
+    // exact double-fetch the `debug_assert!` exists to flag.
+    let _first = unsafe { view.get(live) };
+    let _second = unsafe { view.get(live) };
+}
+
 #[test]
 fn dense_join_aliasing_stress_writes_each_slot_once() {
     // Many-entity `(&mut A, &mut B)` join: the non-driver `&mut B` is
@@ -677,9 +708,21 @@ fn dense_join_aliasing_stress_writes_each_slot_once() {
     // off-by-one in the dense-index lookup the `query/` split touches,
     // surfaces here as a Miri error or a wrong post-condition rather
     // than as silent UB.
+    //
+    // `N` is `cfg(miri)`-branched: native runs 10 000 entities for
+    // genuine stress, Miri runs 1 024. The aliasing model catches a
+    // double-fetch on its first occurrence, so Miri coverage comes from
+    // access-pattern diversity — sparse driver, multi-mut join — not
+    // raw entity count; a larger `N` under interpretation buys nothing
+    // but wall time.
+    #[cfg(miri)]
+    const N: i32 = 1024;
+    #[cfg(not(miri))]
+    const N: i32 = 10_000;
+
     let mut world = World::new();
     let mut ids = Vec::new();
-    for i in 0..256 {
+    for i in 0..N {
         ids.push(world.spawn().insert(A(i)).insert(B(i * 10)).id());
     }
 

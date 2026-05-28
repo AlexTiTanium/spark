@@ -14,23 +14,15 @@ other engine crate (including `spark-core`) sits on top.
 > Adding a feature is usually adding a new component and a new system,
 > not editing existing classes. The update graph stays flat.
 
-> **Today vs tomorrow.** Code blocks tagged ` ```rust ` compile and
-> run today — they're doc tests, kept honest by
-> `cargo test --doc -p spark-ecs`. Code blocks tagged ` ```rust,ignore `
-> show types that don't exist yet; they're the spec of what's coming,
-> not what's runnable. (`Commands`, the events API — `Event` / `Events`
-> / `EventReader` / `EventWriter` — and the workload API —
-> `WorkloadLabel` / `Schedule` / `add_workload` — ship today.) `Query`
-> exists today for `&T` / `&mut T`, every `&` / `&mut` combination
-> of 2-/3-/4-/5-tuples (including multi-mut at any arity, e.g.
-> `(&mut A, &mut B, &mut C)`), the filter generic `Query<D, F>`
-> (`With` / `Without` / `And` / `Or` / `Changed<T>` / `Added<T>`), and
-> **entity-as-data** — `Query<Entity>` and `Query<(Entity, &A, …)>` — and
-> **optional fetch** — `Option<&T>` / `Option<&mut T>`, standalone or as a
-> trailing element of a required-first 2-/3-tuple. The forward-looking
-> design is settled — see [`docs/ECS_DESIGN.md`](../../docs/ECS_DESIGN.md)
-> for the full engineering reference and [`docs/PLAN.md`](../../docs/PLAN.md)
-> for the milestone plan.
+> **Runnable docs.** Every ` ```rust ` block below compiles and runs as a
+> doc test, kept honest by `cargo test --doc -p spark-ecs`. The few
+> ` ```rust,ignore ` blocks are *not* runnable for a structural reason the
+> block states — they call `spark-core` (which sits *above* this crate in
+> the dependency graph, so a doctest here can't reach it), or they're a
+> catalog of type spellings rather than executable code. Nothing here is a
+> placeholder for unbuilt API. For the engineering rationale behind each
+> decision see [`docs/ECS_DESIGN.md`](../../docs/ECS_DESIGN.md); for the
+> milestone plan, [`docs/PLAN.md`](../../docs/PLAN.md).
 
 
 ## Quick reference: every query shape
@@ -63,10 +55,6 @@ for x in &q { … }                        // sugar for q.iter()
 for x in &mut q { … }                    // sugar for q.iter_mut()
 let count = q.iter().count();
 let first = q.iter().next();
-// ⏳ Not yet implemented — shown for the shape they'll take:
-let one = q.single();                    // ⏳ panics if 0 or >1 entities
-let maybe = q.get_single();              // ⏳ Result<_, QuerySingleError>
-let exact = q.get(entity)?;              // ⏳ fetch one specific entity
 ```
 
 
@@ -94,10 +82,10 @@ let exact = q.get(entity)?;              // ⏳ fetch one specific entity
   the `World`; the derive's `Send + Sync + 'static` bound is what lets
   the scheduler iterate them in parallel.
 - **System** — a plain Rust function whose parameters describe what
-  it reads and writes. Today: `Res<T>`, `ResMut<T>`, `Query<D>` (for
-  `D = &T`, `&mut T`, or a tuple of those), and `Commands` for
-  deferred spawn / despawn / insert. `EventReader`/`Writer` and
-  `Local` land in follow-up PRs — see *What's next* further down.
+  it reads and writes: `Res<T>`, `ResMut<T>`, `Query<D, F>` (for
+  `D = &T`, `&mut T`, or a tuple of those), `Commands` for deferred
+  spawn / despawn / insert, and `EventReader<T>` / `EventWriter<T>` for
+  messaging. Each is covered in its own section below.
 
 ```rust
 // Runs today. `Time` here is a tiny stand-in for the future
@@ -1052,7 +1040,7 @@ Two rules make this predictable:
   `Option<&Velocity>` is looked up per entity. So the cost is
   `O(|Position|)` regardless of how many entities have `Velocity` — even
   if `Velocity` is the smaller storage, it can't pull the driver down and
-  drop the `Position`-only rows. (See *Iteration and cost*.)
+  drop the `Position`-only rows. (See *Query cost and iteration order* below.)
 - **The first element must be required.** Optionals are only allowed in the
   *trailing* positions of a 2-/3-tuple (`(&A, Option<&B>)`,
   `(&A, &B, Option<&C>)`), guaranteeing a driver always exists. Standalone
@@ -1087,7 +1075,6 @@ symmetric with `Or` and unambiguous when the two nest
 deliberate divergence from Bevy's implicit tuple-AND.
 
 ```rust
-// ✅ Compiles and runs today.
 use spark_ecs::{And, Component, Or, Query, With, Without, World};
 
 #[derive(Component)]
@@ -1173,147 +1160,10 @@ structural edits. (When candidate populations tie, the earliest part in
 the shape drives, so adding this optimisation didn't reorder the queries
 that were already driving optimally.)
 
-# What's next
+## Change detection: `Changed<T>` / `Added<T>`
 
-The types below are **spec-frozen**. Some ship today (✅) and some
-don't (⏳). Code blocks tagged `rust,ignore` are spec-frozen but use
-types that haven't landed yet — read them as "here's the shape coming
-next". Code blocks tagged `rust` compile and run today.
-
-## `Query<D, F>`: finding entities
-
-A query is a declarative spec of which entities a system wants. The
-**data shape** says which components to read or write, the **filter**
-says how to narrow the set.
-
-> **Status at a glance.** Data shapes for `&T`, `&mut T`, and every
-> `&` / `&mut` combination of flat 2-/3-/4-/5-tuples (including
-> multi-mut at any arity) are ✅ shipping today via
-> [`Query<D>`](struct.Query.html), as is the filter generic
-> `Query<D, F>` (`With` / `Without` / `And` / `Or` / `Changed<T>` /
-> `Added<T>`) and **entity-as-data** (`Query<Entity>`,
-> `Query<(Entity, &A, …)>` for one-to-three trailing components).
-> **Optional fetch** — `Option<&T>` / `Option<&mut T>` — is ✅ shipping
-> too: standalone (`Query<Option<&T>>`) and as a trailing element of a
-> 2-/3-tuple whose first element is required (`Query<(&A, Option<&B>)>`).
-> Each subsection below calls out which bits are runnable now and which
-> are spec-frozen.
-
-### Data shapes
-
-```rust,ignore
-// ✅ today — every `&` / `&mut` combination of 2-/3-/4-/5-tuples,
-//          generated by one `impl_all_tuple!` invocation per arity:
-Query<&Position>                            // immutable single
-Query<&mut Position>                        // mutable single
-Query<(&Position, &Velocity)>               // read-read
-Query<(&mut Position, &Velocity)>           // mut driver, read non-driver
-Query<(&Position, &mut Velocity)>           // read driver, mut non-driver
-Query<(&mut Position, &mut Velocity)>       // multi-mut (self-conflict checked)
-Query<(&A, &B, &C)>                         // arity 3, all-read
-Query<(&mut A, &B, &C)>                     // arity 3, mut at any position…
-Query<(&A, &mut B, &mut C)>                 //   …including multiple positions
-Query<(&mut A, &mut B, &mut C)>             //   …or all of them
-Query<(&A, &B, &C, &D)>                     // arity 4, same story
-Query<(&mut A, &mut B, &mut C, &mut D)>     //   …up to fully mutable
-Query<(&A, &B, &C, &D, &E)>                 // arity 5, same story
-Query<(&mut A, &mut B, &mut C, &mut D, &mut E)>  //   …up to fully mutable
-
-// ✅ today — entity-as-data (Entity as the first element, 1–3 components):
-Query<Entity>                               // just the ID — every live entity
-Query<(Entity, &Position)>                  // ID + one component
-Query<(Entity, &mut Position, &Velocity)>   // ID + mixed &/&mut, up to 3 components
-
-// ✅ today — optional fetch (first element required, 2-/3-tuples):
-Query<Option<&Velocity>>                    // every live entity, Some/None
-Query<(&Position, Option<&Velocity>)>       // Velocity may be absent — row still yielded
-Query<(&mut Position, Option<&mut Velocity>)> // optional mutable too
-Query<(&A, &B, Option<&C>)>                 // arity 3, trailing optional
-```
-
-Iteration shape today is **path B** (Bevy-style): `Query<&T>::iter()`
-yields `&T`, **not** `(Entity, &T)`. When a system needs the entity, it
-asks for it by naming `Entity` in the shape — `Query<(Entity, &T)>`
-yields `(Entity, &T)`, `Query<Entity>` yields the id alone. See
-*Getting the entity id* in the walkthrough above for runnable examples.
-
-```rust
-// ✅ Compiles and runs today.
-use spark_ecs::{Component, Query, World};
-
-#[derive(Component)]
-struct Position(f32, f32);
-#[derive(Component)]
-struct Velocity(f32, f32);
-
-let mut world = World::new();
-world.spawn().insert(Position(0.0, 0.0)).insert(Velocity(1.0, 0.0));
-
-let mut q = Query::<(&mut Position, &Velocity)>::from_world(&world);
-for (mut pos, vel) in q.iter_mut() {
-    pos.0 += vel.0;
-    pos.1 += vel.1;
-}
-```
-
-```rust
-// ✅ Runs today with a local `Time` stand-in. The real `spark-time`
-// `Time` resource lands with the frame-loop PR; the shape stays
-// identical.
-use spark_ecs::{Component, IntoSystem, Query, Res, Resource, World};
-
-#[derive(Resource)]
-struct Time { delta: f32 }
-#[derive(Component)]
-struct Position(f32, f32);
-#[derive(Component)]
-struct Velocity(f32, f32);
-
-fn integrate(time: Res<Time>, mut q: Query<(&mut Position, &Velocity)>) {
-    for (mut pos, vel) in q.iter_mut() {
-        pos.0 += vel.0 * time.delta;
-    }
-}
-
-let mut world = World::new();
-world.add_resource(Time { delta: 0.5 });
-world.spawn().insert(Position(0.0, 0.0)).insert(Velocity(2.0, 0.0));
-
-let mut sys = IntoSystem::into_system(integrate);
-sys(&world);
-// Pull the value out before the `Query` drops.
-let x = Query::<&Position>::from_world(&world).iter().map(|p| p.0).next().unwrap();
-assert!((x - 1.0).abs() < f32::EPSILON);
-```
-
-### Filters
-
-✅ **Ships today.** A second type parameter narrows the entity set
-without fetching anything — filters only *gate* the iteration. See
-*Narrowing with filters* above for runnable examples; the shapes:
-
-```rust,ignore
-// Operational plants only (Operational is a marker — zero-sized).
-Query<&Plant, With<Operational>>
-
-// Workers that don't currently have a job.
-Query<&Worker, Without<CurrentJob>>
-
-// And<(…)> = every inner filter must match. Spelled explicitly (not a
-// bare tuple) so it stays symmetric with Or.
-Query<&Plant, And<(With<Operational>, Without<UnderMaintenance>)>>
-
-// Or<(…)> = any inner filter matches.
-Query<&Plant, Or<(With<Operational>, With<Backup>)>>
-
-// And / Or nest freely — each is itself a filter.
-Query<&Plant, And<(With<Online>, Or<(With<Powered>, With<Backup>)>)>>
-```
-
-### Change detection: `Changed<T>` / `Added<T>`
-
-✅ **Ships today.** Two filters that ask *when* a component was last
-touched, so a system processes only what moved:
+Two filters that ask *when* a component was last touched, so a system
+processes only what moved:
 
 - `Changed<T>` — `T` was **written** since this system last ran (insert,
   overwrite, or a `&mut T` write). React to edits: redraw an HP bar only
@@ -1369,125 +1219,6 @@ Both filters report a **read** of `T` (like `With<T>`), so
 a *different* component (`Query<&mut Sprite, Changed<Transform>>`). They
 compose with the combinators: `And<(With<Powered>, Changed<Load>)>`.
 
-### All variants at a glance
-
-```rust,ignore
-// — DATA SHAPES —
-Query<&T>                                    // ✅ read
-Query<&mut T>                                // ✅ write
-// Every `&` / `&mut` combination at arity 2, 3, 4, and 5 is ✅ today;
-// runtime self-conflict check catches `(&mut A, &A)` / `(&mut A, &mut A)`.
-Query<(&A, &B)>                              // ✅ arity 2: all 4 combos
-Query<(&mut A, &mut B)>                      // ✅   (incl. multi-mut)
-Query<(&A, &B, &C)>                          // ✅ arity 3: all 8 combos
-Query<(&mut A, &mut B, &mut C)>              // ✅   (incl. fully mutable)
-Query<(&A, &B, &C, &D)>                      // ✅ arity 4: all 16 combos
-Query<(&mut A, &mut B, &mut C, &mut D)>      // ✅   (incl. fully mutable)
-Query<(&A, &B, &C, &D, &E)>                  // ✅ arity 5: all 32 combos
-Query<(&mut A, &mut B, &mut C, &mut D, &mut E)>  // ✅ (incl. fully mutable)
-Query<Entity>                                // ✅ just the ID, no component
-Query<(Entity, &Position, &mut Velocity)>    // ✅ ID + 1–3 components, any &/&mut
-Query<&Position, ()>                         // ✅ explicit empty filter (the default)
-
-// — FILTERS —                        ✅ filters + change-detection PRs
-With<T>            // entity must have T (but don't fetch T)
-Without<T>         // entity must NOT have T
-And<(F1, F2, …)>   // AND of filters (explicit, not a bare tuple)
-Or<(F1, F2, …)>    // OR of filters — nests with And
-Changed<T>         // ✅ T written since this system last ran
-Added<T>           // ✅ T first attached since this system last ran
-
-// — OPTIONAL DATA —                  ✅ optional-fetch (issue #70)
-Option<&T>         // fetch T if present, give None otherwise; never gates the row
-Option<&mut T>     // mutable variant; trailing element of a required-first tuple
-
-// — ARITY 6+ —                       follow-up (one line per arity)
-// Add `impl_all_tuple!(A, B, C, D, E, F);` in query/tuple_codegen.rs to
-// unlock all 64 `&` / `&mut` combos at arity 6. Pure mechanical extension —
-// but monomorphisation cost doubles per step, weigh against need.
-```
-
-### Iteration and cost
-
-The driver-storage trick is what keeps queries fast. To resolve
-`Query<(&A, &B)>` the engine:
-
-1. Picks the **smallest candidate set** in the whole query as the
-   *driver* — the storage with the fewest entities, decided once when
-   the query is built (see *Query cost and iteration order* above).
-2. Iterates the driver's `dense` array.
-3. For each entity, looks up the other component via O(1) sparse-set
-   access. Skips if absent.
-
-So a `Query<(&Plant, &CityName)>` with 50 plants and 200
-cities-with-names runs in 50 iterations, not 50 × 200 — and the 50
-drives whether `Plant` is written first or second.
-
-| Query | Iteration cost |
-|-|-|
-| `Query<&T>` | O(n) over T's dense array; n = entities with T |
-| `Query<(&A, &B)>` | O(min(\|A\|, \|B\|)) — the smaller storage drives |
-| `Query<&A, With<B>>` | O(min(\|A\|, \|B\|)) + one sparse lookup per item (two when the filter drives: fetch `A`, then re-check `B`) |
-| `Query<Entity, With<B>>` | O(\|B\|) — the filter drives |
-| `Query<&A, Without<B>>` | O(\|A\|) + one sparse lookup per item (`Without` offers no candidate) |
-| `Query<&A, And<(With<B>, With<C>)>>` | O(smallest of \|A\|, \|B\|, \|C\|) + one sparse lookup per filter term per item |
-| `Query<(&A, Option<&T>)>` | O(\|A\|) — the required element drives; `Option` adds one sparse lookup per item but never gates |
-| `Query<Option<&T>>` | O(live entities) — no required element, so it walks the live-set snapshot like `Query<Entity>` |
-
-Filters are essentially free: each filter borrows its storage **once at
-query construction** (in `init_state`, stored for the query's lifetime),
-then `With<T>` / `Without<T>` do a single sparse lookup per candidate entity
-on each iteration — no component fetch, no repeated `RefCell` borrow.
-`Changed<T>` / `Added<T>` add one tick compare per item against a baseline
-also fetched once at construction.
-
-> **Every `&` / `&mut` combination ships at arity 2-5.** Reads use
-> the storage's safe `get`; mutable non-driver lookups fetch per
-> entity via a tightly contracted `unsafe fn` (`DenseMut::get`).
-> Soundness rests on two facts the engine *enforces*: each driver
-> iteration visits an entity at most once (structural), and the
-> data shape never names the same component twice (runtime check in
-> `QueryAccess::assert_no_self_conflict`, run from `Query::from_world`
-> before any storage borrow). `Query<(&mut A, &mut A)>`,
-> `Query<(&mut A, &A)>`, and the reversed `Query<(&A, &mut A)>` panic
-> at `from_world` with a precise message rather than tripping the
-> `RefCell` "already borrowed" later. To unlock arity 6+, add one
-> `impl_all_tuple!(A, B, C, D, E, F);` line in `query/tuple_codegen.rs` — the
-> Cartesian-product macro generates every combination automatically,
-> though monomorphisation cost doubles per step.
-
-### Mixing queries, resources, commands, events
-
-A single system can mix every parameter type. This is where ECS
-ergonomics shine — read the function signature, you know everything
-it touches:
-
-```rust,ignore
-fn city_growth(
-    time: Res<Time>,                                  // resource read
-    mut grid: ResMut<PowerNetwork>,                   // resource write
-    mut cities: Query<(Entity, &mut City)>,           // entities + write
-    plants: Query<&Plant, With<Operational>>,         // entities + filter
-    mut events: EventWriter<CityTierUp>,              // event send
-    mut cmd: Commands,                                // structural change
-) {
-    grid.supply = plants.iter().map(|p| p.output_mw).sum();
-
-    for (id, mut city) in cities.iter_mut() {
-        // ... update city.population based on grid.ratio ...
-        if city.population >= 1000 {
-            events.send(CityTierUp { city: id, new_tier: 2 });
-        }
-        if city.population == 0 {
-            cmd.despawn(id);                          // queued, applied later
-        }
-    }
-}
-```
-
-The compiler reads the parameter types, the engine wires up the
-borrows. No `world.get_thing()` calls; no manual locking.
-
 ## `Commands`: deferred mutations from inside a system
 
 Systems can't mutate the world's *structure* directly — they hold
@@ -1499,16 +1230,13 @@ iteration stable (a system iterating `Query<&Plant>` can't have new
 plants pop into existence mid-loop) and keeps determinism intact for
 parallel execution.
 
-> **Status at a glance.** Today's [`Commands`](struct.Commands.html)
-> ships ✅ `spawn`, `despawn(entity)`, `EntityCommands::insert<T>`,
-> and `EntityCommands::id()`. Resource-touching commands
-> (`insert_resource`, `update_resource`), event sends (`send_event`),
-> component removes (`.remove::<T>()`), and the `cmd.entity(e)`
-> accessor are ⏳ follow-up PRs. Tuple-spawn (`spawn((A, B, C))`) was
-> **rejected**, not deferred — see #57.
+> **Surface.** [`Commands`](struct.Commands.html) exposes `spawn`,
+> `despawn(entity)`, `EntityCommands::insert<T>`, and
+> `EntityCommands::id()` — see the table in *Commands available today*
+> below. Tuple-spawn (`spawn((A, B, C))`) was **rejected**, not deferred
+> — see #57.
 
 ```rust
-// ✅ Compiles and runs today.
 use spark_ecs::{Commands, Component, IntoSystem, Query, World};
 
 #[derive(Component)]
@@ -1543,7 +1271,6 @@ parts. That's why the entity id is usable inside the same system —
 e.g. to despawn it on the same frame for a quick round-trip.
 
 ```rust
-// ✅ Compiles and runs today.
 use spark_ecs::{Commands, Component, IntoSystem, Query, World};
 
 #[derive(Component)]
@@ -1582,15 +1309,12 @@ commands.
 
 ### Commands available today
 
-| Command | Effect | Status |
-|-|-|-|
-| `commands.spawn()` | Allocates a fresh entity synchronously; returns `EntityCommands` for chained queued inserts. | ✅ |
-| `commands.despawn(entity)` | Queues `World::despawn(entity)` for the next flush. | ✅ |
-| `commands.spawn().insert::<T>(value)` | Queues an `insert::<T>(entity, value)` on the just-spawned entity. Chainable. | ✅ |
-| `commands.spawn().id()` | Synchronously-allocated `Entity` — usable inside the same system. | ✅ |
-| `commands.entity(e).insert(c)` / `.remove::<T>()` | Mutate an existing entity. | ⏳ EntityCommands-for-existing-entity PR |
-| `commands.insert_resource(r)` / `.update_resource::<T>(\|t\| …)` | Resource touches via commands. | ⏳ additive |
-| `commands.send_event(e)` | Convenience for `EventWriter<E>::send(e)` from a command. | ⏳ follow-up |
+| Command | Effect |
+|-|-|
+| `commands.spawn()` | Allocates a fresh entity synchronously; returns `EntityCommands` for chained queued inserts. |
+| `commands.despawn(entity)` | Queues `World::despawn(entity)` for the next flush. |
+| `commands.spawn().insert::<T>(value)` | Queues an `insert::<T>(entity, value)` on the just-spawned entity. Chainable. |
+| `commands.spawn().id()` | Synchronously-allocated `Entity` — usable inside the same system. |
 
 ### Why disjoint cells make this work
 
@@ -1602,7 +1326,7 @@ borrows the storage cell for `T`. Disjoint cells, no runtime
 collision.
 
 ```rust
-// ✅ Compiles and runs today. Commands + Query<&mut T> in one signature.
+// Commands + Query<&mut T> in one signature.
 use spark_ecs::{Commands, Component, IntoSystem, Query, World};
 
 #[derive(Component)]
@@ -1685,8 +1409,8 @@ and reading next frame is `EventReader::read`.
 `EventReader` is **stateless**: it holds no per-system cursor, so it always
 reads the previous-frame snapshot rather than "resuming where it left off."
 Same-frame reads (a writer and reader communicating *within* one frame)
-would need a per-system cursor (`Local<T>`), which lands later — see
-[`docs/ECS_ROADMAP.md`](../../docs/ECS_ROADMAP.md).
+would need a per-system cursor, which this crate does not provide — the
+one-frame-delay model is the whole determinism story above.
 
 ## Workloads and the schedule
 
@@ -1957,12 +1681,9 @@ workloads, everything stays sequential and deterministic.
 > a system with `app.add_system(Stage::Update, my_fn)`. `Stage` lives in
 > `spark-core` — the frame/app layer — not in `spark-ecs`, mirroring how
 > Bevy's `bevy_app` owns `Update` / `Startup` while `bevy_ecs` owns the
-> generic schedule machinery. The `Schedule` batcher above already lives
-> in `spark-ecs`; the workload layer, the parallel executor, and the
-> wiring that routes each `Stage` to a `Schedule` are still ahead. When
-> that wiring lands, `add_system` will reach `Stage` through a
-> `StageLabel` trait, keeping the dependency direction (`spark-ecs`
-> *below* `spark-core`) cycle-free.
+> generic schedule machinery. The `Schedule` batcher above lives in
+> `spark-ecs`; keeping `Stage` a layer up in `spark-core` is what lets
+> `spark-ecs` sit *below* `spark-core` without a dependency cycle.
 
 ## Derive macros
 
@@ -1992,25 +1713,30 @@ inherently non-`Send` singletons (a `wgpu` surface, an OS handle) —
 parallel-safety for those is the scheduler's job (keep the touching
 system on the main thread), not a bound enforced at the type level.
 
-```rust,ignore
-// `ignore`: forward-looking spec — uses `Vec2`, which isn't in spark-ecs
-// yet. Every derive shown here ships today; only the `Vec2` field type
-// keeps this snippet from compiling as a doctest.
+```rust
+use spark_ecs::{Component, Entity, Event, Resource};
+
 #[derive(Component, Debug, Clone, Copy)]
-pub struct Position(pub Vec2);
+struct Position {
+    x: f32,
+    y: f32,
+}
 
 #[derive(Component)]
-pub struct Operational;          // marker (zero-sized)
+struct Operational; // marker (zero-sized)
 
 #[derive(Resource, Default)]
-pub struct PowerNetwork {
-    pub supply: f32,
-    pub demand: f32,
-    pub ratio: f32,
+struct PowerNetwork {
+    supply: f32,
+    demand: f32,
+    ratio: f32,
 }
 
 #[derive(Event)]
-pub struct CityTierUp { pub city: Entity, pub new_tier: u32 }
+struct CityTierUp {
+    city: Entity,
+    new_tier: u32,
+}
 ```
 
 # Reference

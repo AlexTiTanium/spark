@@ -1,7 +1,7 @@
 use super::*;
 
 use crate::access::Access;
-use crate::{Query, World};
+use crate::{Changed, Query, World};
 // -------- change detection: precise `Mut` marking --------
 
 #[test]
@@ -81,4 +81,55 @@ fn multi_mut_tuple_marks_only_the_written_component() {
         world.storage::<Velocity>().unwrap().changed_tick_for(e),
         Some(2) // read-only → stays at its insert tick
     );
+}
+
+#[test]
+fn changed_query_detects_a_write_across_a_clock_wrap() {
+    // End-to-end companion to `filter.rs`'s unit-level wrap tests: drive a real
+    // `Query<&T, Changed<T>>` across a `current_tick` wrap and confirm a
+    // post-wrap write is still detected through the full Query → filter →
+    // storage path. A naive `tick > baseline` would miss it — the post-wrap
+    // write tick (0) is numerically *below* the pre-wrap baseline (`u32::MAX`)
+    // — while the wrapping-aware `is_changed_since` catches it. (The unit
+    // `is_changed_since` boundary is pinned in `filter.rs`; this guards the
+    // wiring that feeds it `current` / `tick` / `baseline`.)
+    let pos = std::any::TypeId::of::<Position>();
+    let mut world = World::new();
+    world.spawn().insert(Position(0, 0)); // Position clock 1 → 2
+
+    // Drive the clock to the wrap boundary.
+    world
+        .storage_mut::<Position>()
+        .unwrap()
+        .set_current_tick(u32::MAX);
+
+    // Writer run: a write of `Position` advances the clock `u32::MAX` → `0`
+    // (the wrap) and stamps the entity's `changed_tick` at the post-wrap `0`.
+    let mut writer_access = Access::new();
+    writer_access.components_mut().add_write::<Position>();
+    let mut writer_baseline = Vec::new();
+    world.run_system(&writer_access, &mut writer_baseline, &mut |w| {
+        for mut p in Query::<&mut Position>::from_world(w).iter_mut() {
+            p.0 += 1;
+        }
+    });
+    assert_eq!(
+        world.storage::<Position>().unwrap().current_tick(),
+        0,
+        "the write advanced the clock past u32::MAX, wrapping it to 0"
+    );
+
+    // Observer run: read `Position` filtered by `Changed`, with its baseline
+    // parked just *before* the wrap (`u32::MAX`) — what the scheduler would
+    // have recorded on the run before the wrap. Empty access ⇒ no clock
+    // advance; the parked baseline is fed straight to `Changed::init_state`.
+    let observer_access = Access::new();
+    let mut observer_baseline = vec![(pos, u32::MAX)];
+    let mut seen = 0usize;
+    world.run_system(&observer_access, &mut observer_baseline, &mut |w| {
+        seen = Query::<&Position, Changed<Position>>::from_world(w)
+            .iter()
+            .count();
+    });
+    assert_eq!(seen, 1, "post-wrap write detected across the clock wrap");
 }

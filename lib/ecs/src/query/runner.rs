@@ -128,12 +128,14 @@ pub struct Query<'w, D: QueryData + 'w, F: QueryFilter + 'w = ()> {
     materialized_driver: Option<Vec<Entity>>,
 }
 
-/// Builds the entity stream for a filter-driven query: a borrowed slice into a
-/// single-storage candidate (`With`/`Changed`/`Added`/`And`), or into the
-/// `Or` union materialized once at `from_world` and passed here as
-/// `materialized`. Only reached when [`QueryFilter::candidate_len`] was
-/// `Some`, so one branch always applies.
-fn build_filter_driver<'s, F: QueryFilter>(
+/// Selects the entity stream for a filter-driven query and wraps it in a
+/// [`DriverIter`]: a borrowed slice into a single-storage candidate
+/// (`With`/`Changed`/`Added`/`And`), or into the `Or` union *already*
+/// materialized at `from_world` and passed here as `materialized`. The
+/// expensive union build happens at construction (issue #65), not here — this
+/// only picks the right pre-built slice. Only reached when
+/// [`QueryFilter::candidate_len`] was `Some`, so one branch always applies.
+fn select_filter_driver<'s, F: QueryFilter>(
     filter_state: &'s F::State<'_>,
     materialized: Option<&'s [Entity]>,
 ) -> DriverIter<'s> {
@@ -317,15 +319,15 @@ impl<'w, D: QueryData + 'w, F: QueryFilter + 'w> Query<'w, D, F> {
     /// ```
     pub fn iter_mut(&mut self) -> impl Iterator<Item = D::Item<'_>> + '_ {
         // The driver was chosen at construction; `state` (mut), `filter_state`
-        // and `materialized_driver` (shared) are disjoint fields, so the
-        // driver and the per-entity `matches` reject borrow them side by side.
+        // and `materialized_driver` (shared) are disjoint fields, so the driver
+        // and the per-entity `matches` closure can borrow them side by side.
         let filter_state = &self.filter_state;
         let materialized = self.materialized_driver.as_deref();
         let driven = match self.plan {
             DriverPlan::LiveSet => D::iter(&mut self.state),
             DriverPlan::Data(idx) => D::drive(&mut self.state, DriveSource::Data(idx)),
             DriverPlan::Filter => {
-                let driver = build_filter_driver::<F>(filter_state, materialized);
+                let driver = select_filter_driver::<F>(filter_state, materialized);
                 D::drive(&mut self.state, DriveSource::External(driver))
             }
         };
@@ -406,14 +408,14 @@ impl<'w, D: ReadOnlyQueryData + 'w, F: QueryFilter + 'w> Query<'w, D, F> {
     /// ```
     pub fn iter(&self) -> impl Iterator<Item = D::Item<'_>> + '_ {
         // Path B — see `Query::iter_mut`. Shared mirror: every borrow here is
-        // shared, so the driver slice and the `matches` reject coexist freely.
+        // shared, so the driver slice and the `matches` closure coexist freely.
         let filter_state = &self.filter_state;
         let materialized = self.materialized_driver.as_deref();
         let driven = match self.plan {
             DriverPlan::LiveSet => D::iter_ref(&self.state),
             DriverPlan::Data(idx) => D::drive_ref(&self.state, DriveSource::Data(idx)),
             DriverPlan::Filter => {
-                let driver = build_filter_driver::<F>(filter_state, materialized);
+                let driver = select_filter_driver::<F>(filter_state, materialized);
                 D::drive_ref(&self.state, DriveSource::External(driver))
             }
         };

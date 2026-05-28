@@ -37,7 +37,11 @@ expanded into full drafts in the project's `#10–#12` format below.
   *variant manifest* fronting the codegen and unifies the plain/entity R/W
   Cartesian generators into one `cartesian_rw!` (release-profile `cargo
   expand` byte-identical). Hardens `DenseMut` with a debug once-per-entity
-  tripwire + a crate-scoped Miri CI job (no UB found). One intentional
+  tripwire + a crate-scoped Miri CI job (no UB found; the job is
+  conditional — `.github/workflows/miri.yml` is path-filtered to the
+  unsafe / change-detection surface plus a weekly cron and manual
+  dispatch, and the aliasing-stress test scales N down under `cfg(miri)`
+  so the interpreter cost stays bounded when the filter fires). One intentional
   behaviour change: `Changed`/`Added` now use wrapping-correct relative-age
   detection (the safe window is the full `u32` range — wider than the 2³¹
   the issue assumed; see the commit). No public-API change
@@ -476,8 +480,8 @@ first-slot-required `y`/`n` sentinel. The default outcome of a merge is
 "why it's hard" context so they aren't relitigated. Not byte-identical
 codegen-PR material, hence deferred out of #80.
 
-  **Folds in the `build_*` W/OW duplication.** `build_non_driver_fetch!` and
-  `build_elem!` (in `query/tuple_codegen.rs`) each carry a `W` arm and an
+  **Folds in the per-element-handle W/OW duplication.** `non_driver_handle!`
+  and `build_elem!` (in `query/tuple_codegen.rs`) each carry a `W` arm and an
   `OW` arm with the same `split_for_join` + `DenseMut::new` body — a real
   DRY seam left untouched by #80 to keep the split byte-identical.
   **Revival trigger:** when (and only when) the `kind`-parameterised

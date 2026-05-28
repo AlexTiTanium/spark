@@ -1,9 +1,10 @@
 //! Integration coverage for multi-mut joins over partially-overlapping
 //! component populations (issue #80 Phase 0 regression net).
 //!
-//! The multi-mut tests already in `query.rs` use tiny or single-entity
-//! sets, where the driving storage *is* the intersection. This pins the
-//! harder case the `query.rs` → `query/` split most risks breaking: a
+//! The multi-mut unit tests in `query/tests/joins.rs` use tiny or
+//! single-entity sets, where the driving storage *is* the intersection.
+//! This pins the harder case the `query.rs` → `query/` split most risked
+//! breaking: a
 //! `(&mut A, &mut B, &mut C)` join whose **driver** (the smallest storage,
 //! chosen by `min_data_candidate`) is far sparser than the non-driver
 //! storages, so most matched rows are reached by the per-entity
