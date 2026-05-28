@@ -8,8 +8,9 @@
 //! [`ReadOnlyQueryData`] traits ([`data`](super::data)), the generated tuple
 //! impls ([`tuple_codegen`](super::tuple_codegen)), and the driver runtime
 //! ([`DriveSource`](super::DriveSource) / [`DriverIter`](super::DriverIter) /
-//! `DriverPlan`) in the parent module. This is where the additive
-//! `Query::single` / `get` / `get_many` APIs (#71–#76) will land.
+//! `DriverPlan`) in the parent module. The additive random-access APIs
+//! [`Query::get`] / [`Query::get_mut`] (#72) ship from this file too;
+//! [`Query::single`] (#71) and `get_many` (#73) are not yet landed.
 
 use crate::access::{Access, QueryAccess};
 use crate::entity::Entity;
@@ -46,6 +47,17 @@ use super::{DriveSource, DriverIter, DriverPlan, QueryData, ReadOnlyQueryData};
 /// unchanged. A non-default `F` narrows which entities iterate without
 /// changing the yielded item: `Query<&Position, With<Powered>>` still
 /// yields `&Position`. See the `With` / `Without` / `And` / `Or` filters.
+///
+/// # Random-access fetch
+///
+/// Beside iteration, every [`Query`] supports one-entity lookup via
+/// [`get`](Self::get) (shared, gated on [`ReadOnlyQueryData`] just like
+/// [`iter`](Self::iter)) and [`get_mut`](Self::get_mut) (any [`QueryData`],
+/// `&mut self`). Both return `None` for any missing required component, a
+/// despawned / stale / never-allocated id, or a filter rejection — the same
+/// pattern iteration would have skipped. They share every contract with
+/// iteration: optional elements still yield a `None` *value*, and
+/// [`Mut<T>`](crate::Mut) still marks change only on a `DerefMut` write.
 ///
 /// # Examples
 ///
@@ -337,6 +349,60 @@ impl<'w, D: QueryData + 'w, F: QueryFilter + 'w> Query<'w, D, F> {
             .filter(move |(entity, _)| F::matches(*entity, filter_state))
             .map(|(_entity, item)| item)
     }
+
+    /// Fetches one specific entity through this query, mutably.
+    ///
+    /// The random-access counterpart of [`iter_mut`](Self::iter_mut). Returns
+    /// `Some` when `entity` has the full data shape **and** passes the filter
+    /// `F`; `None` if any required component is missing, the entity is
+    /// despawned / stale / never-allocated, or the filter rejects it. The same
+    /// snapshot rules iteration follows apply: filter state and (where it
+    /// matters) the live-set snapshot are frozen at
+    /// [`from_world`](Self::from_world).
+    ///
+    /// Available for every `D: QueryData`, including `&mut T` and tuples that
+    /// contain a `&mut T`. The `&mut self` is the borrow checker's guarantee
+    /// that the returned `Mut<'_, T>` (for any mutable element) is the only
+    /// one outstanding at a time — the same way `iter_mut`'s `&mut self`
+    /// protects per-row exclusivity.
+    ///
+    /// # Examples
+    ///
+    /// Fetch by id, observe `None` for every reason `get_mut` rejects an entity:
+    ///
+    /// ```
+    /// use spark_ecs::{Component, Query, World};
+    ///
+    /// #[derive(Component)]
+    /// struct Health(u32);
+    ///
+    /// let mut world = World::new();
+    /// let a = world.spawn().insert(Health(100)).id();
+    /// let b = world.spawn().insert(Health(50)).id();
+    /// let c = world.spawn().id();                // alive, no Health
+    /// let doomed = world.spawn().insert(Health(99)).id(); // value is incidental
+    /// world.despawn(doomed);                     // stale handle from here on
+    ///
+    /// let mut q = Query::<&mut Health>::from_world(&world);
+    /// q.get_mut(a).unwrap().0 -= 10;             // mutate through the handle
+    /// assert_eq!(q.get_mut(b).unwrap().0, 50);
+    /// assert!(q.get_mut(c).is_none());           // missing component → None
+    /// assert!(q.get_mut(doomed).is_none());      // despawned          → None
+    /// drop(q);
+    ///
+    /// // The write through `a` persisted past the query's borrow.
+    /// assert_eq!(Query::<&Health>::from_world(&world).get(a).unwrap().0, 90);
+    /// ```
+    pub fn get_mut(&mut self, entity: Entity) -> Option<D::Item<'_>> {
+        // Filter first — match `iter_mut`'s contract that an entity rejected
+        // by `F` is invisible to the system. Reading `filter_state` borrows
+        // `self` immutably; the subsequent `D::lookup_mut` takes `&mut state`
+        // through a disjoint field, so the two borrows coexist.
+        if !F::matches(entity, &self.filter_state) {
+            return None;
+        }
+        D::lookup_mut(&mut self.state, entity)
+    }
 }
 
 impl<'w, D: ReadOnlyQueryData + 'w, F: QueryFilter + 'w> Query<'w, D, F> {
@@ -422,6 +488,52 @@ impl<'w, D: ReadOnlyQueryData + 'w, F: QueryFilter + 'w> Query<'w, D, F> {
         driven
             .filter(move |(entity, _)| F::matches(*entity, filter_state))
             .map(|(_entity, item)| item)
+    }
+
+    /// Fetches one specific entity through this query, shared.
+    ///
+    /// The random-access counterpart of [`iter`](Self::iter), gated on
+    /// [`ReadOnlyQueryData`] for the same reason `iter` is: a `&mut T` shape
+    /// must go through [`get_mut`](Self::get_mut) so the borrow checker can
+    /// guard the returned `Mut<'_, T>`. Returns `Some` when `entity` has the
+    /// full data shape **and** passes the filter `F`; `None` otherwise — any
+    /// missing required component, a despawned / stale / never-allocated id,
+    /// or a filter rejection collapses to `None`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use spark_ecs::{Component, Query, World};
+    ///
+    /// #[derive(Component)]
+    /// struct Position { x: f32, y: f32 }
+    /// #[derive(Component)]
+    /// struct Velocity { x: f32, y: f32 }
+    ///
+    /// let mut world = World::new();
+    /// let movable = world
+    ///     .spawn()
+    ///     .insert(Position { x: 1.0, y: 2.0 })
+    ///     .insert(Velocity { x: 0.5, y: 0.0 })
+    ///     .id();
+    /// let stationary = world.spawn().insert(Position { x: 9.0, y: 9.0 }).id();
+    /// let doomed = world.spawn().insert(Position { x: 0.0, y: 0.0 }).id();
+    /// world.despawn(doomed); // stale handle from here on
+    ///
+    /// let q = Query::<(&Position, &Velocity)>::from_world(&world);
+    /// // The joined entity returns both components.
+    /// let (pos, vel) = q.get(movable).unwrap();
+    /// assert_eq!(pos.x + vel.x, 1.5);
+    /// // The Position-only entity is missing the Velocity half — `None`.
+    /// assert!(q.get(stationary).is_none());
+    /// // Despawned handles also collapse to `None`, never a stale read.
+    /// assert!(q.get(doomed).is_none());
+    /// ```
+    pub fn get(&self, entity: Entity) -> Option<D::Item<'_>> {
+        if !F::matches(entity, &self.filter_state) {
+            return None;
+        }
+        D::lookup(&self.state, entity)
     }
 }
 

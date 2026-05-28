@@ -249,6 +249,7 @@ impl QueryFilter for () {
 
     fn init_state(_world: &World) -> Self::State<'_> {}
 
+    #[inline]
     fn matches(_entity: Entity, _state: &Self::State<'_>) -> bool {
         true
     }
@@ -294,6 +295,7 @@ impl<T: Component> QueryFilter for With<T> {
         world.storage::<T>()
     }
 
+    #[inline]
     fn matches(entity: Entity, state: &Self::State<'_>) -> bool {
         state
             .as_ref()
@@ -349,6 +351,7 @@ impl<T: Component> QueryFilter for Without<T> {
         world.storage::<T>()
     }
 
+    #[inline]
     fn matches(entity: Entity, state: &Self::State<'_>) -> bool {
         // No storage for `T` → no entity has it → everyone passes.
         state
