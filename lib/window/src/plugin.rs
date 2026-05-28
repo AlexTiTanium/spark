@@ -8,8 +8,9 @@ use crate::event_loop;
 
 /// Installs [`crate::run`] as the [`Application`]'s runner — the
 /// closure that owns the main thread once startup has finished and
-/// ticks `PreUpdate → Update → PostUpdate` on every winit
-/// `RedrawRequested`.
+/// ticks the simulation stages (`Input → PreUpdate → FixedUpdate × N →
+/// Update → PostUpdate`) in winit's `about_to_wait`, leaving
+/// `Stage::Render` for `RedrawRequested`.
 ///
 /// # Examples
 ///
