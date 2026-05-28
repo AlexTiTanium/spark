@@ -647,6 +647,15 @@ impl<T: Component> ComponentStorage<T> {
         self.dense_idx_of(entity).map(|i| self.added_tick[i])
     }
 
+    /// This component's current clock value — the reference point the
+    /// [`Changed<T>`](crate::Changed) / [`Added<T>`](crate::Added) filters
+    /// measure tick *ages* against in their wrapping-aware comparison
+    /// (always `>=` every stamped `changed_tick` / `added_tick` and every
+    /// parked baseline, since the clock only advances).
+    pub(crate) fn current_tick(&self) -> u32 {
+        self.current_tick
+    }
+
     /// Overrides this component's clock. Test-only control point for
     /// driving ticks to specific values; normal operation advances the
     /// clock via [`insert`](Self::insert) and [`AnyStorage::advance_tick`].
@@ -1015,11 +1024,14 @@ mod tests {
     }
 
     #[test]
-    fn tick_wraparound_does_not_panic_and_is_a_clean_false_negative() {
-        // The clock is `wrapping_add`. Driving it across `u32::MAX` must
-        // not panic; the documented cost is a single false-negative frame
-        // at the wrap boundary (a write stamped post-wrap reads as "older"
-        // than a pre-wrap baseline). This pins that behaviour.
+    fn tick_wraparound_does_not_panic_and_is_detected_across_the_wrap() {
+        // The clock is `wrapping_add`. Driving it across `u32::MAX` must not
+        // panic, and — after the Phase-4 change-detection fix (issue #80) —
+        // a write stamped *after* the wrap must still be detected against a
+        // pre-wrap baseline. (Before the fix this was a documented
+        // false-negative: `0 > u32::MAX - 1` is false. The
+        // `Changed`/`Added` filters now use a wrapping-aware relative-age
+        // comparison; this pins the storage-level inputs to it.)
         let (_alloc, entities) = alloc_n(1);
         let mut storage = ComponentStorage::<Pos>::new();
         storage.set_current_tick(u32::MAX - 1);
@@ -1029,9 +1041,16 @@ mod tests {
         assert_eq!(storage.current_tick(), 0);
         assert_eq!(storage.changed_tick_for(entities[0]), Some(0)); // wrapped, no panic
 
-        // A reader whose baseline was the pre-wrap tick misses this write:
-        // 0 > (u32::MAX - 1) is false. Documented wraparound false-negative.
+        // A reader whose baseline was the pre-wrap tick now SEES this write.
+        // The filter's comparison is `current - tick < current - baseline`:
+        // with current = 0, tick = 0, baseline = u32::MAX - 1 that is
+        // `0 < 2`, i.e. changed. The old strict `0 > u32::MAX - 1` missed it.
         let baseline = u32::MAX - 1;
-        assert!(storage.changed_tick_for(entities[0]).unwrap() <= baseline);
+        let current = storage.current_tick();
+        let tick = storage.changed_tick_for(entities[0]).unwrap();
+        assert!(
+            current.wrapping_sub(tick) < current.wrapping_sub(baseline),
+            "post-wrap write must be detected against a pre-wrap baseline"
+        );
     }
 }

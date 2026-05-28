@@ -14,69 +14,49 @@ other engine crate (including `spark-core`) sits on top.
 > Adding a feature is usually adding a new component and a new system,
 > not editing existing classes. The update graph stays flat.
 
-> **Today vs tomorrow.** Code blocks tagged ` ```rust ` compile and
-> run today — they're doc tests, kept honest by
-> `cargo test --doc -p spark-ecs`. Code blocks tagged ` ```rust,ignore `
-> show types that don't exist yet; they're the spec of what's coming,
-> not what's runnable. (`Commands`, the events API — `Event` / `Events`
-> / `EventReader` / `EventWriter` — and the workload API —
-> `WorkloadLabel` / `Schedule` / `add_workload` — ship today.) `Query`
-> exists today for `&T` / `&mut T`, every `&` / `&mut` combination
-> of 2-/3-/4-/5-tuples (including multi-mut at any arity, e.g.
-> `(&mut A, &mut B, &mut C)`), the filter generic `Query<D, F>`
-> (`With` / `Without` / `And` / `Or` / `Changed<T>` / `Added<T>`), and
-> **entity-as-data** — `Query<Entity>` and `Query<(Entity, &A, …)>` — and
-> **optional fetch** — `Option<&T>` / `Option<&mut T>`, standalone or as a
-> trailing element of a required-first 2-/3-tuple. The forward-looking
-> design is settled — see [`docs/ECS_DESIGN.md`](../../docs/ECS_DESIGN.md)
-> for the full engineering reference and [`docs/PLAN.md`](../../docs/PLAN.md)
-> for the milestone plan.
+> **Runnable docs.** Every ` ```rust ` block below compiles and runs as a
+> doc test, kept honest by `cargo test --doc -p spark-ecs`. The few
+> ` ```rust,ignore ` blocks are *not* runnable for a structural reason the
+> block states — they call `spark-core` (which sits *above* this crate in
+> the dependency graph, so a doctest here can't reach it), or they're a
+> catalog of type spellings rather than executable code. Nothing here is a
+> placeholder for unbuilt API. For the engineering rationale behind each
+> decision see [`docs/ECS_DESIGN.md`](../../docs/ECS_DESIGN.md); for the
+> milestone plan, [`docs/PLAN.md`](../../docs/PLAN.md).
 
-## Why ECS instead of OOP?
 
-Suppose you're writing a power-grid simulator. Some objects are power
-plants that produce energy. Some are cities that consume it. Some are
-workers walking around to repair things. Some are plans the player
-has placed but nothing has been built there yet.
+## Quick reference: every query shape
 
-In an OOP design you'd reach for inheritance:
+| Query | What it iterates | Iteration item |
+|-|-|-|
+| `Query<&T>` | All entities with `T` | `&T` |
+| `Query<&mut T>` | All entities with `T` | `&mut T` |
+| `Query<(&A, &B)>` | Entities with both `A` and `B` | `(&A, &B)` |
+| `Query<(&mut A, &B)>` | Entities with both | `(&mut A, &B)` |
+| `Query<(&A, &B, &C)>` | Entities with all three | `(&A, &B, &C)` |
+| `Query<Entity>` | Every live entity | `Entity` |
+| `Query<(Entity, &T)>` | Entities with `T`, including ID | `(Entity, &T)` |
+| `Query<(Entity, &A, &B)>` | Entities with `A` and `B`, including ID | `(Entity, &A, &B)` |
+| `Query<(&T, Option<&U>)>` | Entities with `T`, each carrying `U` if present | `(&T, Option<&U>)` |
+| `Query<Option<&T>>` | Every live entity, `T` if present | `Option<&T>` |
+| `Query<&T, With<U>>` | Entities with both `T` and `U`, only fetch `T` | `&T` |
+| `Query<&T, Without<U>>` | Entities with `T` but not `U` | `&T` |
+| `Query<&T, And<(With<U>, Without<V>)>>` | AND of filters | `&T` |
+| `Query<&T, Or<(With<U>, With<V>)>>` | OR of filters | `&T` |
+| `Query<&T, Changed<T>>` | Entities whose `T` was written since this system last ran | `&T` |
+| `Query<&T, Added<T>>` | Entities whose `T` was first attached since this system last ran | `&T` |
 
-```text
-            GameObject
-              │
-   ┌──────────┼──────────┐
-   ▼          ▼          ▼
- Plant       City      Worker
-   │
-   ▼
-WaterWheel, CoalPlant, …
+Iteration methods on every `Query`:
+
+```rust,ignore
+for x in q.iter() { … }                  // immutable
+for x in q.iter_mut() { … }              // requires `mut q: Query<…>`
+for x in &q { … }                        // sugar for q.iter()
+for x in &mut q { … }                    // sugar for q.iter_mut()
+let count = q.iter().count();
+let first = q.iter().next();
 ```
 
-That works for a while. Then someone wants a *plant under
-construction* — it has a `ConstructionProgress`, isn't producing
-energy yet, but should still appear on the map. Where does that
-component go? On `Plant`? Then you need an `is_built` check
-everywhere. On a new `PlantUnderConstruction`? Then construction has
-two cases. On a wrapper? Now you've got delegation hell.
-
-In an ECS you stop asking "what is this thing" and start asking "what
-does this thing have". A *plant under construction* is just an entity
-with:
-
-```text
-    Position, BuildingKind, ConstructionProgress
-```
-
-When construction finishes, a system removes `ConstructionProgress`
-and adds `Operational`. The entity didn't *become* a different class
-— its component set changed.
-
-> **What about Unity's `GameObject` components?** That's the same
-> idea applied half-way: each `GameObject` is a heap-allocated
-> container holding a list of components. A pure ECS goes further —
-> entities are *just an ID*, components live in tightly-packed arrays
-> keyed by that ID, and systems iterate the arrays directly. Same
-> ergonomics, much better data layout for cache and parallelism.
 
 ## The three vocabulary words
 
@@ -102,10 +82,10 @@ and adds `Operational`. The entity didn't *become* a different class
   the `World`; the derive's `Send + Sync + 'static` bound is what lets
   the scheduler iterate them in parallel.
 - **System** — a plain Rust function whose parameters describe what
-  it reads and writes. Today: `Res<T>`, `ResMut<T>`, `Query<D>` (for
-  `D = &T`, `&mut T`, or a tuple of those), and `Commands` for
-  deferred spawn / despawn / insert. `EventReader`/`Writer` and
-  `Local` land in follow-up PRs — see *What's next* further down.
+  it reads and writes: `Res<T>`, `ResMut<T>`, `Query<D, F>` (for
+  `D = &T`, `&mut T`, or a tuple of those), `Commands` for deferred
+  spawn / despawn / insert, and `EventReader<T>` / `EventWriter<T>` for
+  messaging. Each is covered in its own section below.
 
 ```rust
 // Runs today. `Time` here is a tiny stand-in for the future
@@ -614,271 +594,6 @@ storage glue.
 [`ComponentStorage`]: struct.ComponentStorage.html
 [`AnyStorage`]: trait.AnyStorage.html
 
-## Memory evolution: step by step
-
-The diagrams above show what a `ComponentStorage<T>` looks like at
-rest. This section walks through what happens in memory **step by
-step** as you spawn entities, attach components, remove them, despawn
-entities, and spawn again. Every operation here is O(1) — but
-understanding *why* makes it easier to write systems that stay fast,
-and to read the code when something goes wrong.
-
-### The structures we track
-
-```text
-EntityAllocator
-├── generation:  Vec<u32>     ◀── one entry per slot, bumped on destroy
-├── alive:       Vec<bool>    ◀── whether the slot is currently live
-└── free_list:   Vec<u32>     ◀── LIFO of indices ready for reuse
-
-ComponentStorage<T>
-├── sparse:        Vec<Option<u32>>   ◀── entity.index → dense_idx
-├── dense:         Vec<T>             ◀── packed component values
-└── entity_index:  Vec<Entity>        ◀── dense_idx → Entity
-
-World
-├── entities:   EntityAllocator
-├── components: HashMap<TypeId, RefCell<Box<dyn AnyStorage>>>
-└── resources:  HashMap<TypeId, RefCell<Box<dyn Any>>>
-```
-
-### T = 0 — an empty world
-
-```text
-allocator:           gen=[]  alive=[]  free=[]
-storage<Position>:   not yet created  (no one has touched the TypeId)
-```
-
-### T = 1 — `world.spawn()` → E0
-
-`allocate()` checks `free_list` — it's empty, so it pushes a brand-new
-slot: `index = 0`, `generation[0] = 0`, `alive[0] = true`.
-
-```text
-allocator:  gen=[0]  alive=[T]  free=[]
-E0 = Entity { index: 0, generation: 0 }
-```
-
-The components map is still empty — no components yet.
-
-### T = 2 — `world.insert(E0, Position { x: 0, y: 0 })`
-
-This is the very first `Position` insert, so `World` lazily creates a
-`ComponentStorage<Position>`. The storage stretches `sparse` to
-`entity.index + 1` entries, writes `Some(0)` at the new entry,
-pushes the value onto `dense`, and pushes `E0` onto `entity_index`.
-
-```text
-storage<Position>:
-  sparse:        [Some(0)]
-  dense:         [P{0, 0}]
-  entity_index: [E(0, gen=0)]
-                 ↑ dense_idx = 0
-```
-
-**Lookup cost:** `sparse[0]` → `Some(0)` → `dense[0]`. Two index
-reads, O(1).
-
-### T = 3, T = 4 — spawn E1 and E2, insert more components
-
-```text
-spawn E1 → index=1, generation=0       (free_list empty → push new slot)
-spawn E2 → index=2, generation=0
-
-world.insert(E1, Position{10, 0})
-world.insert(E2, Position{20, 0})
-world.insert(E2, Velocity{-1, 0})       ◀── new TypeId → new storage
-```
-
-State after:
-
-```text
-allocator:  gen=[0,0,0]  alive=[T,T,T]  free=[]
-
-storage<Position>:
-  sparse:        [Some(0), Some(1), Some(2)]
-  dense:         [P{0,0},  P{10,0}, P{20,0}]
-  entity_index: [E0,      E1,      E2]
-
-storage<Velocity>:
-  sparse:        [None, None, Some(0)]    ◀── only stretched to index=2
-  dense:         [V{-1, 0}]
-  entity_index: [E2]
-```
-
-Notice how `Velocity`'s `sparse` array is mostly `None` — E0 and E1
-don't have a `Velocity`. That's where the **sparse** in "sparse set"
-comes from: most slots are empty. The `dense` array, on the other
-hand, is always packed: no gaps. That's what makes iteration
-cache-friendly — `for v in &velocity_storage.dense` walks a
-contiguous slab of memory.
-
-### T = 5 — `world.remove::<Position>(E1)` — the swap-remove dance
-
-This is the operation the sparse-set scheme exists for. Removing
-`dense[1]` by shifting the tail down would be O(n). Instead, the
-storage swaps the doomed element with the last one and pops:
-
-```text
-step 1:  dense_idx = sparse[1].take()    → 1,  sparse[1] = None
-step 2:  last_idx  = dense.len() - 1     → 2
-step 3:  dense_idx ≠ last_idx, so swap:
-           swapped_entity        = entity_index[2] = E2
-           sparse[E2.index = 2]  = Some(1)         ◀── redirect E2's sparse entry
-step 4:  dense.swap_remove(1)
-         entity_index.swap_remove(1)
-```
-
-After:
-
-```text
-storage<Position>:
-  sparse:        [Some(0), None,   Some(1)]    ◀── E1 gone; E2 now points at dense[1]
-  dense:         [P{0,0},          P{20,0}]
-  entity_index: [E0,              E2]
-```
-
-`dense` stays packed. One swap, one pop — O(1). The trade-off:
-iteration order isn't stable across removes. Systems don't depend on
-that; they only need *deterministic* iteration within a single
-frame, which the engine still guarantees.
-
-### T = 6 — `world.despawn(E2)` — type-erased cleanup
-
-The `World` doesn't know which components are on E2 — that's the
-cost of type-erasure. So `despawn` walks **every** storage and tells
-each one "remove this entity if you have it":
-
-```rust
-use spark_ecs::{Component, World};
-
-#[derive(Debug, Component)] struct Position { x: f32, y: f32 }
-#[derive(Debug, Component)] struct Velocity { x: f32, y: f32 }
-
-let mut world = World::new();
-let e = world.spawn()
-    .insert(Position { x: 20.0, y: 0.0 })
-    .insert(Velocity { x: -1.0, y: 0.0 })
-    .id();
-
-assert!(world.despawn(e));
-assert!(world.get::<Position>(e).is_none());
-assert!(world.get::<Velocity>(e).is_none());
-```
-
-In `Position`'s storage, E2 sits at `dense[1]` *and* that's the last
-slot, so the swap-remove degenerates to a plain pop. In `Velocity`'s
-storage, E2 was the only entry — pop again.
-
-```text
-storage<Position>:
-  sparse:        [Some(0), None, None]
-  dense:         [P{0, 0}]
-  entity_index: [E0]
-
-storage<Velocity>:
-  sparse:        [None, None, None]
-  dense:         []
-  entity_index: []
-```
-
-In the allocator:
-
-```text
-generation[2] += 1     (was 0, now 1)
-alive[2] = false
-free_list.push(2)
-
-allocator:  gen=[0,0,1]  alive=[T,T,F]  free=[2]
-```
-
-### T = 7 — `world.spawn()` again — the generation trick pays off
-
-`allocate()` finds `free_list` non-empty, pops `2` (LIFO), sets
-`alive[2] = true`. Crucially, it **does not** reset `generation[2]`
-— that stays at `1`, the value it was bumped to during destroy.
-
-```text
-allocator:  gen=[0,0,1]  alive=[T,T,T]  free=[]
-E3 = Entity { index: 2, generation: 1 }       ◀── same slot, new generation
-```
-
-Any old copy of `E2 = Entity { index: 2, generation: 0 }` still
-floating around in user code is now provably stale. The check is the
-public `is_alive`:
-
-```rust
-use spark_ecs::{Component, World};
-
-#[derive(Component)]
-struct Tag;
-
-let mut world = World::new();
-let old = world.spawn().insert(Tag).id();
-world.despawn(old);
-
-let fresh = world.spawn().id();
-// Same slot under the hood; distinct identities.
-assert_ne!(old, fresh);
-assert!(!world.is_alive(old));        // stale handle → dead ✓
-assert!(world.is_alive(fresh));        // fresh handle → alive ✓
-```
-
-Without the generation field, `spawn` would return `Entity(index=2)`
-again and the stale handle would silently point at the new tenant —
-the classic **ABA bug**. The generation makes an entity's identity
-unique in practice, while still letting the underlying slot be
-reused.
-
-### Cost table
-
-| Operation | What it touches | Cost |
-|-|-|-|
-| `spawn()` | `allocator`: pop `free_list`, or push to `generation` + `alive` | O(1) amortised |
-| `insert<T>(e, v)` | `storage<T>`: maybe grow `sparse`, push `dense` + `entity_index` | O(1) amortised |
-| `get<T>(e)` | one hash on `TypeId`, two index reads | O(1) |
-| `remove<T>(e)` | swap-remove `dense` + `entity_index`, patch the neighbour's `sparse` | O(1) |
-| `despawn(e)` | for **every** storage in the components map: `remove_entity` | O(K), K = component types |
-
-The detail worth knowing about `despawn`: its cost depends on how
-many component **types** are registered in the `World`, *not* how
-many components the doomed entity actually has. Every storage gets
-its `RefCell::borrow_mut`, a `sparse[entity.index]` check, and (if
-absent) an immediate return. Cheap, but not free — keep an eye on it
-when component-type count grows into the hundreds.
-
-### What actually takes memory
-
-A realistic case: 10 000 map tiles, each with a `Position` (8 bytes)
-and a `Walkable` marker component (zero-sized).
-
-```text
-allocator:
-  generation:    10_000 × 4 B  =  40 000 B
-  alive:         10_000 × 1 B  =  10 000 B
-  free_list:     0             (no one has died yet)
-
-storage<Position>:
-  sparse:        10_000 × 4 B  =  40 000 B   (Option<u32> often packs to 4 B via niche)
-  dense:         10_000 × 8 B  =  80 000 B
-  entity_index:  10_000 × 8 B  =  80 000 B
-
-storage<Walkable> (zero-sized):
-  sparse:        10_000 × 4 B  =  40 000 B
-  dense:         0             (ZST: Vec allocates no backing storage at all)
-  entity_index:  10_000 × 8 B  =  80 000 B
-```
-
-Notice what dominates: `sparse` and `entity_index` — not the
-component data itself. For **common** components (sit on most
-entities: `Position`, `Visible`) that's a great deal — you pay 12 B
-of overhead per slot for fast O(1) lookup. For **rare** components
-(1 % of entities) most of `sparse` is wasted slots; that's where a
-`HashMap`-backed storage would be a better fit. Spark sticks to one
-storage scheme for M3 (sparse only) and revisits per-component
-storage strategies only if profiling shows a need — premature
-optimisation otherwise.
-
 ## Systems and parameters
 
 A system is a plain Rust function. Its parameter types declare what
@@ -1325,7 +1040,7 @@ Two rules make this predictable:
   `Option<&Velocity>` is looked up per entity. So the cost is
   `O(|Position|)` regardless of how many entities have `Velocity` — even
   if `Velocity` is the smaller storage, it can't pull the driver down and
-  drop the `Position`-only rows. (See *Iteration and cost*.)
+  drop the `Position`-only rows. (See *Query cost and iteration order* below.)
 - **The first element must be required.** Optionals are only allowed in the
   *trailing* positions of a 2-/3-tuple (`(&A, Option<&B>)`,
   `(&A, &B, Option<&C>)`), guaranteeing a driver always exists. Standalone
@@ -1360,7 +1075,6 @@ symmetric with `Or` and unambiguous when the two nest
 deliberate divergence from Bevy's implicit tuple-AND.
 
 ```rust
-// ✅ Compiles and runs today.
 use spark_ecs::{And, Component, Or, Query, With, Without, World};
 
 #[derive(Component)]
@@ -1446,147 +1160,10 @@ structural edits. (When candidate populations tie, the earliest part in
 the shape drives, so adding this optimisation didn't reorder the queries
 that were already driving optimally.)
 
-# What's next
+## Change detection: `Changed<T>` / `Added<T>`
 
-The types below are **spec-frozen**. Some ship today (✅) and some
-don't (⏳). Code blocks tagged `rust,ignore` are spec-frozen but use
-types that haven't landed yet — read them as "here's the shape coming
-next". Code blocks tagged `rust` compile and run today.
-
-## `Query<D, F>`: finding entities
-
-A query is a declarative spec of which entities a system wants. The
-**data shape** says which components to read or write, the **filter**
-says how to narrow the set.
-
-> **Status at a glance.** Data shapes for `&T`, `&mut T`, and every
-> `&` / `&mut` combination of flat 2-/3-/4-/5-tuples (including
-> multi-mut at any arity) are ✅ shipping today via
-> [`Query<D>`](struct.Query.html), as is the filter generic
-> `Query<D, F>` (`With` / `Without` / `And` / `Or` / `Changed<T>` /
-> `Added<T>`) and **entity-as-data** (`Query<Entity>`,
-> `Query<(Entity, &A, …)>` for one-to-three trailing components).
-> **Optional fetch** — `Option<&T>` / `Option<&mut T>` — is ✅ shipping
-> too: standalone (`Query<Option<&T>>`) and as a trailing element of a
-> 2-/3-tuple whose first element is required (`Query<(&A, Option<&B>)>`).
-> Each subsection below calls out which bits are runnable now and which
-> are spec-frozen.
-
-### Data shapes
-
-```rust,ignore
-// ✅ today — every `&` / `&mut` combination of 2-/3-/4-/5-tuples,
-//          generated by one `impl_all_tuple!` invocation per arity:
-Query<&Position>                            // immutable single
-Query<&mut Position>                        // mutable single
-Query<(&Position, &Velocity)>               // read-read
-Query<(&mut Position, &Velocity)>           // mut driver, read non-driver
-Query<(&Position, &mut Velocity)>           // read driver, mut non-driver
-Query<(&mut Position, &mut Velocity)>       // multi-mut (self-conflict checked)
-Query<(&A, &B, &C)>                         // arity 3, all-read
-Query<(&mut A, &B, &C)>                     // arity 3, mut at any position…
-Query<(&A, &mut B, &mut C)>                 //   …including multiple positions
-Query<(&mut A, &mut B, &mut C)>             //   …or all of them
-Query<(&A, &B, &C, &D)>                     // arity 4, same story
-Query<(&mut A, &mut B, &mut C, &mut D)>     //   …up to fully mutable
-Query<(&A, &B, &C, &D, &E)>                 // arity 5, same story
-Query<(&mut A, &mut B, &mut C, &mut D, &mut E)>  //   …up to fully mutable
-
-// ✅ today — entity-as-data (Entity as the first element, 1–3 components):
-Query<Entity>                               // just the ID — every live entity
-Query<(Entity, &Position)>                  // ID + one component
-Query<(Entity, &mut Position, &Velocity)>   // ID + mixed &/&mut, up to 3 components
-
-// ✅ today — optional fetch (first element required, 2-/3-tuples):
-Query<Option<&Velocity>>                    // every live entity, Some/None
-Query<(&Position, Option<&Velocity>)>       // Velocity may be absent — row still yielded
-Query<(&mut Position, Option<&mut Velocity>)> // optional mutable too
-Query<(&A, &B, Option<&C>)>                 // arity 3, trailing optional
-```
-
-Iteration shape today is **path B** (Bevy-style): `Query<&T>::iter()`
-yields `&T`, **not** `(Entity, &T)`. When a system needs the entity, it
-asks for it by naming `Entity` in the shape — `Query<(Entity, &T)>`
-yields `(Entity, &T)`, `Query<Entity>` yields the id alone. See
-*Getting the entity id* in the walkthrough above for runnable examples.
-
-```rust
-// ✅ Compiles and runs today.
-use spark_ecs::{Component, Query, World};
-
-#[derive(Component)]
-struct Position(f32, f32);
-#[derive(Component)]
-struct Velocity(f32, f32);
-
-let mut world = World::new();
-world.spawn().insert(Position(0.0, 0.0)).insert(Velocity(1.0, 0.0));
-
-let mut q = Query::<(&mut Position, &Velocity)>::from_world(&world);
-for (mut pos, vel) in q.iter_mut() {
-    pos.0 += vel.0;
-    pos.1 += vel.1;
-}
-```
-
-```rust
-// ✅ Runs today with a local `Time` stand-in. The real `spark-time`
-// `Time` resource lands with the frame-loop PR; the shape stays
-// identical.
-use spark_ecs::{Component, IntoSystem, Query, Res, Resource, World};
-
-#[derive(Resource)]
-struct Time { delta: f32 }
-#[derive(Component)]
-struct Position(f32, f32);
-#[derive(Component)]
-struct Velocity(f32, f32);
-
-fn integrate(time: Res<Time>, mut q: Query<(&mut Position, &Velocity)>) {
-    for (mut pos, vel) in q.iter_mut() {
-        pos.0 += vel.0 * time.delta;
-    }
-}
-
-let mut world = World::new();
-world.add_resource(Time { delta: 0.5 });
-world.spawn().insert(Position(0.0, 0.0)).insert(Velocity(2.0, 0.0));
-
-let mut sys = IntoSystem::into_system(integrate);
-sys(&world);
-// Pull the value out before the `Query` drops.
-let x = Query::<&Position>::from_world(&world).iter().map(|p| p.0).next().unwrap();
-assert!((x - 1.0).abs() < f32::EPSILON);
-```
-
-### Filters
-
-✅ **Ships today.** A second type parameter narrows the entity set
-without fetching anything — filters only *gate* the iteration. See
-*Narrowing with filters* above for runnable examples; the shapes:
-
-```rust,ignore
-// Operational plants only (Operational is a marker — zero-sized).
-Query<&Plant, With<Operational>>
-
-// Workers that don't currently have a job.
-Query<&Worker, Without<CurrentJob>>
-
-// And<(…)> = every inner filter must match. Spelled explicitly (not a
-// bare tuple) so it stays symmetric with Or.
-Query<&Plant, And<(With<Operational>, Without<UnderMaintenance>)>>
-
-// Or<(…)> = any inner filter matches.
-Query<&Plant, Or<(With<Operational>, With<Backup>)>>
-
-// And / Or nest freely — each is itself a filter.
-Query<&Plant, And<(With<Online>, Or<(With<Powered>, With<Backup>)>)>>
-```
-
-### Change detection: `Changed<T>` / `Added<T>`
-
-✅ **Ships today.** Two filters that ask *when* a component was last
-touched, so a system processes only what moved:
+Two filters that ask *when* a component was last touched, so a system
+processes only what moved:
 
 - `Changed<T>` — `T` was **written** since this system last ran (insert,
   overwrite, or a `&mut T` write). React to edits: redraw an HP bar only
@@ -1599,8 +1176,11 @@ The model is **per-component clocks**. Each component type owns its own
 tick that advances when something writes that type — so `Position`'s clock
 and `Velocity`'s clock move independently. A system remembers, per
 component it touches, the tick it last saw; a write bumps the clock past
-that, and `changed_tick > last_seen` answers "changed since I looked." No
-global frame counter.
+that, and a `changed_tick` *newer than* that baseline answers "changed
+since I looked." No global frame counter. ("Newer than" is a wrapping-aware
+relative-age comparison, not a plain `>`, so it stays correct even when a
+clock wraps past `u32::MAX` — see the change-detection notes in
+`filter.rs`.)
 
 ```rust
 use spark_ecs::{Changed, Component, Query, World};
@@ -1639,125 +1219,6 @@ Both filters report a **read** of `T` (like `With<T>`), so
 a *different* component (`Query<&mut Sprite, Changed<Transform>>`). They
 compose with the combinators: `And<(With<Powered>, Changed<Load>)>`.
 
-### All variants at a glance
-
-```rust,ignore
-// — DATA SHAPES —
-Query<&T>                                    // ✅ read
-Query<&mut T>                                // ✅ write
-// Every `&` / `&mut` combination at arity 2, 3, 4, and 5 is ✅ today;
-// runtime self-conflict check catches `(&mut A, &A)` / `(&mut A, &mut A)`.
-Query<(&A, &B)>                              // ✅ arity 2: all 4 combos
-Query<(&mut A, &mut B)>                      // ✅   (incl. multi-mut)
-Query<(&A, &B, &C)>                          // ✅ arity 3: all 8 combos
-Query<(&mut A, &mut B, &mut C)>              // ✅   (incl. fully mutable)
-Query<(&A, &B, &C, &D)>                      // ✅ arity 4: all 16 combos
-Query<(&mut A, &mut B, &mut C, &mut D)>      // ✅   (incl. fully mutable)
-Query<(&A, &B, &C, &D, &E)>                  // ✅ arity 5: all 32 combos
-Query<(&mut A, &mut B, &mut C, &mut D, &mut E)>  // ✅ (incl. fully mutable)
-Query<Entity>                                // ✅ just the ID, no component
-Query<(Entity, &Position, &mut Velocity)>    // ✅ ID + 1–3 components, any &/&mut
-Query<&Position, ()>                         // ✅ explicit empty filter (the default)
-
-// — FILTERS —                        ✅ filters + change-detection PRs
-With<T>            // entity must have T (but don't fetch T)
-Without<T>         // entity must NOT have T
-And<(F1, F2, …)>   // AND of filters (explicit, not a bare tuple)
-Or<(F1, F2, …)>    // OR of filters — nests with And
-Changed<T>         // ✅ T written since this system last ran
-Added<T>           // ✅ T first attached since this system last ran
-
-// — OPTIONAL DATA —                  ✅ optional-fetch (issue #70)
-Option<&T>         // fetch T if present, give None otherwise; never gates the row
-Option<&mut T>     // mutable variant; trailing element of a required-first tuple
-
-// — ARITY 6+ —                       follow-up (one line per arity)
-// Add `impl_all_tuple!(A, B, C, D, E, F);` in query.rs to unlock all
-// 64 `&` / `&mut` combinations at arity 6. Pure mechanical extension —
-// but monomorphisation cost doubles per step, weigh against need.
-```
-
-### Iteration and cost
-
-The driver-storage trick is what keeps queries fast. To resolve
-`Query<(&A, &B)>` the engine:
-
-1. Picks the **smallest candidate set** in the whole query as the
-   *driver* — the storage with the fewest entities, decided once when
-   the query is built (see *Query cost and iteration order* above).
-2. Iterates the driver's `dense` array.
-3. For each entity, looks up the other component via O(1) sparse-set
-   access. Skips if absent.
-
-So a `Query<(&Plant, &CityName)>` with 50 plants and 200
-cities-with-names runs in 50 iterations, not 50 × 200 — and the 50
-drives whether `Plant` is written first or second.
-
-| Query | Iteration cost |
-|-|-|
-| `Query<&T>` | O(n) over T's dense array; n = entities with T |
-| `Query<(&A, &B)>` | O(min(\|A\|, \|B\|)) — the smaller storage drives |
-| `Query<&A, With<B>>` | O(min(\|A\|, \|B\|)) + one sparse lookup per item (two when the filter drives: fetch `A`, then re-check `B`) |
-| `Query<Entity, With<B>>` | O(\|B\|) — the filter drives |
-| `Query<&A, Without<B>>` | O(\|A\|) + one sparse lookup per item (`Without` offers no candidate) |
-| `Query<&A, And<(With<B>, With<C>)>>` | O(smallest of \|A\|, \|B\|, \|C\|) + one sparse lookup per filter term per item |
-| `Query<(&A, Option<&T>)>` | O(\|A\|) — the required element drives; `Option` adds one sparse lookup per item but never gates |
-| `Query<Option<&T>>` | O(live entities) — no required element, so it walks the live-set snapshot like `Query<Entity>` |
-
-Filters are essentially free: each filter borrows its storage **once at
-query construction** (in `init_state`, stored for the query's lifetime),
-then `With<T>` / `Without<T>` do a single sparse lookup per candidate entity
-on each iteration — no component fetch, no repeated `RefCell` borrow.
-`Changed<T>` / `Added<T>` add one tick compare per item against a baseline
-also fetched once at construction.
-
-> **Every `&` / `&mut` combination ships at arity 2-5.** Reads use
-> the storage's safe `get`; mutable non-driver lookups fetch per
-> entity via a tightly contracted `unsafe fn` (`DenseMut::get`).
-> Soundness rests on two facts the engine *enforces*: each driver
-> iteration visits an entity at most once (structural), and the
-> data shape never names the same component twice (runtime check in
-> `QueryAccess::assert_no_self_conflict`, run from `Query::from_world`
-> before any storage borrow). `Query<(&mut A, &mut A)>`,
-> `Query<(&mut A, &A)>`, and the reversed `Query<(&A, &mut A)>` panic
-> at `from_world` with a precise message rather than tripping the
-> `RefCell` "already borrowed" later. To unlock arity 6+, add one
-> `impl_all_tuple!(A, B, C, D, E, F);` line in `query.rs` — the
-> Cartesian-product macro generates every combination automatically,
-> though monomorphisation cost doubles per step.
-
-### Mixing queries, resources, commands, events
-
-A single system can mix every parameter type. This is where ECS
-ergonomics shine — read the function signature, you know everything
-it touches:
-
-```rust,ignore
-fn city_growth(
-    time: Res<Time>,                                  // resource read
-    mut grid: ResMut<PowerNetwork>,                   // resource write
-    mut cities: Query<(Entity, &mut City)>,           // entities + write
-    plants: Query<&Plant, With<Operational>>,         // entities + filter
-    mut events: EventWriter<CityTierUp>,              // event send
-    mut cmd: Commands,                                // structural change
-) {
-    grid.supply = plants.iter().map(|p| p.output_mw).sum();
-
-    for (id, mut city) in cities.iter_mut() {
-        // ... update city.population based on grid.ratio ...
-        if city.population >= 1000 {
-            events.send(CityTierUp { city: id, new_tier: 2 });
-        }
-        if city.population == 0 {
-            cmd.despawn(id);                          // queued, applied later
-        }
-    }
-}
-```
-
-The compiler reads the parameter types, the engine wires up the
-borrows. No `world.get_thing()` calls; no manual locking.
-
 ## `Commands`: deferred mutations from inside a system
 
 Systems can't mutate the world's *structure* directly — they hold
@@ -1769,16 +1230,13 @@ iteration stable (a system iterating `Query<&Plant>` can't have new
 plants pop into existence mid-loop) and keeps determinism intact for
 parallel execution.
 
-> **Status at a glance.** Today's [`Commands`](struct.Commands.html)
-> ships ✅ `spawn`, `despawn(entity)`, `EntityCommands::insert<T>`,
-> and `EntityCommands::id()`. Resource-touching commands
-> (`insert_resource`, `update_resource`), event sends (`send_event`),
-> component removes (`.remove::<T>()`), and the `cmd.entity(e)`
-> accessor are ⏳ follow-up PRs. Tuple-spawn (`spawn((A, B, C))`) was
-> **rejected**, not deferred — see #57.
+> **Surface.** [`Commands`](struct.Commands.html) exposes `spawn`,
+> `despawn(entity)`, `EntityCommands::insert<T>`, and
+> `EntityCommands::id()` — see the table in *Commands available today*
+> below. Tuple-spawn (`spawn((A, B, C))`) was **rejected**, not deferred
+> — see #57.
 
 ```rust
-// ✅ Compiles and runs today.
 use spark_ecs::{Commands, Component, IntoSystem, Query, World};
 
 #[derive(Component)]
@@ -1813,7 +1271,6 @@ parts. That's why the entity id is usable inside the same system —
 e.g. to despawn it on the same frame for a quick round-trip.
 
 ```rust
-// ✅ Compiles and runs today.
 use spark_ecs::{Commands, Component, IntoSystem, Query, World};
 
 #[derive(Component)]
@@ -1852,15 +1309,12 @@ commands.
 
 ### Commands available today
 
-| Command | Effect | Status |
-|-|-|-|
-| `commands.spawn()` | Allocates a fresh entity synchronously; returns `EntityCommands` for chained queued inserts. | ✅ |
-| `commands.despawn(entity)` | Queues `World::despawn(entity)` for the next flush. | ✅ |
-| `commands.spawn().insert::<T>(value)` | Queues an `insert::<T>(entity, value)` on the just-spawned entity. Chainable. | ✅ |
-| `commands.spawn().id()` | Synchronously-allocated `Entity` — usable inside the same system. | ✅ |
-| `commands.entity(e).insert(c)` / `.remove::<T>()` | Mutate an existing entity. | ⏳ EntityCommands-for-existing-entity PR |
-| `commands.insert_resource(r)` / `.update_resource::<T>(\|t\| …)` | Resource touches via commands. | ⏳ additive |
-| `commands.send_event(e)` | Convenience for `EventWriter<E>::send(e)` from a command. | ⏳ follow-up |
+| Command | Effect |
+|-|-|
+| `commands.spawn()` | Allocates a fresh entity synchronously; returns `EntityCommands` for chained queued inserts. |
+| `commands.despawn(entity)` | Queues `World::despawn(entity)` for the next flush. |
+| `commands.spawn().insert::<T>(value)` | Queues an `insert::<T>(entity, value)` on the just-spawned entity. Chainable. |
+| `commands.spawn().id()` | Synchronously-allocated `Entity` — usable inside the same system. |
 
 ### Why disjoint cells make this work
 
@@ -1872,7 +1326,7 @@ borrows the storage cell for `T`. Disjoint cells, no runtime
 collision.
 
 ```rust
-// ✅ Compiles and runs today. Commands + Query<&mut T> in one signature.
+// Commands + Query<&mut T> in one signature.
 use spark_ecs::{Commands, Component, IntoSystem, Query, World};
 
 #[derive(Component)]
@@ -1955,8 +1409,8 @@ and reading next frame is `EventReader::read`.
 `EventReader` is **stateless**: it holds no per-system cursor, so it always
 reads the previous-frame snapshot rather than "resuming where it left off."
 Same-frame reads (a writer and reader communicating *within* one frame)
-would need a per-system cursor (`Local<T>`), which lands later — see
-[`docs/ECS_ROADMAP.md`](../../docs/ECS_ROADMAP.md).
+would need a per-system cursor, which this crate does not provide — the
+one-frame-delay model is the whole determinism story above.
 
 ## Workloads and the schedule
 
@@ -2227,12 +1681,9 @@ workloads, everything stays sequential and deterministic.
 > a system with `app.add_system(Stage::Update, my_fn)`. `Stage` lives in
 > `spark-core` — the frame/app layer — not in `spark-ecs`, mirroring how
 > Bevy's `bevy_app` owns `Update` / `Startup` while `bevy_ecs` owns the
-> generic schedule machinery. The `Schedule` batcher above already lives
-> in `spark-ecs`; the workload layer, the parallel executor, and the
-> wiring that routes each `Stage` to a `Schedule` are still ahead. When
-> that wiring lands, `add_system` will reach `Stage` through a
-> `StageLabel` trait, keeping the dependency direction (`spark-ecs`
-> *below* `spark-core`) cycle-free.
+> generic schedule machinery. The `Schedule` batcher above lives in
+> `spark-ecs`; keeping `Stage` a layer up in `spark-core` is what lets
+> `spark-ecs` sit *below* `spark-core` without a dependency cycle.
 
 ## Derive macros
 
@@ -2262,25 +1713,30 @@ inherently non-`Send` singletons (a `wgpu` surface, an OS handle) —
 parallel-safety for those is the scheduler's job (keep the touching
 system on the main thread), not a bound enforced at the type level.
 
-```rust,ignore
-// `ignore`: forward-looking spec — uses `Vec2`, which isn't in spark-ecs
-// yet. Every derive shown here ships today; only the `Vec2` field type
-// keeps this snippet from compiling as a doctest.
+```rust
+use spark_ecs::{Component, Entity, Event, Resource};
+
 #[derive(Component, Debug, Clone, Copy)]
-pub struct Position(pub Vec2);
+struct Position {
+    x: f32,
+    y: f32,
+}
 
 #[derive(Component)]
-pub struct Operational;          // marker (zero-sized)
+struct Operational; // marker (zero-sized)
 
 #[derive(Resource, Default)]
-pub struct PowerNetwork {
-    pub supply: f32,
-    pub demand: f32,
-    pub ratio: f32,
+struct PowerNetwork {
+    supply: f32,
+    demand: f32,
+    ratio: f32,
 }
 
 #[derive(Event)]
-pub struct CityTierUp { pub city: Entity, pub new_tier: u32 }
+struct CityTierUp {
+    city: Entity,
+    new_tier: u32,
+}
 ```
 
 # Reference
@@ -2394,42 +1850,6 @@ exactly once before it falls off.)
 
 End of frame. Back to Step 1 for frame 43.
 
-## Quick reference: every query shape
-
-| Query | What it iterates | Iteration item |
-|-|-|-|
-| `Query<&T>` | All entities with `T` | `&T` |
-| `Query<&mut T>` | All entities with `T` | `&mut T` |
-| `Query<(&A, &B)>` | Entities with both `A` and `B` | `(&A, &B)` |
-| `Query<(&mut A, &B)>` | Entities with both | `(&mut A, &B)` |
-| `Query<(&A, &B, &C)>` | Entities with all three | `(&A, &B, &C)` |
-| `Query<Entity>` | Every live entity | `Entity` |
-| `Query<(Entity, &T)>` | Entities with `T`, including ID | `(Entity, &T)` |
-| `Query<(Entity, &A, &B)>` | Entities with `A` and `B`, including ID | `(Entity, &A, &B)` |
-| `Query<(&T, Option<&U>)>` | Entities with `T`, each carrying `U` if present | `(&T, Option<&U>)` |
-| `Query<Option<&T>>` | Every live entity, `T` if present | `Option<&T>` |
-| `Query<&T, With<U>>` | Entities with both `T` and `U`, only fetch `T` | `&T` |
-| `Query<&T, Without<U>>` | Entities with `T` but not `U` | `&T` |
-| `Query<&T, And<(With<U>, Without<V>)>>` | AND of filters | `&T` |
-| `Query<&T, Or<(With<U>, With<V>)>>` | OR of filters | `&T` |
-| `Query<&T, Changed<T>>` | Entities whose `T` was written since this system last ran | `&T` |
-| `Query<&T, Added<T>>` | Entities whose `T` was first attached since this system last ran | `&T` |
-
-Iteration methods on every `Query`:
-
-```rust,ignore
-for x in q.iter() { … }                  // immutable
-for x in q.iter_mut() { … }              // requires `mut q: Query<…>`
-for x in &q { … }                        // sugar for q.iter()
-for x in &mut q { … }                    // sugar for q.iter_mut()
-let count = q.iter().count();
-let first = q.iter().next();
-// ⏳ Not yet implemented — shown for the shape they'll take:
-let one = q.single();                    // ⏳ panics if 0 or >1 entities
-let maybe = q.get_single();              // ⏳ Result<_, QuerySingleError>
-let exact = q.get(entity)?;              // ⏳ fetch one specific entity
-```
-
 ## Configuration
 
 `spark-ecs` has no environment variables, no Cargo features, no
@@ -2506,3 +1926,321 @@ directly without circular-dependency worries.
 For the full milestone plan see [`docs/PLAN.md`](../../docs/PLAN.md);
 for the engineering rationale behind every decision in this README
 see [`docs/ECS_DESIGN.md`](../../docs/ECS_DESIGN.md).
+
+# Appendix — the longer story
+
+> Conceptual deep dives, moved below the reference material so the quick-lookup
+> sections sit up top. New to ECS, or want the storage walkthrough? Read on.
+
+## Why ECS instead of OOP?
+
+Suppose you're writing a power-grid simulator. Some objects are power
+plants that produce energy. Some are cities that consume it. Some are
+workers walking around to repair things. Some are plans the player
+has placed but nothing has been built there yet.
+
+In an OOP design you'd reach for inheritance:
+
+```text
+            GameObject
+              │
+   ┌──────────┼──────────┐
+   ▼          ▼          ▼
+ Plant       City      Worker
+   │
+   ▼
+WaterWheel, CoalPlant, …
+```
+
+That works for a while. Then someone wants a *plant under
+construction* — it has a `ConstructionProgress`, isn't producing
+energy yet, but should still appear on the map. Where does that
+component go? On `Plant`? Then you need an `is_built` check
+everywhere. On a new `PlantUnderConstruction`? Then construction has
+two cases. On a wrapper? Now you've got delegation hell.
+
+In an ECS you stop asking "what is this thing" and start asking "what
+does this thing have". A *plant under construction* is just an entity
+with:
+
+```text
+    Position, BuildingKind, ConstructionProgress
+```
+
+When construction finishes, a system removes `ConstructionProgress`
+and adds `Operational`. The entity didn't *become* a different class
+— its component set changed.
+
+> **What about Unity's `GameObject` components?** That's the same
+> idea applied half-way: each `GameObject` is a heap-allocated
+> container holding a list of components. A pure ECS goes further —
+> entities are *just an ID*, components live in tightly-packed arrays
+> keyed by that ID, and systems iterate the arrays directly. Same
+> ergonomics, much better data layout for cache and parallelism.
+
+
+## Memory evolution: step by step
+
+The diagrams above show what a `ComponentStorage<T>` looks like at
+rest. This section walks through what happens in memory **step by
+step** as you spawn entities, attach components, remove them, despawn
+entities, and spawn again. Every operation here is O(1) — but
+understanding *why* makes it easier to write systems that stay fast,
+and to read the code when something goes wrong.
+
+### The structures we track
+
+```text
+EntityAllocator
+├── generation:  Vec<u32>     ◀── one entry per slot, bumped on destroy
+├── alive:       Vec<bool>    ◀── whether the slot is currently live
+└── free_list:   Vec<u32>     ◀── LIFO of indices ready for reuse
+
+ComponentStorage<T>
+├── sparse:        Vec<Option<u32>>   ◀── entity.index → dense_idx
+├── dense:         Vec<T>             ◀── packed component values
+└── entity_index:  Vec<Entity>        ◀── dense_idx → Entity
+
+World
+├── entities:   EntityAllocator
+├── components: HashMap<TypeId, RefCell<Box<dyn AnyStorage>>>
+└── resources:  HashMap<TypeId, RefCell<Box<dyn Any>>>
+```
+
+### T = 0 — an empty world
+
+```text
+allocator:           gen=[]  alive=[]  free=[]
+storage<Position>:   not yet created  (no one has touched the TypeId)
+```
+
+### T = 1 — `world.spawn()` → E0
+
+`allocate()` checks `free_list` — it's empty, so it pushes a brand-new
+slot: `index = 0`, `generation[0] = 0`, `alive[0] = true`.
+
+```text
+allocator:  gen=[0]  alive=[T]  free=[]
+E0 = Entity { index: 0, generation: 0 }
+```
+
+The components map is still empty — no components yet.
+
+### T = 2 — `world.insert(E0, Position { x: 0, y: 0 })`
+
+This is the very first `Position` insert, so `World` lazily creates a
+`ComponentStorage<Position>`. The storage stretches `sparse` to
+`entity.index + 1` entries, writes `Some(0)` at the new entry,
+pushes the value onto `dense`, and pushes `E0` onto `entity_index`.
+
+```text
+storage<Position>:
+  sparse:        [Some(0)]
+  dense:         [P{0, 0}]
+  entity_index: [E(0, gen=0)]
+                 ↑ dense_idx = 0
+```
+
+**Lookup cost:** `sparse[0]` → `Some(0)` → `dense[0]`. Two index
+reads, O(1).
+
+### T = 3, T = 4 — spawn E1 and E2, insert more components
+
+```text
+spawn E1 → index=1, generation=0       (free_list empty → push new slot)
+spawn E2 → index=2, generation=0
+
+world.insert(E1, Position{10, 0})
+world.insert(E2, Position{20, 0})
+world.insert(E2, Velocity{-1, 0})       ◀── new TypeId → new storage
+```
+
+State after:
+
+```text
+allocator:  gen=[0,0,0]  alive=[T,T,T]  free=[]
+
+storage<Position>:
+  sparse:        [Some(0), Some(1), Some(2)]
+  dense:         [P{0,0},  P{10,0}, P{20,0}]
+  entity_index: [E0,      E1,      E2]
+
+storage<Velocity>:
+  sparse:        [None, None, Some(0)]    ◀── only stretched to index=2
+  dense:         [V{-1, 0}]
+  entity_index: [E2]
+```
+
+Notice how `Velocity`'s `sparse` array is mostly `None` — E0 and E1
+don't have a `Velocity`. That's where the **sparse** in "sparse set"
+comes from: most slots are empty. The `dense` array, on the other
+hand, is always packed: no gaps. That's what makes iteration
+cache-friendly — `for v in &velocity_storage.dense` walks a
+contiguous slab of memory.
+
+### T = 5 — `world.remove::<Position>(E1)` — the swap-remove dance
+
+This is the operation the sparse-set scheme exists for. Removing
+`dense[1]` by shifting the tail down would be O(n). Instead, the
+storage swaps the doomed element with the last one and pops:
+
+```text
+step 1:  dense_idx = sparse[1].take()    → 1,  sparse[1] = None
+step 2:  last_idx  = dense.len() - 1     → 2
+step 3:  dense_idx ≠ last_idx, so swap:
+           swapped_entity        = entity_index[2] = E2
+           sparse[E2.index = 2]  = Some(1)         ◀── redirect E2's sparse entry
+step 4:  dense.swap_remove(1)
+         entity_index.swap_remove(1)
+```
+
+After:
+
+```text
+storage<Position>:
+  sparse:        [Some(0), None,   Some(1)]    ◀── E1 gone; E2 now points at dense[1]
+  dense:         [P{0,0},          P{20,0}]
+  entity_index: [E0,              E2]
+```
+
+`dense` stays packed. One swap, one pop — O(1). The trade-off:
+iteration order isn't stable across removes. Systems don't depend on
+that; they only need *deterministic* iteration within a single
+frame, which the engine still guarantees.
+
+### T = 6 — `world.despawn(E2)` — type-erased cleanup
+
+The `World` doesn't know which components are on E2 — that's the
+cost of type-erasure. So `despawn` walks **every** storage and tells
+each one "remove this entity if you have it":
+
+```rust
+use spark_ecs::{Component, World};
+
+#[derive(Debug, Component)] struct Position { x: f32, y: f32 }
+#[derive(Debug, Component)] struct Velocity { x: f32, y: f32 }
+
+let mut world = World::new();
+let e = world.spawn()
+    .insert(Position { x: 20.0, y: 0.0 })
+    .insert(Velocity { x: -1.0, y: 0.0 })
+    .id();
+
+assert!(world.despawn(e));
+assert!(world.get::<Position>(e).is_none());
+assert!(world.get::<Velocity>(e).is_none());
+```
+
+In `Position`'s storage, E2 sits at `dense[1]` *and* that's the last
+slot, so the swap-remove degenerates to a plain pop. In `Velocity`'s
+storage, E2 was the only entry — pop again.
+
+```text
+storage<Position>:
+  sparse:        [Some(0), None, None]
+  dense:         [P{0, 0}]
+  entity_index: [E0]
+
+storage<Velocity>:
+  sparse:        [None, None, None]
+  dense:         []
+  entity_index: []
+```
+
+In the allocator:
+
+```text
+generation[2] += 1     (was 0, now 1)
+alive[2] = false
+free_list.push(2)
+
+allocator:  gen=[0,0,1]  alive=[T,T,F]  free=[2]
+```
+
+### T = 7 — `world.spawn()` again — the generation trick pays off
+
+`allocate()` finds `free_list` non-empty, pops `2` (LIFO), sets
+`alive[2] = true`. Crucially, it **does not** reset `generation[2]`
+— that stays at `1`, the value it was bumped to during destroy.
+
+```text
+allocator:  gen=[0,0,1]  alive=[T,T,T]  free=[]
+E3 = Entity { index: 2, generation: 1 }       ◀── same slot, new generation
+```
+
+Any old copy of `E2 = Entity { index: 2, generation: 0 }` still
+floating around in user code is now provably stale. The check is the
+public `is_alive`:
+
+```rust
+use spark_ecs::{Component, World};
+
+#[derive(Component)]
+struct Tag;
+
+let mut world = World::new();
+let old = world.spawn().insert(Tag).id();
+world.despawn(old);
+
+let fresh = world.spawn().id();
+// Same slot under the hood; distinct identities.
+assert_ne!(old, fresh);
+assert!(!world.is_alive(old));        // stale handle → dead ✓
+assert!(world.is_alive(fresh));        // fresh handle → alive ✓
+```
+
+Without the generation field, `spawn` would return `Entity(index=2)`
+again and the stale handle would silently point at the new tenant —
+the classic **ABA bug**. The generation makes an entity's identity
+unique in practice, while still letting the underlying slot be
+reused.
+
+### Cost table
+
+| Operation | What it touches | Cost |
+|-|-|-|
+| `spawn()` | `allocator`: pop `free_list`, or push to `generation` + `alive` | O(1) amortised |
+| `insert<T>(e, v)` | `storage<T>`: maybe grow `sparse`, push `dense` + `entity_index` | O(1) amortised |
+| `get<T>(e)` | one hash on `TypeId`, two index reads | O(1) |
+| `remove<T>(e)` | swap-remove `dense` + `entity_index`, patch the neighbour's `sparse` | O(1) |
+| `despawn(e)` | for **every** storage in the components map: `remove_entity` | O(K), K = component types |
+
+The detail worth knowing about `despawn`: its cost depends on how
+many component **types** are registered in the `World`, *not* how
+many components the doomed entity actually has. Every storage gets
+its `RefCell::borrow_mut`, a `sparse[entity.index]` check, and (if
+absent) an immediate return. Cheap, but not free — keep an eye on it
+when component-type count grows into the hundreds.
+
+### What actually takes memory
+
+A realistic case: 10 000 map tiles, each with a `Position` (8 bytes)
+and a `Walkable` marker component (zero-sized).
+
+```text
+allocator:
+  generation:    10_000 × 4 B  =  40 000 B
+  alive:         10_000 × 1 B  =  10 000 B
+  free_list:     0             (no one has died yet)
+
+storage<Position>:
+  sparse:        10_000 × 4 B  =  40 000 B   (Option<u32> often packs to 4 B via niche)
+  dense:         10_000 × 8 B  =  80 000 B
+  entity_index:  10_000 × 8 B  =  80 000 B
+
+storage<Walkable> (zero-sized):
+  sparse:        10_000 × 4 B  =  40 000 B
+  dense:         0             (ZST: Vec allocates no backing storage at all)
+  entity_index:  10_000 × 8 B  =  80 000 B
+```
+
+Notice what dominates: `sparse` and `entity_index` — not the
+component data itself. For **common** components (sit on most
+entities: `Position`, `Visible`) that's a great deal — you pay 12 B
+of overhead per slot for fast O(1) lookup. For **rare** components
+(1 % of entities) most of `sparse` is wasted slots; that's where a
+`HashMap`-backed storage would be a better fit. Spark sticks to one
+storage scheme for M3 (sparse only) and revisits per-component
+storage strategies only if profiling shows a need — premature
+optimisation otherwise.
+

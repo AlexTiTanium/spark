@@ -686,11 +686,13 @@ lib/
     │   ├── storage.rs          # ComponentStorage<T>, AnyStorage
     │   ├── world.rs            # World
     │   ├── resource.rs         # Resource access, AnyResource
-    │   ├── query.rs            # parent — Query<'_, D, F> + re-exports
+    │   ├── filter.rs           # QueryFilter: With, Without, And, Or, Changed, Added
+    │   ├── query.rs            # parent — DriveSource/DriverIter driver runtime + test harness
     │   ├── query/
-    │   │   ├── data.rs         # QueryData trait, tuple impls
-    │   │   ├── filter.rs       # With, Without (Or deferred)
-    │   │   └── iter.rs         # Query iteration
+    │   │   ├── data.rs         # QueryData/ReadOnlyQueryData traits + arity-1 impls
+    │   │   ├── dense_mut.rs    # DenseMut — the crate's one unsafe fn (non-driver &mut)
+    │   │   ├── runner.rs       # the public Query<'w, D, F> + SystemParam impl
+    │   │   └── tuple_codegen.rs # tuple QueryData impl macros (arity 2+ families)
     │   ├── system.rs           # parent — System trait + re-exports
     │   ├── system/
     │   │   ├── param.rs        # SystemParam trait, all impls

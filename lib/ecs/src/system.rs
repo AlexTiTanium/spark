@@ -296,6 +296,9 @@ pub trait IntoSystem<Marker>: Sized {
 /// from `&World`, then forwards them to the wrapped fn — see the
 /// module-level docs for the marker-type and `for<'w>` HRTB tricks
 /// that make this work.
+//
+// Codegen census: this is one of the crate's declarative-macro families;
+// see the variant manifest at the top of `query/tuple_codegen.rs`.
 macro_rules! impl_into_system {
     ($($P:ident),*) => {
         impl<F $(, $P)*> IntoSystem<fn($($P,)*)> for F

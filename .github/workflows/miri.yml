@@ -1,0 +1,55 @@
+name: Miri (spark-ecs)
+
+# Machine-checks the one `unsafe fn` in the crate — `DenseMut::get`,
+# which hands out `&mut T` into a storage's dense array by raw pointer —
+# under Miri's Stacked/Tree Borrows model. A double-borrow of one dense
+# slot (the "fetched at most once" invariant) surfaces here as a hard
+# error instead of silent UB. Scoped to `spark-ecs` to bound CI time
+# (Miri interprets every operation); this is the only crate with `unsafe`.
+# It also seeds the M4 baseline for the `UnsafeCell` switchover.
+#
+# Conditional cadence (deviation from #80, recorded in the PR body): most
+# PRs never touch unsafe, so this only fires when the relevant surface
+# moves (path filter below), plus a weekly cron for toolchain / nightly
+# drift and a manual dispatch button. The aliasing-stress test also drops
+# to a reduced N under `cfg(miri)` so the interpreter cost stays bounded
+# when the filter fires — coverage comes from access-pattern diversity,
+# not raw entity count.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 4 * * 1'  # weekly safety sweep — Mon 04:00 UTC
+  pull_request:
+    paths:
+      # `query/**` covers the submodule but does NOT cover the sibling
+      # `query.rs` root (DriverIter / DriveSource / DriverPlan — the
+      # types that feed the unsafe lookup); list it explicitly.
+      - 'lib/ecs/src/query.rs'
+      - 'lib/ecs/src/query/**'
+      - 'lib/ecs/src/storage.rs'
+      - 'lib/ecs/src/access.rs'
+      - 'lib/ecs/src/filter.rs'
+      - '.github/workflows/miri.yml'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  miri:
+    name: Miri (spark-ecs)
+    runs-on: ubuntu-latest
+    # Bound an interpreter hang so a runner doesn't burn indefinitely.
+    timeout-minutes: 30
+    env:
+      # Decouple from nightly lint drift: this job is about UB detection,
+      # not warnings (clippy/test enforce those on the pinned stable).
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo +nightly miri test -p spark-ecs
