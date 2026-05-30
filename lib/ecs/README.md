@@ -57,6 +57,10 @@ let count = q.iter().count();
 let first = q.iter().next();
 let one  = q.get(entity);                // fetch one entity (shared)
 let one  = q.get_mut(entity);            // fetch one entity (mut)
+let one  = q.single();                   // the sole match (shared), or panic
+let one  = q.single_mut();               // the sole match (mut), or panic
+let res  = q.get_single();               // Ok(item) / Err(QuerySingleError)
+let res  = q.get_single_mut();           // ditto, for `&mut` shapes
 ```
 
 `q.get(entity)` / `q.get_mut(entity)` return `None` if any required component
@@ -64,6 +68,12 @@ is missing, if the entity is despawned / stale / never-allocated, or if the
 query's filter rejects it. They share every contract with iteration —
 optionals still yield a `None` value, `Mut<T>` still marks change only on
 write.
+
+`q.single()` / `q.single_mut()` return the *sole* matching item and panic if
+zero or more than one entity matches; `q.get_single()` / `q.get_single_mut()`
+hand back `Result<_, QuerySingleError>` (`QuerySingleError::None` /
+`QuerySingleError::Multiple`) instead of panicking. Like `get`, they honour the
+filter `F`; the shared vs `&mut` split follows `iter` / `iter_mut`.
 
 
 ## The three vocabulary words
@@ -914,6 +924,41 @@ directly when you need an adapter chain (`q.iter().map(…).sum()`) or the
 very tightest loop. `for x in q` **by value** is intentionally not
 implemented: consuming the query would drop its storage borrow guards
 mid-iteration.
+
+**Single-result lookup.** Some queries are meant to match *exactly one*
+entity — a primary camera, the main window, the run's RNG holder. `single()`
+returns that sole item and panics if the count is wrong; `get_single()` hands
+back a `Result<_, QuerySingleError>` for when zero-or-many is something to
+handle rather than crash on. Both honour the filter `F`, and split shared vs
+`&mut` exactly like `iter` / `iter_mut`.
+
+```rust
+use spark_ecs::{Component, Query, QuerySingleError, World};
+
+#[derive(Component)]
+struct PrimaryCamera {
+    zoom: f32,
+}
+
+let mut world = World::new();
+world.spawn().insert(PrimaryCamera { zoom: 1.0 });
+
+// Exactly one match — `single()` returns it directly, no `.iter().next()`.
+assert_eq!(Query::<&PrimaryCamera>::from_world(&world).single().zoom, 1.0);
+
+// The `&mut` mirror writes through; the change outlives the query's borrow.
+{
+    let mut q = Query::<&mut PrimaryCamera>::from_world(&world);
+    q.single_mut().zoom = 2.0;
+}
+assert_eq!(Query::<&PrimaryCamera>::from_world(&world).single().zoom, 2.0);
+
+// Spawn a second camera and the invariant breaks: `get_single` reports
+// `Multiple` instead of panicking, so the caller can recover.
+world.spawn().insert(PrimaryCamera { zoom: 5.0 });
+let q = Query::<&PrimaryCamera>::from_world(&world);
+assert!(matches!(q.get_single(), Err(QuerySingleError::Multiple)));
+```
 
 **Borrow rules.** Two `Query<&T>` over the same `T` in one system
 coexist — shared borrows of the same storage stack. Two `Query<&mut T>`
@@ -1928,6 +1973,11 @@ honest: anything that touches the ECS adds a direct edge to it.
 - **`despawn` is O(K)** — K = number of component types registered
   in the world. Despawning is still cheap, but it isn't free if you
   end up with hundreds of types and despawn a lot.
+- **`single()` / `single_mut()` panic on the wrong count** — they
+  assert *exactly one* match and panic on zero or more than one, with
+  a message naming the query shape. When the count is genuinely
+  variable, use `get_single()` / `get_single_mut()`, which return
+  `Err(QuerySingleError::None)` / `Err(QuerySingleError::Multiple)` instead.
 
 ## Where this crate fits
 

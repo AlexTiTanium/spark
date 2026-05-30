@@ -9,8 +9,9 @@
 //! impls ([`tuple_codegen`](super::tuple_codegen)), and the driver runtime
 //! ([`DriveSource`](super::DriveSource) / [`DriverIter`](super::DriverIter) /
 //! `DriverPlan`) in the parent module. The additive random-access APIs
-//! [`Query::get`] / [`Query::get_mut`] (#72) ship from this file too;
-//! [`Query::single`] (#71) and `get_many` (#73) are not yet landed.
+//! [`Query::get`] / [`Query::get_mut`] (#72) and the single-entity helpers
+//! [`Query::single`] / [`get_single`] (+ `single_mut` / `get_single_mut`)
+//! (#71) ship from this file too; `get_many` (#73) is not yet landed.
 
 use crate::access::{Access, QueryAccess};
 use crate::entity::Entity;
@@ -58,6 +59,16 @@ use super::{DriveSource, DriverIter, DriverPlan, QueryData, ReadOnlyQueryData};
 /// pattern iteration would have skipped. They share every contract with
 /// iteration: optional elements still yield a `None` *value*, and
 /// [`Mut<T>`](crate::Mut) still marks change only on a `DerefMut` write.
+///
+/// # Single-result fetch
+///
+/// For queries you *expect* to match exactly one entity — a `PrimaryCamera`,
+/// a `MainWindow` — [`single`](Self::single) / [`single_mut`](Self::single_mut)
+/// return that sole item and panic on zero or many, while
+/// [`get_single`](Self::get_single) / [`get_single_mut`](Self::get_single_mut)
+/// hand back a [`QuerySingleError`] instead of panicking. Same
+/// [`ReadOnlyQueryData`] split as `iter` / `iter_mut`, and the filter `F`
+/// still narrows what counts as a match.
 ///
 /// # Examples
 ///
@@ -157,6 +168,76 @@ fn select_filter_driver<'s, F: QueryFilter>(
         // No single-storage candidate ⇒ an `Or`, whose union was materialized
         // at construction (its `candidate_len` was `Some`, so it must exist).
         DriverIter::new(materialized.expect("Or driver materialized at from_world"))
+    }
+}
+
+// -------- QuerySingleError --------
+
+/// Why [`Query::get_single`] / [`Query::get_single_mut`] could not return
+/// exactly one item — the error half of the single-entity helpers (#71).
+///
+/// [`Query::get_single`] hands this back instead of panicking;
+/// [`Query::single`] turns it *into* a panic whose message names the query
+/// shape.
+///
+/// # Examples
+///
+/// ```
+/// use spark_ecs::{Component, Query, QuerySingleError, World};
+///
+/// #[derive(Component)]
+/// struct Camera;
+///
+/// let world = World::new(); // no camera spawned
+/// let q = Query::<&Camera>::from_world(&world);
+/// assert!(matches!(q.get_single(), Err(QuerySingleError::None)));
+/// ```
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum QuerySingleError {
+    /// No entity matched the query's data shape and filter.
+    None,
+    /// More than one entity matched; the caller required exactly one.
+    Multiple,
+}
+
+/// Human-readable reason, used verbatim in [`Query::single`]'s and
+/// [`Query::single_mut`]'s panic messages and in any `{}`-formatting of the
+/// error.
+impl std::fmt::Display for QuerySingleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None => f.write_str("no matching entities"),
+            Self::Multiple => f.write_str("multiple matching entities"),
+        }
+    }
+}
+
+/// Opts the error into the std `Error` ecosystem (`?`, `anyhow`); the message
+/// lives in [`Display`](std::fmt::Display), so the default methods suffice.
+impl std::error::Error for QuerySingleError {}
+
+/// Pulls *exactly one* item from a query iterator, or reports why it couldn't.
+///
+/// The shared core of [`Query::get_single`] / [`Query::get_single_mut`]: take
+/// the first item, then probe for a second and immediately drop it (`is_some`)
+/// so two items — e.g. two `Mut`s — are never held at once.
+///
+/// The returned item borrows the storage the iterator walks (owned by the
+/// caller's [`Query`]), *not* the cursor `it`, so it stays valid once `it` is
+/// dropped here — the same way `slice::iter_mut().next()` hands out a `&mut`
+/// that outlives the iterator.
+///
+/// # Errors
+///
+/// - [`QuerySingleError::None`] if the iterator was empty.
+/// - [`QuerySingleError::Multiple`] if it yielded more than one item.
+fn probe_single<T>(mut it: impl Iterator<Item = T>) -> Result<T, QuerySingleError> {
+    let first = it.next();
+    let extra = it.next().is_some();
+    match (first, extra) {
+        (Some(item), false) => Ok(item),
+        (Some(_), true) => Err(QuerySingleError::Multiple),
+        (None, _) => Err(QuerySingleError::None),
     }
 }
 
@@ -403,6 +484,90 @@ impl<'w, D: QueryData + 'w, F: QueryFilter + 'w> Query<'w, D, F> {
         }
         D::lookup_mut(&mut self.state, entity)
     }
+
+    /// Returns the one item this query matches, mutably, or a
+    /// [`QuerySingleError`] if zero or more than one entity matches.
+    ///
+    /// The exclusive mirror of [`get_single`](Self::get_single): works for any
+    /// `D: QueryData`, including `&mut T` shapes and tuples that contain one.
+    /// The `&mut self` is the borrow checker's proof that the returned
+    /// `Mut<'_, T>` is the only one outstanding, exactly as in
+    /// [`iter_mut`](Self::iter_mut). The filter `F` narrows the count the same
+    /// way iteration does.
+    ///
+    /// # Errors
+    ///
+    /// - [`QuerySingleError::None`] if no entity matches the data shape and
+    ///   filter.
+    /// - [`QuerySingleError::Multiple`] if more than one does.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use spark_ecs::{Component, Query, QuerySingleError, World};
+    ///
+    /// #[derive(Component)]
+    /// struct Score(u32);
+    ///
+    /// let mut world = World::new();
+    /// world.spawn().insert(Score(10));
+    ///
+    /// let mut q = Query::<&mut Score>::from_world(&world);
+    /// q.get_single_mut().unwrap().0 += 5; // write through the sole match
+    /// assert_eq!(q.get_single_mut().unwrap().0, 15);
+    ///
+    /// // A second match makes the call an error, not a write.
+    /// drop(q);
+    /// world.spawn().insert(Score(99));
+    /// let mut q = Query::<&mut Score>::from_world(&world);
+    /// assert!(matches!(q.get_single_mut(), Err(QuerySingleError::Multiple)));
+    /// ```
+    pub fn get_single_mut(&mut self) -> Result<D::Item<'_>, QuerySingleError> {
+        probe_single(self.iter_mut())
+    }
+
+    /// Returns the one item this query matches, mutably, or panics if zero or
+    /// more than one entity matches.
+    ///
+    /// The exclusive mirror of [`single`](Self::single), for `&mut`-containing
+    /// shapes. Reach for [`get_single_mut`](Self::get_single_mut) when
+    /// zero-or-many is a recoverable outcome rather than a bug.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the query matches no entity or more than one. The message
+    /// names the query shape and this method — e.g.
+    /// `Query::<&mut Score>::single_mut(): multiple matching entities` — and is
+    /// reported at the call site (`#[track_caller]`), like
+    /// [`single`](Self::single).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use spark_ecs::{Component, Query, World};
+    ///
+    /// #[derive(Component)]
+    /// struct Score(u32);
+    ///
+    /// let mut world = World::new();
+    /// world.spawn().insert(Score(10));
+    ///
+    /// let mut q = Query::<&mut Score>::from_world(&world);
+    /// q.single_mut().0 += 5; // the sole Score, mutated in place
+    /// assert_eq!(q.single_mut().0, 15);
+    /// ```
+    #[track_caller]
+    pub fn single_mut(&mut self) -> D::Item<'_> {
+        match self.get_single_mut() {
+            Ok(item) => item,
+            Err(err) => {
+                panic!(
+                    "Query::<{}>::single_mut(): {err}",
+                    std::any::type_name::<D>()
+                )
+            }
+        }
+    }
 }
 
 impl<'w, D: ReadOnlyQueryData + 'w, F: QueryFilter + 'w> Query<'w, D, F> {
@@ -534,6 +699,129 @@ impl<'w, D: ReadOnlyQueryData + 'w, F: QueryFilter + 'w> Query<'w, D, F> {
             return None;
         }
         D::lookup(&self.state, entity)
+    }
+
+    /// Returns the one item this query matches, or a [`QuerySingleError`] if
+    /// zero or more than one entity matches.
+    ///
+    /// The non-panicking [`single`](Self::single): reach for it when "nothing
+    /// matched" or "several matched" is a normal outcome to handle rather than
+    /// a bug to crash on. Like [`iter`](Self::iter) it applies the filter `F`
+    /// and is gated on [`ReadOnlyQueryData`] — a `&mut` shape goes through
+    /// [`get_single_mut`](Self::get_single_mut) so the borrow checker can guard
+    /// the returned `Mut<'_, T>`.
+    ///
+    /// # Errors
+    ///
+    /// - [`QuerySingleError::None`] if no entity matches the data shape and
+    ///   filter.
+    /// - [`QuerySingleError::Multiple`] if more than one does.
+    ///
+    /// # Examples
+    ///
+    /// One, zero, and two matches — the three outcomes:
+    ///
+    /// ```
+    /// use spark_ecs::{Component, Query, QuerySingleError, World};
+    ///
+    /// #[derive(Component)]
+    /// struct Camera {
+    ///     fov: f32,
+    /// }
+    ///
+    /// // Exactly one → Ok.
+    /// let mut world = World::new();
+    /// world.spawn().insert(Camera { fov: 60.0 });
+    /// let q = Query::<&Camera>::from_world(&world);
+    /// assert_eq!(q.get_single().unwrap().fov, 60.0);
+    ///
+    /// // Zero → Err(None).
+    /// let empty = World::new();
+    /// let q = Query::<&Camera>::from_world(&empty);
+    /// assert!(matches!(q.get_single(), Err(QuerySingleError::None)));
+    ///
+    /// // Two → Err(Multiple).
+    /// let mut crowd = World::new();
+    /// crowd.spawn().insert(Camera { fov: 60.0 });
+    /// crowd.spawn().insert(Camera { fov: 90.0 });
+    /// let q = Query::<&Camera>::from_world(&crowd);
+    /// assert!(matches!(q.get_single(), Err(QuerySingleError::Multiple)));
+    /// ```
+    pub fn get_single(&self) -> Result<D::Item<'_>, QuerySingleError> {
+        probe_single(self.iter())
+    }
+
+    /// Returns the one item this query matches, or panics if zero or more than
+    /// one entity matches.
+    ///
+    /// The exactly-one sugar over [`iter`](Self::iter): the standard way to
+    /// read a query you *expect* to be a singleton — a `PrimaryCamera`, a
+    /// `MainWindow`. Gated on [`ReadOnlyQueryData`] exactly like `iter`; a
+    /// `&mut`-containing shape uses [`single_mut`](Self::single_mut). Reach for
+    /// [`get_single`](Self::get_single) when zero-or-many is a recoverable
+    /// outcome rather than a bug.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the query matches no entity or more than one. The message
+    /// names the query shape (via [`type_name`](std::any::type_name)) and the
+    /// reason (`no matching entities` / `multiple matching entities`), and is
+    /// reported at the call site (`#[track_caller]`).
+    ///
+    /// # Examples
+    ///
+    /// Exactly one — returns the sole item:
+    ///
+    /// ```
+    /// use spark_ecs::{Component, Query, World};
+    ///
+    /// #[derive(Component)]
+    /// struct Camera {
+    ///     fov: f32,
+    /// }
+    ///
+    /// let mut world = World::new();
+    /// world.spawn().insert(Camera { fov: 60.0 });
+    ///
+    /// let q = Query::<&Camera>::from_world(&world);
+    /// assert_eq!(q.single().fov, 60.0);
+    /// ```
+    ///
+    /// Zero matches — panics:
+    ///
+    /// ```should_panic
+    /// use spark_ecs::{Component, Query, World};
+    ///
+    /// // A marker is enough — `single` only counts matches here.
+    /// #[derive(Component)]
+    /// struct Camera;
+    ///
+    /// let world = World::new(); // no Camera spawned
+    /// let q = Query::<&Camera>::from_world(&world);
+    /// q.single(); // panics: "… single(): no matching entities"
+    /// ```
+    ///
+    /// Two matches — also panics:
+    ///
+    /// ```should_panic
+    /// use spark_ecs::{Component, Query, World};
+    ///
+    /// #[derive(Component)]
+    /// struct Camera;
+    ///
+    /// let mut world = World::new();
+    /// world.spawn().insert(Camera);
+    /// world.spawn().insert(Camera);
+    ///
+    /// let q = Query::<&Camera>::from_world(&world);
+    /// q.single(); // panics: "… single(): multiple matching entities"
+    /// ```
+    #[track_caller]
+    pub fn single(&self) -> D::Item<'_> {
+        match self.get_single() {
+            Ok(item) => item,
+            Err(err) => panic!("Query::<{}>::single(): {err}", std::any::type_name::<D>()),
+        }
     }
 }
 

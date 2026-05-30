@@ -268,4 +268,4 @@ mod tests;
 // `lib.rs` re-export) keep resolving, and so the tuple codegen can name the
 // traits it implements.
 pub use data::{QueryData, ReadOnlyQueryData};
-pub use runner::Query;
+pub use runner::{Query, QuerySingleError};

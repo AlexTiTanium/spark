@@ -66,6 +66,17 @@ expanded into full drafts in the project's `#10–#12` format below.
   `update_resource`. `send_event_now` (immediate, flush-skipping) stays out
   of scope: it would reintroduce the intra-frame ordering variable
   read-previous exists to remove.
+- **#71 — `Query::single` / `get_single` (+ `single_mut` / `get_single_mut`).**
+  Single-entity fetch helpers for "expect exactly one" queries (a
+  `PrimaryCamera`, a `MainWindow`). `single()` returns the sole match and
+  panics — naming the query shape via `type_name` and `#[track_caller]`-ing the
+  call site — on zero-or-many; `get_single()` returns
+  `Result<_, QuerySingleError>` (`None` / `Multiple`) for the recoverable case.
+  Built on `iter` / `iter_mut`, so the filter `F` and the `ReadOnlyQueryData`
+  shared/`&mut` split carry over unchanged. `QuerySingleError` is the crate's
+  first error type — hand-rolled `Display` + `Error`, since `spark-ecs` is
+  stdlib-only. `single_or_insert` (default-spawning) stays out of scope: it
+  would couple the query to `Commands`.
 
 ### To create — in order
 

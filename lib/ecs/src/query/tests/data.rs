@@ -5,7 +5,7 @@ use super::*;
 
 use crate::filter::{Or, With, Without};
 use crate::system::IntoSystem;
-use crate::{Commands, Entity, Query, ReadOnlyQueryData, World};
+use crate::{Commands, Entity, Query, QuerySingleError, ReadOnlyQueryData, World};
 #[test]
 fn query_ref_single_component_walks_every_entity() {
     let (world, _) = world_with_three_movers();
@@ -1409,4 +1409,175 @@ fn query_get_mut_mixed_mut_read_tuple_writes_through_mut_slot() {
     }
     assert_eq!(world.get::<Position>(with_both).unwrap().0, 13);
     assert_eq!(world.get::<Position>(only_pos).unwrap().0, 20); // untouched
+}
+
+// ---- Query::single / Query::get_single (issue #71) -------------------------
+
+// `get_single` reports all three outcomes without panicking: `Err(None)` for
+// zero, `Ok` for exactly one, `Err(Multiple)` for two-or-more.
+#[test]
+fn query_get_single_read_ok_none_multiple() {
+    let mut world = World::new();
+
+    // Zero matches → Err(None). A never-inserted component reads as empty,
+    // not a panic (storage stays absent), so the error is `single`'s, not the
+    // storage's.
+    assert!(matches!(
+        Query::<&Position>::from_world(&world).get_single(),
+        Err(QuerySingleError::None)
+    ));
+
+    // Exactly one → Ok(the sole item).
+    world.spawn().insert(Position(7, 8));
+    assert_eq!(
+        Query::<&Position>::from_world(&world).get_single().unwrap(),
+        &Position(7, 8)
+    );
+
+    // Two → Err(Multiple).
+    world.spawn().insert(Position(9, 9));
+    assert!(matches!(
+        Query::<&Position>::from_world(&world).get_single(),
+        Err(QuerySingleError::Multiple)
+    ));
+}
+
+// `get_single_mut` mirrors the shared version for `&mut` shapes: `Err(None)`
+// on zero, a write-through `Ok` on one, `Err(Multiple)` on two. Name lists all
+// three outcomes (like the read-path peer) so a failure log pins the branch.
+#[test]
+fn query_get_single_mut_none_ok_multiple() {
+    let mut world = World::new();
+
+    // Zero → Err(None).
+    assert!(matches!(
+        Query::<&mut Position>::from_world(&world).get_single_mut(),
+        Err(QuerySingleError::None)
+    ));
+
+    // Exactly one → Ok, and the write persists past the query's borrow.
+    let only = world.spawn().insert(Position(5, 0)).id();
+    {
+        let mut q = Query::<&mut Position>::from_world(&world);
+        q.get_single_mut().unwrap().0 += 10;
+    }
+    assert_eq!(world.get::<Position>(only).unwrap().0, 15);
+
+    // Two → Err(Multiple), and nothing is written.
+    world.spawn().insert(Position(1, 1));
+    assert!(matches!(
+        Query::<&mut Position>::from_world(&world).get_single_mut(),
+        Err(QuerySingleError::Multiple)
+    ));
+    assert_eq!(world.get::<Position>(only).unwrap().0, 15); // unchanged
+}
+
+// `single` returns the sole match directly when exactly one entity matches.
+#[test]
+fn query_single_read_returns_sole_item() {
+    let mut world = World::new();
+    world.spawn().insert(Position(42, 7));
+    let q = Query::<&Position>::from_world(&world);
+    assert_eq!(q.single(), &Position(42, 7));
+}
+
+// Zero matches panics. The message names the query shape (`…Position`), the
+// method, and the reason — one contiguous substring pins all three, while
+// staying robust to the (unstable) module path `type_name` prints before it.
+#[test]
+#[should_panic(expected = "Position>::single(): no matching entities")]
+fn query_single_read_panics_on_none() {
+    let world = World::new();
+    let q = Query::<&Position>::from_world(&world);
+    let _ = q.single();
+}
+
+// Two matches panics, again naming shape + method + reason.
+#[test]
+#[should_panic(expected = "Position>::single(): multiple matching entities")]
+fn query_single_read_panics_on_multiple() {
+    let mut world = World::new();
+    world.spawn().insert(Position(1, 0));
+    world.spawn().insert(Position(2, 0));
+    let q = Query::<&Position>::from_world(&world);
+    let _ = q.single();
+}
+
+// `single_mut` returns the sole match mutably; the write outlives the query.
+#[test]
+fn query_single_mut_returns_and_writes_through() {
+    let mut world = World::new();
+    let only = world.spawn().insert(Position(5, 0)).id();
+    {
+        let mut q = Query::<&mut Position>::from_world(&world);
+        q.single_mut().0 += 10;
+    }
+    assert_eq!(world.get::<Position>(only).unwrap().0, 15);
+}
+
+// Zero matches panics on the mut path too, naming `single_mut()` + the reason.
+#[test]
+#[should_panic(expected = "Position>::single_mut(): no matching entities")]
+fn query_single_mut_panics_on_none() {
+    let world = World::new();
+    let mut q = Query::<&mut Position>::from_world(&world);
+    let _ = q.single_mut();
+}
+
+// The mut panic path names `single_mut()` (not `single()`) in its message.
+#[test]
+#[should_panic(expected = "Position>::single_mut(): multiple matching entities")]
+fn query_single_mut_panics_on_multiple() {
+    let mut world = World::new();
+    world.spawn().insert(Position(1, 0));
+    world.spawn().insert(Position(2, 0));
+    let mut q = Query::<&mut Position>::from_world(&world);
+    let _ = q.single_mut();
+}
+
+// `single` counts only entities that pass the filter `F`: two bare `Position`s
+// are `Multiple`, but narrowing to `With<Velocity>` leaves exactly one.
+#[test]
+fn query_single_respects_filter() {
+    let mut world = World::new();
+    world.spawn().insert(Position(1, 0));
+    world.spawn().insert(Position(2, 0)).insert(Velocity(9, 9));
+
+    // Unfiltered: both Positions match → Multiple.
+    assert!(matches!(
+        Query::<&Position>::from_world(&world).get_single(),
+        Err(QuerySingleError::Multiple)
+    ));
+
+    // Filtered to `With<Velocity>`: exactly one matches, and `single` returns it.
+    let q = Query::<&Position, With<Velocity>>::from_world(&world);
+    assert_eq!(q.single(), &Position(2, 0));
+}
+
+// `single_mut` honours the filter on the exclusive path too — the mirror of
+// `query_single_respects_filter` for `&mut`. Narrowing two `Position`
+// candidates to one via `With<Velocity>` both fixes the count and lets the
+// sole match be written through.
+#[test]
+fn query_single_mut_respects_filter() {
+    let mut world = World::new();
+    world.spawn().insert(Position(1, 0));
+    let chosen = world
+        .spawn()
+        .insert(Position(2, 0))
+        .insert(Velocity(9, 9))
+        .id();
+
+    // Unfiltered: both Positions match → Multiple.
+    assert!(matches!(
+        Query::<&mut Position>::from_world(&world).get_single_mut(),
+        Err(QuerySingleError::Multiple)
+    ));
+
+    // Filtered to `With<Velocity>`: exactly one matches; write through it.
+    {
+        let mut q = Query::<&mut Position, With<Velocity>>::from_world(&world);
+        q.single_mut().0 += 100;
+    }
+    assert_eq!(world.get::<Position>(chosen).unwrap().0, 102);
 }

@@ -23,7 +23,7 @@ pub use commands::{CommandQueue, Commands, EntityCommands};
 pub use entity::{Entity, EntityAllocator};
 pub use events::{EventReader, EventWriter, Events, swap_events};
 pub use filter::{Added, And, Changed, Or, QueryFilter, With, Without};
-pub use query::{Query, QueryData, ReadOnlyQueryData};
+pub use query::{Query, QueryData, QuerySingleError, ReadOnlyQueryData};
 pub use scheduler::{Schedule, WorkloadOrderBuilder};
 pub use storage::{AnyStorage, ComponentStorage, Mut};
 pub use system::{IntoSystem, Res, ResMut, SystemParam};
