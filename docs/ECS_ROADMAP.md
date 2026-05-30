@@ -56,6 +56,16 @@ expanded into full drafts in the project's `#10–#12` format below.
   bumping closes the slot-reuse hazard (a stale handle never hits a new
   tenant). `insert_bundle((A, B, C))` stays out of scope — folded into the
   #57 bundle rejection.
+- **#76 — `Commands::send_event::<E>(event)`.** Event-send convenience: a
+  system already holding `Commands` queues an `Events::<E>::send` at the
+  flush boundary instead of also declaring an `EventWriter<E>`. Same deferred
+  discipline as the rest of `Commands` (zero per-frame access; the flush is
+  what touches `Events<E>`). An unregistered `Events<E>` panics **at flush**
+  with an actionable message naming `E` and pointing at `add_event::<E>()`,
+  not the generic missing-resource miss — same treatment as #75's
+  `update_resource`. `send_event_now` (immediate, flush-skipping) stays out
+  of scope: it would reintroduce the intra-frame ordering variable
+  read-previous exists to remove.
 
 ### To create — in order
 

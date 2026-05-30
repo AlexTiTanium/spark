@@ -1,5 +1,5 @@
-//! `Commands` — system-param for deferred entity / component / resource
-//! mutations.
+//! `Commands` — system-param for deferred entity / component / resource /
+//! event mutations.
 //!
 //! Systems can't mutate the [`World`] structurally while iterating it.
 //! If a system iterating `Query<&mut Position>` decides to spawn a new
@@ -34,6 +34,14 @@
 //! world touch — it is a pure builder wrapping an existing handle, so all
 //! of its `insert` / `remove` ops are deferred to the next flush.
 //!
+//! [`Commands::send_event`] extends the same deferral discipline past the
+//! entity/component world: it queues a push into the `Events<E>` *resource*
+//! buffer rather than touching a component storage. Like [`entity`] it has no
+//! synchronous side effect — the event lands only at flush — and like every
+//! op here it is invisible until then.
+//!
+//! [`entity`]: Commands::entity
+//!
 //! # Borrow choreography
 //!
 //! [`Commands`] borrows two cells on the world — `entities` and
@@ -46,9 +54,10 @@ use std::cell::RefCell;
 
 use crate::access::Access;
 use crate::entity::{Entity, EntityAllocator};
+use crate::events::Events;
 use crate::system::SystemParam;
 use crate::world::World;
-use crate::{Component, Resource};
+use crate::{Component, Event, Resource};
 
 /// Boxed one-shot mutation applied to the [`World`] during
 /// [`CommandQueue::flush`].
@@ -188,9 +197,9 @@ impl CommandQueue {
 ///
 /// 1. The runner calls [`SystemParam::fetch`] — `Commands` captures
 ///    references to the two cells, no data is moved.
-/// 2. The system queues spawns / inserts / removes / despawns, plus
-///    resource inserts / updates. These deferred changes are *not yet
-///    visible* to other systems.
+/// 2. The system queues spawns / inserts / removes / despawns / event
+///    sends, plus resource inserts / updates. These deferred changes are
+///    *not yet visible* to other systems.
 /// 3. At the next flush point — after the stage's sequential systems, or
 ///    at a workload boundary — [`World::flush_commands`] drains the queue
 ///    into the world; the queued writes land all at once. Systems that run
@@ -435,6 +444,69 @@ impl Commands<'_> {
             f(&mut guard);
         }));
     }
+
+    /// Queues an [`Events::<E>::send`](Events::send) for the next flush, so a
+    /// system that already holds [`Commands`] can emit an event without also
+    /// declaring an [`EventWriter<E>`](crate::EventWriter) parameter.
+    ///
+    /// The send is deferred exactly like every other `Commands` op: the
+    /// queued closure pushes `event` into `Events::<E>`'s `current` buffer
+    /// when [`World::flush_commands`] drains the queue — not at the moment
+    /// `send_event` is called. It is then read-previous like any other send
+    /// (see [`Events`]): a reader observes it **next frame**, not this one.
+    ///
+    /// # Panics
+    ///
+    /// Panics **at flush**, not at the call, if `Events<E>` has not been
+    /// registered — i.e. no
+    /// [`Application::add_event::<E>()`](../../spark_core/struct.Application.html#method.add_event)
+    /// has run. Unlike the generic miss from [`World::resource_mut`], the
+    /// message names the event type `E` and points at `add_event::<E>()`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use spark_ecs::{Commands, Event, EventReader, Events, IntoSystem, ResMut, Resource, World};
+    ///
+    /// #[derive(Event)]
+    /// struct PowerFailed { zone: u32 }
+    /// #[derive(Resource)]
+    /// struct Seen(Vec<u32>);
+    ///
+    /// // The sender takes only `Commands` — no `EventWriter<PowerFailed>`.
+    /// fn alert(mut commands: Commands) {
+    ///     commands.send_event(PowerFailed { zone: 3 });
+    /// }
+    ///
+    /// let mut world = World::new();
+    /// world.add_resource(Events::<PowerFailed>::default());
+    /// world.add_resource(Seen(Vec::new()));
+    ///
+    /// IntoSystem::into_system(alert)(&world);
+    /// world.flush_commands();                              // the queued send fires here
+    /// world.resource_mut::<Events<PowerFailed>>().swap();  // rotate current -> previous
+    ///
+    /// // A reader in the next stage sees it (read-previous).
+    /// IntoSystem::into_system(|r: EventReader<PowerFailed>, mut seen: ResMut<Seen>| {
+    ///     seen.0.extend(r.read().map(|e| e.zone));
+    /// })(&world);
+    /// assert_eq!(world.resource::<Seen>().0, vec![3]);
+    /// ```
+    pub fn send_event<E: Event>(&mut self, event: E) {
+        self.queue.borrow_mut().push(Box::new(move |world| {
+            // Resolve the actionable message here, where `E` is known —
+            // `World::resource_mut`'s generic miss is shared and stays generic.
+            let mut events = world.get_resource_mut::<Events<E>>().unwrap_or_else(|| {
+                panic!(
+                    "Commands::send_event::<{0}> was queued, but no Events<{0}> \
+                     is registered. Register the event with \
+                     Application::add_event::<{0}>() first.",
+                    std::any::type_name::<E>(),
+                )
+            });
+            events.send(event);
+        }));
+    }
 }
 
 /// Builder returned by [`Commands::spawn`] (freshly-allocated entity) and
@@ -620,7 +692,7 @@ impl<'a> SystemParam for Commands<'a> {
 mod tests {
     use super::*;
     use crate::system::IntoSystem;
-    use crate::{Component, Query, ResMut, Resource};
+    use crate::{Component, EventReader, EventWriter, Query, ResMut, Resource};
 
     #[derive(Debug, PartialEq, Component)]
     struct Position(i32, i32);
@@ -630,6 +702,24 @@ mod tests {
 
     #[derive(Debug, PartialEq, Resource)]
     struct Score(u32);
+
+    /// Event type used by the `send_event` tests. Carries a payload so a
+    /// reader can assert it observed the exact value the sender queued.
+    #[derive(Debug, PartialEq, Event)]
+    struct Alarm(u32);
+
+    /// Accumulates the `Alarm` payloads a reader system observed, so a test
+    /// can assert what was delivered after running the reader.
+    #[derive(Resource)]
+    struct Seen(Vec<u32>);
+
+    /// Non-`Copy` event payload (owns a heap `String`), used to prove the
+    /// queued closure captures the event by value rather than relying on
+    /// `Copy`.
+    #[derive(Debug, PartialEq, Event)]
+    struct Message {
+        text: String,
+    }
 
     #[test]
     fn spawn_allocates_entity_synchronously() {
@@ -1124,6 +1214,40 @@ mod tests {
     }
 
     #[test]
+    fn send_event_is_deferred_until_flush() {
+        // Mirrors `insert_is_deferred_until_flush`: the send is queued, not
+        // applied, until the flush point. `Events::send` lands in `current`,
+        // so a `swap` is the only way to observe it — and a swap *before* the
+        // flush rotates an empty `current`, proving nothing landed early.
+        let mut world = World::new();
+        world.add_resource(Events::<Alarm>::default());
+        let mut sys = IntoSystem::into_system(|mut commands: Commands| {
+            commands.send_event(Alarm(7));
+        });
+        sys(&world);
+
+        // Pre-flush: swapping now rotates an empty `current` — no event yet.
+        world.resource_mut::<Events<Alarm>>().swap();
+        assert_eq!(
+            world.resource::<Events<Alarm>>().iter_previous().count(),
+            0,
+            "send_event must not land before flush"
+        );
+
+        // Flush fires the queued op (Alarm -> current); a swap then exposes it.
+        world.flush_commands();
+        world.resource_mut::<Events<Alarm>>().swap();
+        assert_eq!(
+            world
+                .resource::<Events<Alarm>>()
+                .iter_previous()
+                .map(|a| a.0)
+                .collect::<Vec<_>>(),
+            vec![7],
+        );
+    }
+
+    #[test]
     fn resource_and_structural_ops_share_one_flush() {
         // The module header's headline: resource ops "ride the same queue ...
         // alongside the structural edits." Pin that a single drain applies
@@ -1161,5 +1285,123 @@ mod tests {
         sys(&world);
         world.flush_commands();
         assert_eq!(*world.resource::<Score>(), Score(10));
+    }
+
+    #[test]
+    fn send_event_readable_by_event_reader_after_flush() {
+        // Read-previous round trip (per #36): the sender takes *only*
+        // `Commands` — no `EventWriter<Alarm>` — yet an `EventReader<Alarm>`
+        // in a later stage observes the send after flush + swap.
+        let mut world = World::new();
+        world.add_resource(Events::<Alarm>::default());
+        world.add_resource(Seen(Vec::new()));
+
+        let mut sender = IntoSystem::into_system(|mut commands: Commands| {
+            commands.send_event(Alarm(55));
+        });
+        sender(&world);
+        world.flush_commands(); // Alarm(55) -> current
+        world.resource_mut::<Events<Alarm>>().swap(); // current -> previous
+
+        let mut reader =
+            IntoSystem::into_system(|r: EventReader<Alarm>, mut seen: ResMut<Seen>| {
+                seen.0.extend(r.read().map(|a| a.0));
+            });
+        reader(&world);
+        assert_eq!(world.resource::<Seen>().0, vec![55]);
+    }
+
+    #[test]
+    #[should_panic(expected = "Application::add_event")]
+    fn send_event_panics_at_flush_when_event_type_unregistered() {
+        // `Events::<Alarm>` was never registered. The send queues without
+        // complaint; the actionable panic fires when the flush resolves it.
+        // Anchoring on `Application::add_event` (not the bare type name)
+        // distinguishes this from the generic `World::resource_mut` miss,
+        // which would *also* contain the type name — the actionable hint is
+        // the whole point of the issue.
+        let mut world = World::new();
+        let mut sys = IntoSystem::into_system(|mut commands: Commands| {
+            commands.send_event(Alarm(99));
+        });
+        sys(&world);
+        world.flush_commands(); // panics: names Alarm, suggests add_event::<Alarm>()
+    }
+
+    #[test]
+    fn send_event_multiple_in_one_system_preserves_fifo_order() {
+        // The event analogue of `chained_inserts_all_flush_together`: three
+        // sends in one system land in push order after a single flush + swap.
+        // The shared `CommandQueue` is a FIFO `Vec`, so order is structural.
+        let mut world = World::new();
+        world.add_resource(Events::<Alarm>::default());
+        let mut sys = IntoSystem::into_system(|mut commands: Commands| {
+            commands.send_event(Alarm(1));
+            commands.send_event(Alarm(2));
+            commands.send_event(Alarm(3));
+        });
+        sys(&world);
+        world.flush_commands();
+        world.resource_mut::<Events<Alarm>>().swap();
+        assert_eq!(
+            world
+                .resource::<Events<Alarm>>()
+                .iter_previous()
+                .map(|a| a.0)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3],
+        );
+    }
+
+    #[test]
+    fn send_event_coexists_with_event_writer_in_one_flush_window() {
+        // An immediate `EventWriter::send` (lands in `current` at system-run
+        // time) and a deferred `Commands::send_event` (lands in `current` at
+        // flush) target the same `Events<Alarm>` buffer. Both survive into
+        // `previous` after one swap — the flush appends, it never clobbers the
+        // earlier in-frame write.
+        let mut world = World::new();
+        world.add_resource(Events::<Alarm>::default());
+
+        IntoSystem::into_system(|mut w: EventWriter<Alarm>| {
+            w.send(Alarm(10));
+        })(&world);
+        IntoSystem::into_system(|mut commands: Commands| {
+            commands.send_event(Alarm(20));
+        })(&world);
+
+        world.flush_commands();
+        world.resource_mut::<Events<Alarm>>().swap();
+        assert_eq!(
+            world
+                .resource::<Events<Alarm>>()
+                .iter_previous()
+                .map(|a| a.0)
+                .collect::<Vec<_>>(),
+            vec![10, 20],
+        );
+    }
+
+    #[test]
+    fn send_event_moves_non_copy_payload() {
+        // `E: Event` is only `Send + Sync + 'static` — not `Copy`. The queued
+        // closure captures the event by value, so a heap-owning payload (a
+        // `String`) survives the defer-to-flush hop intact.
+        let mut world = World::new();
+        world.add_resource(Events::<Message>::default());
+        let mut sys = IntoSystem::into_system(|mut commands: Commands| {
+            commands.send_event(Message {
+                text: String::from("grid failure in zone 4"),
+            });
+        });
+        sys(&world);
+        world.flush_commands();
+        world.resource_mut::<Events<Message>>().swap();
+        assert_eq!(
+            world.resource::<Events<Message>>().iter_previous().next(),
+            Some(&Message {
+                text: String::from("grid failure in zone 4"),
+            }),
+        );
     }
 }
