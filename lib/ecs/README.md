@@ -57,6 +57,7 @@ let count = q.iter().count();
 let first = q.iter().next();
 let one  = q.get(entity);                // fetch one entity (shared)
 let one  = q.get_mut(entity);            // fetch one entity (mut)
+let many = q.get_many([e1, e2, e3]);     // fetch several entities (shared)
 ```
 
 `q.get(entity)` / `q.get_mut(entity)` return `None` if any required component
@@ -64,6 +65,14 @@ is missing, if the entity is despawned / stale / never-allocated, or if the
 query's filter rejects it. They share every contract with iteration —
 optionals still yield a `None` value, `Mut<T>` still marks change only on
 write.
+
+`q.get_many([…])` is the batched read-only form: it takes a fixed-size array of
+ids and returns a `[Option<…>; N]` of the same length, one slot per id in
+order, each following the same `None` rules as `get`. It is just `N`
+independent `get`s, so a repeated id is harmless. There is no `get_many_mut`:
+handing out several `&mut` by id at once needs heavier machinery than the one
+read-only call site (a power-grid edge fetching its two endpoint nodes)
+justifies.
 
 
 ## The three vocabulary words

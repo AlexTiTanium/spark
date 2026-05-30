@@ -1410,3 +1410,134 @@ fn query_get_mut_mixed_mut_read_tuple_writes_through_mut_slot() {
     assert_eq!(world.get::<Position>(with_both).unwrap().0, 13);
     assert_eq!(world.get::<Position>(only_pos).unwrap().0, 20); // untouched
 }
+
+// ---- get_many ----
+
+// The batched read returns one slot per id, in the order asked. A present id
+// yields `Some`, a live-but-componentless id yields `None`, exactly mirroring
+// `get` one slot at a time. The single-element call also exercises the `N == 1`
+// boundary of the const-generic array form.
+#[test]
+fn query_get_many_returns_slot_per_id_in_order() {
+    let mut world = World::new();
+    let a = world.spawn().insert(Position(1, 0)).id();
+    let b = world.spawn().insert(Position(2, 0)).id();
+    let ghost = world.spawn().id(); // alive, but no Position
+
+    let q = Query::<&Position>::from_world(&world);
+    let [first, second, third] = q.get_many([a, b, ghost]);
+    assert_eq!(first, Some(&Position(1, 0)));
+    assert_eq!(second, Some(&Position(2, 0)));
+    assert!(third.is_none()); // missing component → None, like `get`
+
+    // N == 1 boundary: a single-element array is still one ordered slot.
+    let [only] = q.get_many([a]);
+    assert_eq!(only, Some(&Position(1, 0)));
+}
+
+// `get_many` is just `N` independent `get`s: a repeated id reads the same data
+// back into both slots (each is a shared `&` borrow), and the two structurally
+// distinct rejections — a despawned/stale handle (generation mismatch) and a
+// never-allocated handle (index out of range) — both collapse to `None`.
+#[test]
+fn query_get_many_allows_duplicate_ids_and_rejects_stale_and_never() {
+    let mut world = World::new();
+    let a = world.spawn().insert(Position(7, 0)).id();
+    let doomed = world.spawn().insert(Position(0, 0)).id();
+    world.despawn(doomed); // stale handle from here on
+    let never = Entity {
+        index: 9999,
+        generation: 0,
+    };
+
+    let q = Query::<&Position>::from_world(&world);
+    let [first, second, stale, oob] = q.get_many([a, a, doomed, never]);
+    assert_eq!(first, Some(&Position(7, 0)));
+    assert_eq!(second, Some(&Position(7, 0))); // duplicate id is harmless
+    assert!(stale.is_none()); // despawned → generation mismatch
+    assert!(oob.is_none()); // never allocated → index out of range, distinct path
+}
+
+// Each slot runs the full join independently: a slot is `Some` only when its
+// entity has every required component, `None` (just for that slot) otherwise.
+#[test]
+fn query_get_many_join_is_all_or_nothing_per_slot() {
+    let mut world = World::new();
+    let both = world
+        .spawn()
+        .insert(Position(1, 0))
+        .insert(Velocity(2, 0))
+        .id();
+    let pos_only = world.spawn().insert(Position(3, 0)).id();
+
+    let q = Query::<(&Position, &Velocity)>::from_world(&world);
+    let [a, b] = q.get_many([both, pos_only]);
+    assert_eq!(a, Some((&Position(1, 0), &Velocity(2, 0))));
+    assert!(b.is_none()); // missing the &Velocity half — only this slot is None
+}
+
+// The filter participates per slot, same as in `get`: an entity that satisfies
+// the data shape but fails the filter is `None` in its own slot only.
+#[test]
+fn query_get_many_filter_rejects_per_slot() {
+    let mut world = World::new();
+    let marked = world.spawn().insert(Position(1, 0)).insert(Marker).id();
+    let bare = world.spawn().insert(Position(2, 0)).id(); // no Marker
+
+    let q = Query::<&Position, With<Marker>>::from_world(&world);
+    let [a, b] = q.get_many([marked, bare]);
+    assert_eq!(a, Some(&Position(1, 0)));
+    assert!(b.is_none()); // has Position, lacks Marker — filter rejects this slot
+}
+
+// `get_many::<0>` over an empty array is a valid call and returns an empty
+// array without touching the world — the `N == 0` boundary of the const generic.
+#[test]
+fn query_get_many_empty_array_is_empty() {
+    let world = World::new();
+    let q = Query::<&Position>::from_world(&world);
+    let out: [Option<&Position>; 0] = q.get_many([]);
+    assert_eq!(out, []);
+}
+
+// Standalone `Option<&T>` keeps the nested `Some(None)` vs flat `None`
+// distinction inside an array slot: a live-but-componentless entity is
+// `Some(None)`, a despawned one is `None`. A regression collapsing either into
+// the other inside `array::map` would be caught here, mirroring the
+// single-entity `query_get_option_standalone_alive_checks_via_snapshot`.
+#[test]
+fn query_get_many_option_standalone_distinguishes_some_none_from_none() {
+    let mut world = World::new();
+    let with_pos = world.spawn().insert(Position(5, 0)).id();
+    let without = world.spawn().id(); // live, no Position
+    let stale = world.spawn().id();
+    world.despawn(stale);
+
+    let q = Query::<Option<&Position>>::from_world(&world);
+    let [a, b, c] = q.get_many([with_pos, without, stale]);
+    assert_eq!(a, Some(Some(&Position(5, 0))));
+    assert_eq!(b, Some(None)); // live, no component → nested Some(None)
+    assert!(c.is_none()); // despawned → flat None, not Some(None)
+}
+
+// Standalone `Query<Entity>` has no component storage to gate aliveness — it
+// alive-checks each id against the frozen live snapshot. `get_many` must take
+// that distinct path per slot: a live id reads back as itself, a despawned or
+// never-allocated id is `None`.
+#[test]
+fn query_get_many_entity_standalone_uses_snapshot_alive_check() {
+    let mut world = World::new();
+    let a = world.spawn().id();
+    let b = world.spawn().id();
+    world.despawn(a);
+    let never = Entity {
+        index: 9999,
+        generation: 0,
+    };
+
+    let q = Query::<Entity>::from_world(&world);
+    let [ra, rb, rn] = q.get_many([a, b, never]);
+    assert!(ra.is_none()); // despawned → absent from the snapshot
+    assert_eq!(rb, Some(b)); // live id reads back as itself
+    assert!(rn.is_none()); // never-allocated → None
+}
