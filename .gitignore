@@ -1,6 +1,10 @@
 # Rust build artifacts
 /target
 
+# The benchmark crate is its own (excluded) workspace, so it builds into a
+# separate target dir the root `/target` rule above doesn't cover.
+/bench/spark-ecs-bench/target
+
 # Backup files from rustfmt
 **/*.rs.bk
 

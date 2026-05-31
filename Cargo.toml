@@ -14,6 +14,14 @@ resolver = "3"
 # every package to be a listed member, and the glob won't reach it.
 members = ["lib/*", "lib/ecs/macros", "src"]
 
+# The ECS benchmark harness is deliberately kept OUT of the workspace. It
+# pulls heavy optional deps (`bevy_ecs`, `hecs`) behind its `external`
+# feature; excluding it guarantees those never enter the engine's build
+# graph, the engine's `Cargo.lock`, or any `--all-features` CI job. It is a
+# standalone crate with its own lockfile — run it manually, e.g.
+# `cargo bench --manifest-path bench/spark-ecs-bench/Cargo.toml --features external`.
+exclude = ["bench/spark-ecs-bench"]
+
 [workspace.package]
 edition = "2024"
 
