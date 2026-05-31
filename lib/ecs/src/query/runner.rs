@@ -9,8 +9,18 @@
 //! impls ([`tuple_codegen`](super::tuple_codegen)), and the driver runtime
 //! ([`DriveSource`](super::DriveSource) / [`DriverIter`](super::DriverIter) /
 //! `DriverPlan`) in the parent module. The additive random-access APIs
-//! [`Query::get`] / [`Query::get_mut`] (#72) ship from this file too;
-//! [`Query::single`] (#71) and `get_many` (#73) are not yet landed.
+//! [`Query::get`] / [`Query::get_mut`] (#72) and the read-only batched
+//! [`Query::get_many`] (#73) ship from this file too. A mutable
+//! `get_many_mut` was considered for #73 and **not** pursued: handing out
+//! `N` simultaneous `&mut` by id needs a per-shape [`DenseMut`]-style
+//! batched lookup (the existing single-entity `lookup_mut` re-derives
+//! `&mut [T]` per call, so calling it `N` times aliases under Stacked
+//! Borrows), and the lone read-only call site — the power-grid solver
+//! fetching an edge's two endpoint nodes — does not justify that machinery.
+//! Revisit if a write-batch call site appears. [`Query::single`] (#71) is
+//! not yet landed.
+//!
+//! [`DenseMut`]: super::dense_mut::DenseMut
 
 use crate::access::{Access, QueryAccess};
 use crate::entity::Entity;
@@ -53,9 +63,10 @@ use super::{DriveSource, DriverIter, DriverPlan, QueryData, ReadOnlyQueryData};
 /// Beside iteration, every [`Query`] supports one-entity lookup via
 /// [`get`](Self::get) (shared, gated on [`ReadOnlyQueryData`] just like
 /// [`iter`](Self::iter)) and [`get_mut`](Self::get_mut) (any [`QueryData`],
-/// `&mut self`). Both return `None` for any missing required component, a
-/// despawned / stale / never-allocated id, or a filter rejection — the same
-/// pattern iteration would have skipped. They share every contract with
+/// `&mut self`), plus the batched read-only [`get_many`](Self::get_many).
+/// All return `None` for any missing required component, a despawned /
+/// stale / never-allocated id, or a filter rejection — the same pattern
+/// iteration would have skipped. They share every contract with
 /// iteration: optional elements still yield a `None` *value*, and
 /// [`Mut<T>`](crate::Mut) still marks change only on a `DerefMut` write.
 ///
@@ -534,6 +545,82 @@ impl<'w, D: ReadOnlyQueryData + 'w, F: QueryFilter + 'w> Query<'w, D, F> {
             return None;
         }
         D::lookup(&self.state, entity)
+    }
+
+    /// Fetches several entities by id in one call, shared — the batched
+    /// counterpart of [`get`](Self::get).
+    ///
+    /// Returns a fixed-size array the same length as `ids`, one slot per id
+    /// in order. Each slot follows [`get`](Self::get)'s rule exactly: `Some`
+    /// when that entity has the full data shape **and** passes the filter `F`;
+    /// `None` for any missing required component, a despawned / stale /
+    /// never-allocated id, or a filter rejection. The batch is just `N`
+    /// independent `get`s — there is no cross-slot interaction, so a repeated
+    /// id is harmless (each lookup is a shared `&` borrow; both slots read the
+    /// same data back).
+    ///
+    /// Gated on [`ReadOnlyQueryData`] for the same reason [`get`](Self::get)
+    /// and [`iter`](Self::iter) are. A `&mut T` shape has no batched form:
+    /// `get_many_mut` would hand out several `Mut<'_, T>` from one call, which
+    /// cannot ride a shared `&self`, and the sound `&mut` machinery it needs
+    /// was deliberately not built (see the module-level docs).
+    ///
+    /// # Examples
+    ///
+    /// A power-grid edge fetching both endpoint nodes in one shot — the
+    /// motivating call site — instead of two [`get`](Self::get)s and two
+    /// `Option` unwraps:
+    ///
+    /// ```
+    /// use spark_ecs::{Component, Query, World};
+    ///
+    /// #[derive(Component, PartialEq, Debug)]
+    /// struct Node { load: f32 }
+    ///
+    /// let mut world = World::new();
+    /// let from = world.spawn().insert(Node { load: 3.0 }).id();
+    /// let to = world.spawn().insert(Node { load: 5.0 }).id();
+    /// let ghost = world.spawn().id(); // alive, but no Node
+    ///
+    /// let q = Query::<&Node>::from_world(&world);
+    /// let [a, b, c] = q.get_many([from, to, ghost]);
+    /// assert_eq!(a, Some(&Node { load: 3.0 }));
+    /// assert_eq!(b, Some(&Node { load: 5.0 }));
+    /// assert!(c.is_none()); // missing component → None, exactly like `get`
+    /// ```
+    ///
+    /// Like [`get`](Self::get) it is gated on [`ReadOnlyQueryData`], so a
+    /// `&mut` shape cannot call it — a **compile-time** error, not a runtime
+    /// one:
+    ///
+    /// ```compile_fail
+    /// use spark_ecs::{Component, Query, World};
+    ///
+    /// // `Position` is a component, so `insert` compiles and the failure
+    /// // lands on `get_many` — the `ReadOnlyQueryData` bound this example
+    /// // is about.
+    /// #[derive(Component)]
+    /// struct Position(f32, f32);
+    ///
+    /// let mut world = World::new();
+    /// let e = world.spawn().insert(Position(0.0, 0.0)).id();
+    /// let q = Query::<&mut Position>::from_world(&world);
+    /// // error[E0599]: the method `get_many` exists for `Query<&mut Position>`,
+    /// // but its trait bounds were not satisfied: `&mut Position:
+    /// // ReadOnlyQueryData`.
+    /// let _ = q.get_many([e]);
+    /// ```
+    pub fn get_many<const N: usize>(&self, ids: [Entity; N]) -> [Option<D::Item<'_>>; N] {
+        // `N` independent `get`s — `Entity` is `Copy`, so `array::map` consumes
+        // the id array by value. Every slot is a shared `&self.state` borrow, so
+        // all `N` items coexist with no aliasing concern (the reason the `&mut`
+        // batch is a separate, unbuilt design).
+        ids.map(|entity| {
+            if !F::matches(entity, &self.filter_state) {
+                return None;
+            }
+            D::lookup(&self.state, entity)
+        })
     }
 }
 
