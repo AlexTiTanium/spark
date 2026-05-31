@@ -226,7 +226,14 @@ pub(crate) fn record_driver_step() {
 /// Returns the driver-advance count since the last call and resets it to 0.
 /// The cost-contract tests assert this tracks the smallest candidate
 /// population, never the live set.
+///
+/// Read only by the `driver_cost` tests, which are `#[cfg(not(miri))]`
+/// (a 10k-entity step-count oracle has no aliasing surface — see
+/// `query/tests.rs`). `record_driver_step` still fires under Miri via
+/// `counted!`, so the counter stays live; only this reader goes unused
+/// there, hence the targeted `allow`.
 #[cfg(test)]
+#[cfg_attr(miri, allow(dead_code))]
 pub(crate) fn take_driver_steps() -> usize {
     DRIVER_STEPS.with(|c| c.replace(0))
 }

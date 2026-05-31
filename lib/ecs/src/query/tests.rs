@@ -8,6 +8,9 @@
 //! - [`change_detection`] — precise `Mut` change marking;
 //! - [`driver_cost`] — kept whole; its exact driver-step counts are the
 //!   codegen regression oracle, so they must not drift across the split.
+//!   Excluded under `cfg(miri)` (see the `mod driver_cost;` note): a
+//!   step-count oracle over 10_000-entity worlds is pure safe code with no
+//!   aliasing surface, and dominated the Miri CI budget for zero UB coverage.
 #![allow(
     clippy::items_after_statements,
     clippy::needless_pass_by_value,
@@ -19,6 +22,16 @@ use crate::{Component, Entity, World};
 
 mod change_detection;
 mod data;
+// Excluded under Miri: `driver_cost` is a driver-step *count* oracle, not an
+// aliasing check. Each test builds a 10_000-entity world and asserts how many
+// driver steps a shape takes — pure safe code, exercising the same iteration
+// paths the `joins`/`data` tests already interpret at 50 entities. Under the
+// Miri interpreter those 34 ×10k-entity worlds cost ~27 min and buy zero
+// Stacked/Tree-Borrows coverage (they never build a multi-mut tuple, so they
+// never reach the one `unsafe fn`, `DenseMut::get`). Gating it keeps the Miri
+// job scoped to code that actually touches `unsafe`; native runs are
+// unaffected and the codegen oracle still guards every non-Miri build.
+#[cfg(not(miri))]
 mod driver_cost;
 mod filters;
 mod joins;
