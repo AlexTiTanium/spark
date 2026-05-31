@@ -1,0 +1,56 @@
+# spark-ecs-bench — benchmark harness comparing `spark-ecs` against rival
+# ECS crates. This crate is deliberately EXCLUDED from the root workspace
+# (see `exclude` in the root Cargo.toml): its heavy optional dependencies
+# (`bevy_ecs`, `hecs`) must never enter the engine's build graph or the
+# engine's `Cargo.lock`. As a standalone package it cannot inherit
+# `[workspace.package]` / `[workspace.lints]`, so those fields are spelled
+# out here and kept in sync with the root manifest by hand.
+
+[package]
+name = "spark-ecs-bench"
+version = "0.1.0"
+publish = false                       # tooling, never published
+readme = "README.md"
+
+# Mirrors [workspace.package] in the root manifest. Kept in sync manually
+# because an excluded crate can't use `<field>.workspace = true`.
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+
+# Mirrors [workspace.lints] in the root manifest, same reason as above.
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+
+[features]
+# Default build depends only on `spark-ecs` — fast inner loop, no rival
+# ECS fetched. `external` turns on the cross-ECS comparison.
+default = []
+external = ["dep:bevy_ecs", "dep:hecs", "dep:shipyard", "dep:flax"]
+
+[dependencies]
+# The engine crate under test. Path dep into the (separate) root workspace;
+# this is the only edge between bench and engine, and it points one way.
+spark-ecs = { path = "../../lib/ecs" }
+
+# Rival ECS, pulled in only behind `external`. Pinned exact (project rule;
+# no Dependabot). Local to this crate — not shared, so not in a workspace
+# dependency table.
+bevy_ecs = { version = "0.18.1", optional = true }   # archetype-based, industry standard
+hecs = { version = "0.11.0", optional = true }        # archetype-based, minimal API
+shipyard = { version = "0.11.3", optional = true }    # sparse-set, workload-oriented
+flax = { version = "0.7.1", optional = true }         # archetype-based, ergonomic
+# legion (0.4, unmaintained since 2021) is intentionally NOT benchmarked for
+# time/memory — it appears only in the dependency-weight axis of the result
+# file, measured via an isolated `cargo tree` probe, not as a dep of this crate.
+
+[dev-dependencies]
+# Statistical benchmark harness: warm-up, sampling, confidence intervals.
+criterion = { version = "0.8.2", features = ["html_reports"] }
+
+[[bench]]
+name = "micro"
+harness = false                       # Criterion provides its own `main`.
