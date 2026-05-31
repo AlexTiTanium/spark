@@ -18,6 +18,18 @@ name: Miri (spark-ecs)
 # `-Zmiri-disable-isolation` trims syscall-emulation overhead; the borrow
 # model that does the actual checking stays on.
 #
+# One module inside `query::tests` is gated out at the source level rather
+# than by this filter: `driver_cost` is a driver-step *count* oracle that
+# builds 10_000-entity worlds, so it is `#[cfg(not(miri))]` (see
+# query/tests.rs). It is pure safe code — it never forms a multi-mut tuple,
+# so it never reaches `DenseMut::get` — yet under the interpreter its 34
+# ×10k-entity worlds ran ~27 min and pushed this job past its 30-min budget
+# for zero aliasing coverage. The substring filter can only *add* names, not
+# drop one module, so the carve-out lives next to the tests. Everything that
+# actually touches `unsafe` (joins + the `&mut` paths in data) still runs
+# here; the run is now ~4 min, so the timeout below catches genuine
+# regressions instead of normal interpreter cost.
+#
 # Conditional cadence (deviation from #80, recorded in the PR body): most
 # PRs never touch unsafe, so this only fires when the relevant surface
 # moves (path filter below), plus a weekly cron for toolchain / nightly
