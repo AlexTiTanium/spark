@@ -50,9 +50,6 @@ fn spawn(c: &mut Criterion) {
         group.bench_function("flax", |b| {
             b.iter(|| black_box(rivals::flax::world(ENTITY_COUNT)));
         });
-        group.bench_function("legion", |b| {
-            b.iter(|| black_box(rivals::legion::world(ENTITY_COUNT)));
-        });
     }
 
     group.finish();
@@ -191,23 +188,6 @@ mod external {
                 });
             });
         }
-
-        // legion: query built once outside the loop.
-        {
-            use ::legion::IntoQuery;
-            use rivals::legion::Position;
-            let world = rivals::legion::world(super::ENTITY_COUNT);
-            let mut query = <&Position>::query();
-            group.bench_function("legion", |b| {
-                b.iter(|| {
-                    let mut sum = 0.0f32;
-                    for p in query.iter(&world) {
-                        sum += p.x + p.y + p.z;
-                    }
-                    black_box(sum);
-                });
-            });
-        }
     }
 
     /// `pos += vel` traversal for every rival ECS. `acc += pos.x` reads each
@@ -282,26 +262,6 @@ mod external {
                 b.iter(|| {
                     let mut acc = 0.0f32;
                     for (pos, vel) in &mut query.borrow(&world) {
-                        pos.x += vel.x;
-                        pos.y += vel.y;
-                        pos.z += vel.z;
-                        acc += pos.x;
-                    }
-                    black_box(acc);
-                });
-            });
-        }
-
-        // legion: query built once outside the loop.
-        {
-            use ::legion::IntoQuery;
-            use rivals::legion::{Position, Velocity};
-            let mut world = rivals::legion::world(super::ENTITY_COUNT);
-            let mut query = <(&mut Position, &Velocity)>::query();
-            group.bench_function("legion", |b| {
-                b.iter(|| {
-                    let mut acc = 0.0f32;
-                    for (pos, vel) in query.iter_mut(&mut world) {
                         pos.x += vel.x;
                         pos.y += vel.y;
                         pos.z += vel.z;

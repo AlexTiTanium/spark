@@ -76,18 +76,34 @@ The three timing benches:
 | `iter_mut` | `pos += vel` over `(&mut Position, &Velocity)`  | mutable write path (`spark-ecs`: `Mut<T>` change-marker from PR #62) |
 
 **Compared crates** (all under `--features external`): `spark-ecs` (always),
-`bevy_ecs`, `hecs`, `shipyard`, `flax`, and `legion`. Architecture spread —
-sparse-set: `spark-ecs`, `shipyard`; archetype: `bevy_ecs`, `hecs`, `flax`,
-`legion`. `legion` 0.4 is unmaintained since 2021 (reference point only). The
-remaining micros (`despawn`, filters, change detection, commands, resources)
-and the macro / Spark-realistic scenarios stay deferred to follow-up PRs
-against issue #63.
+`bevy_ecs`, `hecs`, `shipyard`, `flax`. Architecture spread — sparse-set:
+`spark-ecs`, `shipyard`; archetype: `bevy_ecs`, `hecs`, `flax`. `legion` 0.4
+(unmaintained since 2021) appears **only in the dependency-weight axis** of the
+result file — benchmarking its speed/memory would invite comparison with a crate
+no one should pick today. The remaining micros (`despawn`, filters, change
+detection, commands, resources) and the macro / Spark-realistic scenarios stay
+deferred to follow-up PRs against issue #63.
+
+> **Two things this baseline does *not* measure** (so the numbers aren't
+> over-read):
+>
+> 1. **Parallelism — it's single-threaded.** `spark-ecs` has no parallel
+>    scheduler yet (M4/Rayon is ahead); `bevy_ecs`'s parallel scheduler — its
+>    real strength — is also off here. The traversal numbers are
+>    single-thread-vs-single-thread: honest for "where spark-ecs is today", but
+>    **not** the real bevy gap, which shows under multi-threaded scheduling.
+> 2. **Structural churn — only dense traversal.** One archetype shape, one size,
+>    pure iteration is archetype's best case and sparse-set's worst. The
+>    sparse-set advantage (cheap `insert`/`remove` with no archetype moves) isn't
+>    measured. So spark-ecs's `iter` deficit is measured on its least favourable
+>    discipline. Varying N, fragmented archetypes, and insert/remove churn are
+>    planned follow-ups.
 
 > **Note on `iter_mut` fairness.** The benched ECS differ in default
 > modification tracking: `spark-ecs` and `bevy_ecs`/`flax` stamp a change tick
-> on write; `hecs`, `legion`, and `shipyard`'s default `ViewMut` do not. So
-> `iter_mut` compares each crate's *default* mutable iteration, which is the
-> honest out-of-the-box path — not an identical one.
+> on write; `hecs` and `shipyard`'s default `ViewMut` do not. So `iter_mut`
+> compares each crate's *default* mutable iteration, the honest out-of-the-box
+> path — not an identical one.
 
 ## Methodology
 
@@ -114,8 +130,8 @@ carries machine-readable provenance (YAML front-matter), a human narrative, and
 Mermaid bar charts. The latest:
 
 - [`results/2026-05-31-bbb0e5d.md`](results/2026-05-31-bbb0e5d.md) — baseline,
-  post-PR #62, single-threaded: six ECS across time, throughput, memory, and
-  dependency weight.
+  post-PR #62, single-threaded: five ECS across time, throughput, and memory
+  (plus `legion` in the dependency-weight axis).
 
 ## Pitfalls
 

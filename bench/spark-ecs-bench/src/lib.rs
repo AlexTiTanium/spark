@@ -249,39 +249,4 @@ pub mod rivals {
             world
         }
     }
-
-    /// `legion` (archetype-based; **unmaintained since 2021**, kept as a
-    /// historical reference point and dependency-weight data point).
-    pub mod legion {
-        #[derive(Clone, Copy, Debug)]
-        pub struct Position {
-            pub x: f32,
-            pub y: f32,
-            pub z: f32,
-        }
-        #[derive(Clone, Copy, Debug)]
-        pub struct Velocity {
-            pub x: f32,
-            pub y: f32,
-            pub z: f32,
-        }
-
-        /// Populates a `legion` world with `count` movers.
-        #[must_use]
-        pub fn world(count: usize) -> ::legion::World {
-            let mut world = ::legion::World::default();
-            for i in 0..count {
-                let f = i as f32;
-                world.push((
-                    Position { x: f, y: f, z: f },
-                    Velocity {
-                        x: 1.0,
-                        y: 2.0,
-                        z: 3.0,
-                    },
-                ));
-            }
-            world
-        }
-    }
 }

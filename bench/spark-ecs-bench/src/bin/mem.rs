@@ -85,7 +85,6 @@ fn main() {
         report("bevy_ecs", || rivals::bevy::world(ENTITY_COUNT));
         report("shipyard", || rivals::shipyard::world(ENTITY_COUNT));
         report("flax", || rivals::flax::world(ENTITY_COUNT));
-        report("legion", || rivals::legion::world(ENTITY_COUNT));
     }
 
     #[cfg(not(feature = "external"))]
