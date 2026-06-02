@@ -44,12 +44,12 @@
 │ Game process (debug build only)                                  │
 │                                                                  │
 │   winit main thread ─── App::run() ── Scheduler.frame()         │
-│      ├── Schedule::First       drain_inbox(world)                │
-│      ├── Schedule::PreUpdate   apply_control(world)              │
-│      ├── Schedule::FixedUpdate (skipped if Time.paused)          │
-│      ├── Schedule::Update      (skipped if Time.paused)          │
-│      ├── Schedule::Render                                        │
-│      └── Schedule::Last        publish_events(world)             │
+│      ├── Stage::First       drain_inbox(world)                │
+│      ├── Stage::PreUpdate   apply_control(world)              │
+│      ├── Stage::FixedUpdate (skipped if Time.paused)          │
+│      ├── Stage::Update      (skipped if Time.paused)          │
+│      ├── Stage::Render                                        │
+│      └── Stage::Last        publish_events(world)             │
 │                                                                  │
 │      ↑ std::sync::mpsc<Request>          ↓ Bus<LogLine>          │
 │      │                                    │                       │
@@ -77,9 +77,9 @@ Two channels:
 2. `Bus<LogLine>` — main thread → all subscribed SSE streams.
 
 Three ECS systems registered by the plugin:
-1. `drain_inbox` in `Schedule::First` — processes pending tool calls under exclusive `&mut World`.
-2. `apply_control` in `Schedule::PreUpdate` — applies pause/step/scale onto `Time` for the rest of the frame.
-3. `publish_events` in `Schedule::Last` — placeholder until events land (§ 10).
+1. `drain_inbox` in `Stage::First` — processes pending tool calls under exclusive `&mut World`.
+2. `apply_control` in `Stage::PreUpdate` — applies pause/step/scale onto `Time` for the rest of the frame.
+3. `publish_events` in `Stage::Last` — placeholder until events land (§ 10).
 
 ## 4. Cross-doc review
 
@@ -243,13 +243,13 @@ impl Plugin for SparkMcpPlugin {
         app.init_resource::<control::McpControl>()
            .insert_resource(methods::Inbox::new(req_rx))
            .insert_resource(log_buf.clone())
-           .add_workload(McpWorkload::Inbox, Schedule::First, |w| {
+           .add_workload(McpWorkload::Inbox, Stage::First, |w| {
                w.add(methods::drain_inbox);
            })
-           .add_workload(McpWorkload::Control, Schedule::PreUpdate, |w| {
+           .add_workload(McpWorkload::Control, Stage::PreUpdate, |w| {
                w.add(control::apply_control);
            })
-           .add_workload(McpWorkload::Outbox, Schedule::Last, |w| {
+           .add_workload(McpWorkload::Outbox, Stage::Last, |w| {
                w.add(methods::publish_events);
            });
 
@@ -412,7 +412,7 @@ pub enum Request {
     ToolCall { name: String, args: Value, reply: Sender<Value> },
 }
 
-/// `Schedule::First` system. Drains MCP requests under exclusive `&mut World`.
+/// `Stage::First` system. Drains MCP requests under exclusive `&mut World`.
 /// Spark ECS schedules `&mut World` systems in their own batch (M4 parallel executor).
 pub fn drain_inbox(world: &mut World) {
     let mut budget = 256usize;
@@ -427,7 +427,7 @@ pub fn drain_inbox(world: &mut World) {
     }
 }
 
-/// `Schedule::Last` system. Placeholder until events land in ECS Stage 14;
+/// `Stage::Last` system. Placeholder until events land in ECS Stage 14;
 /// see § 10 Future work.
 pub fn publish_events(_world: &mut World) {}
 
@@ -708,7 +708,7 @@ pub struct McpControl {
     pub pending_steps: u32,
 }
 
-/// `Schedule::PreUpdate` system. Single source of truth for the paused flag.
+/// `Stage::PreUpdate` system. Single source of truth for the paused flag.
 pub fn apply_control(
     mut ctl: ResMut<McpControl>,
     mut time: ResMut<Time>,
@@ -869,7 +869,7 @@ Every reply is wrapped in `Reply<T> { frame, at_ms, data }`.
 ## 8. Concurrency model
 
 - HTTP thread parses JSON-RPC, builds a `Request`, and sends it through the `mpsc::Sender<Request>`. It then blocks on a per-request `oneshot` until the main thread responds, up to a 10-second timeout.
-- The main thread drains the inbox in `Schedule::First` under exclusive `&mut World`. Spark ECS's M4 parallel executor schedules `&mut World` systems in their own batch, so this is safe and explicit.
+- The main thread drains the inbox in `Stage::First` under exclusive `&mut World`. Spark ECS's M4 parallel executor schedules `&mut World` systems in their own batch, so this is safe and explicit.
 - A per-frame budget of 256 requests caps how much the main thread will service before yielding to the rest of the schedule. Excess requests wait one or more frames.
 - Log events publish into a `Bus<LogLine>` (an `Arc<Mutex<Vec<Sender>>>`) from any thread — the tracing layer pushes lines as they occur.
 - Each active SSE stream runs in its own short-lived OS thread that owns the `Receiver` half of one channel.
@@ -890,7 +890,7 @@ When `Events<T>`, `EventReader<T>`, and `EventWriter<T>` exist, three additions:
 
 - `EventRegistry` populated by `#[derive(Event)]`, mirroring `ComponentRegistry`.
 - Tools `spark.event.list` (registered event types + source paths) and `spark.event.emit { type, payload }` (writes through `EventWriter<T>`).
-- `GET /events?types=Foo,Bar` SSE stream. The `publish_events` system in `Schedule::Last` drains `EventReader<T>` for each subscribed type and forwards onto a `Bus<NamedEvent>`. Filtering happens server-side based on subscription query params.
+- `GET /events?types=Foo,Bar` SSE stream. The `publish_events` system in `Stage::Last` drains `EventReader<T>` for each subscribed type and forwards onto a `Bus<NamedEvent>`. Filtering happens server-side based on subscription query params.
 
 No design work needed in advance. The shapes mirror the component plumbing exactly.
 

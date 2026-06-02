@@ -48,6 +48,7 @@ Guiding rule: **build the engine the game needs, not a general-purpose engine.**
 │   ├── assets/                 # texture/atlas/mesh loading, hot reload
 │   ├── ui/                     # egui + wgpu plumbing, EguiContext Resource
 │   ├── editor/                 # dev-only inspector UI (feature-flagged)
+│   ├── mcp/                    # debug-only MCP server for AI agents (`#![cfg(debug_assertions)]`)
 │   └── audio/                  # kira wrapper
 ├── src/
 │   ├── Cargo.toml
@@ -80,6 +81,7 @@ render  ── core + window + (wgpu, image)
 assets  ── core + render + (notify)
 ui      ── core + window + input + render + (egui, egui-wgpu, egui-winit)
 editor  ── core + ui                    (feature-flagged, dev-only)
+mcp     ── core + ecs + common + (tiny_http, serde, serde_json) (debug-only HTTP MCP server)
 audio   ── core + (kira)
 game    ── all of the above
 ```

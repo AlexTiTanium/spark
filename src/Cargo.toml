@@ -40,4 +40,8 @@ spark-core = { path = "../lib/core" }
 spark-ecs = { path = "../lib/ecs" }
 spark-input = { path = "../lib/input" }
 spark-log = { path = "../lib/log" }
+# `spark-mcp`'s crate root is `#![cfg(debug_assertions)]`, so release
+# builds compile it to an empty lib — depend on it unconditionally and
+# rely on the `cfg` gate at the call site for the absence guarantee.
+spark-mcp = { path = "../lib/mcp" }
 spark-window = { path = "../lib/window" }
